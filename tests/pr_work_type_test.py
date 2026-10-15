@@ -35,8 +35,11 @@ SID = "sess-1"
 # classification sentence. A pull request that already carries a type must
 # render exactly this again — the ask disappears rather than degrading into
 # something new. Change these deliberately, never to make the suite green.
-GOLDEN_PRE_CLASSIFICATION = {"CREATED": "0feb75e89d6c385f",
-                             "IN_PLAY": "c79dc68b09546397"}
+# Re-pinned once, deliberately: the finder the templates offer is now spelled
+# `/memhub:link-pr --find {pr_url}` (the separate finder skill was merged into
+# link-pr); no other byte changed.
+GOLDEN_PRE_CLASSIFICATION = {"CREATED": "8ee3f30a78f924a2",
+                             "IN_PLAY": "8711d86ee07c070c"}
 
 failures: list[str] = []
 

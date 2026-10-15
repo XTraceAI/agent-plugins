@@ -104,6 +104,9 @@ def portability_check() -> None:
         os.mkdir(incomplete)
         incomplete_hook = os.path.join(incomplete, "rulebook_hook.py")
         shutil.copy2(HOOK, incomplete_hook)
+        # The lock shim is what is missing here; `rulebook_shell` is part of the
+        # hook itself (split out for the release tree's per-file size limit).
+        shutil.copy2(os.path.join(os.path.dirname(HOOK), "rulebook_shell.py"), incomplete)
         incomplete_repo = os.path.join(td, "incomplete-repo")
         os.makedirs(os.path.join(incomplete_repo, ".git"))
         with open(
@@ -692,9 +695,7 @@ def read_lane_checks() -> None:
             denied, c, _, _ = bash(cmd)
             check(f"read via bash: silent — {cmd.replace(repo, '<repo>')[:50]}",
                   not denied and "[big-read]" not in c, c)
-        # the measured shape: a relative path after a cd (the session cwd stays the
-        # trust boundary — a cd OUT of the session's repo is not followed, as for
-        # every other lane)
+        # the measured shape: a relative path after a cd
         for cmd in ("cd src && cat big.py", f"cd {repo}/src && cat big.py", "cd src; cat ./big.py"):
             denied, c, _, _ = bash(cmd)
             check(f"read via bash: a relative path resolves against the cd — {cmd[:40]}",
@@ -775,7 +776,9 @@ def bash_edit_checks() -> None:
                 f.write(text.replace(old, new))
 
         def bash(command, *, session="b1", run_it=True, pre=True, resp=None, mutate=None):
-            """pre → apply the command's file effect → post, the way a session does.
+            """pre → apply the command's file effect → post, the way a session does;
+            the advice of both lanes (a write the command line shows fires in the
+            pre lane, the disk scan in the post lane catches the rest).
 
             The hook receives the real shell syntax under test. Applying its
             expected file effect in Python keeps this fixture independent of
@@ -785,8 +788,9 @@ def bash_edit_checks() -> None:
             tid = f"tu{n[0]}"
             ev = {"cwd": repo, "session_id": session, "tool_name": "Bash", "tool_use_id": tid,
                   "tool_input": {"command": command}}
+            said = ""
             if pre:
-                run("pre", ev, env)
+                said = ctx(run("pre", ev, env)[1])
             if run_it:
                 if mutate is not None:
                     mutate()
@@ -794,7 +798,8 @@ def bash_edit_checks() -> None:
                 else:
                     r = subprocess.run(command, shell=True, cwd=repo, capture_output=True, text=True)
                     resp = resp or {"stdout": r.stdout, "stderr": r.stderr, "exit_code": r.returncode}
-            return ctx(run("post", dict(ev, tool_response=resp or {"stdout": "", "exit_code": 0}), env)[1])
+            return (said + "\n" + ctx(run("post", dict(ev, tool_response=resp or {"stdout": "", "exit_code": 0}),
+                                              env)[1])).strip()
 
         mig = "alembic/versions/20260902_user_logins.py"
         c = bash(f"cat > {mig} <<'EOF'\ndef upgrade():\n    op.create_table('user_logins')\nEOF",
@@ -1071,6 +1076,66 @@ def diff_base_checks() -> None:
               H.command_root(td, "cd /nope/nowhere && gh pr create") == "")
 
 
+def spec_pending_probe_checks() -> None:
+    """The post lane takes the branch diff (~20 git calls) only to answer a
+    pending `spec_untouched` entry for this checkout; with none it must not
+    run git for it, and with one the conversion still lands."""
+    if shutil.which("git") is None:
+        check("spec pending probe (git unavailable here — skipped)", True)
+        return
+    with tempfile.TemporaryDirectory() as td:
+        td = os.path.realpath(td)
+        repo, base, shim = os.path.join(td, "repo"), os.path.join(td, "base"), os.path.join(td, "bin")
+        os.makedirs(repo)
+        os.makedirs(shim)
+        _git(repo, "init", "-q", "-b", "main")
+        with open(os.path.join(repo, "README.md"), "w") as f:
+            f.write("r\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-qm", "init")
+        _git(repo, "checkout", "-qb", "feature")
+        os.makedirs(os.path.join(repo, "docs", "specs"))
+        spec = "docs/specs/a.md"
+        with open(os.path.join(repo, spec), "w") as f:
+            f.write("---\nspec: a\nowns:\n  - app/x.py\n---\n# A\n")
+        seed_book(base, "repo", [_row("r1", {"event": "read", "path_rx": r"nothing-matches-this"})])
+        log = os.path.join(td, "git.log")
+        real_git = shutil.which("git")
+        with open(os.path.join(shim, "git"), "w") as f:
+            f.write(f'#!/bin/sh\necho "$@" >> "{log}"\nexec "{real_git}" "$@"\n')
+        os.chmod(os.path.join(shim, "git"), 0o755)
+        env = {"MEMHUB_RULEBOOK_BASE": base, "MEMHUB_RULEBOOK_FETCH": "0",
+               "MEMHUB_RULEBOOK_RECALL": "0", "MEMHUB_RULEBOOK_JUDGE": "0",
+               "PATH": shim + os.pathsep + os.environ.get("PATH", "")}
+
+        def post(session):
+            open(log, "w").close()
+            run("post", {"session_id": session, "cwd": repo, "hook_event_name": "PostToolUse",
+                         "tool_name": "Read", "tool_input": {"file_path": os.path.join(repo, "README.md")},
+                         "tool_response": {"type": "text"}, "tool_use_id": "t1"}, env)
+            with open(log) as f:
+                return f.read()
+
+        calls = post("none-pending")
+        check("spec pending probe: no pending entry, no branch-diff git calls",
+              "merge-base" not in calls and "diff --name-only" not in calls, calls)
+
+        os.makedirs(os.path.join(base, "state"), exist_ok=True)
+        with open(os.path.join(base, "state", "one-pending.json"), "w") as f:
+            json.dump({"spec_pending": {json.dumps(["r1", repo, "feature"]): {
+                "root": repo, "branch": "feature", "spec_dir": "docs/specs", "paths": [spec]}}}, f)
+        calls = post("one-pending")
+        check("spec pending probe: a pending entry for this checkout takes the branch diff",
+              "merge-base" in calls and "diff --name-only" in calls, calls)
+        events = []
+        ev_path = os.path.join(base, "ledger", "events.jsonl")
+        if os.path.exists(ev_path):
+            with open(ev_path, encoding="utf-8") as f:
+                events = [json.loads(line) for line in f if line.strip()]
+        check("spec pending probe: the pending entry still converts",
+              any(e.get("kind") == "converted" and e.get("rule_id") == "r1" for e in events), str(events))
+
+
 def apply_patch_checks() -> None:
     """Codex edits with `apply_patch`: the whole patch in `tool_input.command`,
     no `file_path`, a path absolute or relative to cwd. Payloads are the shape
@@ -1143,8 +1208,215 @@ def apply_patch_checks() -> None:
               "[tests-before-push]" in c, c)
 
 
+# ── ENG-1201: one rulebook state dir per backend ─────────────────────────
+
+def _install(root, url):
+    """A copy of the plugin's scripts as one install: `<root>/scripts/…` beside
+    a `.mcp.json` naming `url` — all that tells a staging install from the
+    prod one promote_export.py makes."""
+    shutil.copytree(os.path.dirname(os.path.abspath(HOOK)), os.path.join(root, "scripts"),
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    if url is not None:
+        with open(os.path.join(root, ".mcp.json"), "w", encoding="utf-8") as f:
+            json.dump({"mcpServers": {"memhub": {"type": "http", "url": url}}}, f)
+    return os.path.join(root, "scripts", "rulebook_hook.py")
+
+
+def _paths_cli(hook):
+    """The install's `rulebook_paths.py`, which prints its base when run."""
+    return os.path.join(os.path.dirname(hook), "rulebook_paths.py")
+
+
+def _hook_at(hook, home, args, payload=None, **env_extra):
+    """Run one install's hook with HOME = `home` and none of the developer's
+    MEMHUB_* overrides, so the default (keyed) base is what is exercised and
+    the real ~/.config is never reached."""
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("MEMHUB_") and k != "CLAUDE_PLUGIN_ROOT"}
+    env.update(HOME=home, MEMHUB_RULEBOOK_FETCH="0", **env_extra)
+    argv = [_paths_cli(hook)] if args == ["base"] else [hook, *args]
+    p = subprocess.run([sys.executable, *argv], input=json.dumps(payload or {}),
+                       capture_output=True, text=True, env=env, timeout=30)
+    return p.returncode, p.stdout.strip()
+
+
+def env_keyed_base_checks() -> None:
+    """Two installs on one machine (staging + the prod export) keep separate
+    books, ledgers and session state — observed 2026-10-05: prod's refresh
+    replaced the staging book (89 rules) with its own (1 rule) mid-session,
+    because both lived at <base>/book/<repo>-<hash>.json. And the pre-keying
+    ledger is still drained, never dropped."""
+    with tempfile.TemporaryDirectory() as td:
+        home = os.path.join(td, "home")
+        os.makedirs(home)
+        staging = _install(os.path.join(td, "staging"), "https://api.staging.example.test/mcp-server/mcp")
+        prod = _install(os.path.join(td, "prod"), "https://api.example.test/mcp-server/mcp")
+        broken = _install(os.path.join(td, "broken"), None)
+        shared = os.path.join(home, ".config", "memhub-plugin", "rulebook")
+
+        _, s_base = _hook_at(staging, home, ["base"])
+        _, p_base = _hook_at(prod, home, ["base"])
+        _, s_book = _hook_at(staging, home, ["book-path", "xmem"])
+        _, p_book = _hook_at(prod, home, ["book-path", "xmem"])
+        check("env base: each install keys its state by its own backend host",
+              s_base == os.path.join(shared, "api.staging.example.test")
+              and p_base == os.path.join(shared, "api.example.test"), f"{s_base} | {p_base}")
+        check("env base: two installs never share a repo's book",
+              s_book != p_book and s_book.startswith(s_base + os.sep)
+              and p_book.startswith(p_base + os.sep), f"{s_book} | {p_book}")
+        _, b_base = _hook_at(broken, home, ["base"])
+        check("env base: an install whose .mcp.json is unreadable keeps the old unkeyed base",
+              b_base == shared, b_base)
+        override = os.path.join(td, "override")
+        _, o_base = _hook_at(staging, home, ["base"], MEMHUB_RULEBOOK_BASE=override)
+        _, o_book = _hook_at(prod, home, ["book-path", "xmem"], MEMHUB_RULEBOOK_BASE=override)
+        check("env base: MEMHUB_RULEBOOK_BASE still names the base verbatim, unkeyed",
+              o_base == override and o_book.startswith(os.path.join(override, "book") + os.sep),
+              f"{o_base} | {o_book}")
+        _, x_base = _hook_at(staging, home, ["base"], MEMHUB_MCP_BASE_URL="http://127.0.0.1:9")
+        check("env base: a per-process MEMHUB_MCP_BASE_URL (a test proxy) does not re-key the install",
+              x_base == s_base, x_base)
+
+        # The live failure, end to end: the staging book gates, the prod book
+        # (cached for the same repo) has nothing — each install reads its own,
+        # and the staging fire lands in the staging ledger only.
+        repo = os.path.join(td, "xmem")
+        os.makedirs(os.path.join(repo, ".git"))
+        with open(os.path.join(repo, ".git", "HEAD"), "w", encoding="utf-8") as f:
+            f.write("ref: refs/heads/main\n")
+        gate = {"id": "staging-gate", "on": "bash", "rx": r"git\s+push", "mode": "gate",
+                "fire_scope": "call", "repo_scope": "any", "status": "active",
+                "text": "Do not push yet", "why": "staging rule"}
+        seed_book(s_base, "xmem", [gate])
+        seed_book(p_base, "xmem", [])
+        call = {"cwd": repo, "session_id": "env-s1", "tool_name": "Bash",
+                "tool_input": {"command": "git push origin main"}}
+
+        def denied(out):
+            try:
+                return json.loads(out)["hookSpecificOutput"].get("permissionDecision") == "deny"
+            except Exception:
+                return False
+        _, s_out = _hook_at(staging, home, ["pre"], call)
+        _, p_out = _hook_at(prod, home, ["pre"], dict(call, session_id="env-p1"))
+        check("env base: the staging install enforces the staging book; the prod install its own",
+              denied(s_out) and not denied(p_out), f"{s_out!r} | {p_out!r}")
+        check("env base: the fire lands in that install's ledger, never the other's or the shared one",
+              os.path.isfile(os.path.join(s_base, "ledger", "fires.jsonl"))
+              and not os.path.exists(os.path.join(p_base, "ledger", "fires.jsonl"))
+              and not os.path.exists(os.path.join(shared, "ledger", "fires.jsonl")))
+        check("env base: session state is per install too",
+              os.path.isdir(os.path.join(s_base, "state"))
+              and not os.path.exists(os.path.join(shared, "state")))
+
+    # The pre-keying ledger: rows recorded before the upgrade and never flushed
+    # are still shipped, behind their own watermark, until it is drained.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(HOOK)))
+    import rulebook_hook as H
+    import rulebook_paths
+
+    def flush_lane():      # what `rulebook_hook.py flush` runs
+        H.flush_fires(final=True)
+        rulebook_paths.drain_legacy(vars(H), final=True)   # the hook passes globals()
+    saved = (H.BASE, H.LEGACY_BASE, H._api, H._ACTIVE_BASE)
+    with tempfile.TemporaryDirectory() as td:
+        keyed, legacy = os.path.join(td, "rulebook", "api.example.test"), os.path.join(td, "rulebook")
+        for base, ids in ((keyed, ("new-1",)), (legacy, ("old-1", "old-2"))):
+            os.makedirs(os.path.join(base, "ledger"), exist_ok=True)
+            with open(os.path.join(base, "ledger", "fires.jsonl"), "w", encoding="utf-8") as f:
+                for i in ids:
+                    f.write(json.dumps({"fire_id": i, "rule_id": "r", "fired_at": "t"}) + "\n")
+        posted, fail = [], {"on": True}
+
+        class _R:
+            def __init__(self, n):
+                self.status = 500 if fail["on"] else 202
+                self.data = None if fail["on"] else {"accepted": n, "rejected": 0}
+
+        class _Http:
+            @staticmethod
+            def rest(url, bearer, method, body=None, headers=None, timeout=None):
+                rows = (body or {}).get("fires") or []
+                if not fail["on"]:
+                    posted.extend(r["fire_id"] for r in rows)
+                return _R(len(rows))
+        try:
+            H.BASE, H.LEGACY_BASE, H._ACTIVE_BASE = keyed, legacy, ""
+            H._api = lambda: ("http://x", "t", _Http)
+            legacy_sent = os.path.join(legacy, "ledger", ".sent")
+            flush_lane()                      # server down
+            check("legacy ledger: a failed flush leaves the old rows behind their watermark",
+                  H.load_sent().get("fires_offset", 0) == 0 and not os.path.exists(legacy_sent)
+                  and posted == [], str(posted))
+            fail["on"] = False
+            flush_lane()
+            check("legacy ledger: the pre-upgrade rows are flushed after this install's own",
+                  posted == ["new-1", "old-1", "old-2"], str(posted))
+            with open(legacy_sent, encoding="utf-8") as f:
+                lw = json.load(f)
+            check("legacy ledger: …and its own watermark reaches the end of the old file",
+                  lw.get("fires_offset") == os.path.getsize(os.path.join(legacy, "ledger", "fires.jsonl")), str(lw))
+            check("legacy ledger: the drain leaves this process on its own base",
+                  H._base() == keyed and H._ledger_dir() == os.path.join(keyed, "ledger"))
+            real_flush, legacy_runs = H.flush_fires, []
+
+            def counting_flush(final=False):
+                if H._ACTIVE_BASE == legacy:
+                    legacy_runs.append(1)
+                return real_flush(final=final)
+            H.flush_fires = counting_flush
+            try:
+                flush_lane()
+            finally:
+                H.flush_fires = real_flush
+            check("legacy ledger: a drained old ledger sends nothing again",
+                  posted == ["new-1", "old-1", "old-2"], str(posted))
+            check("legacy ledger: …and once drained it is not flushed at all (no per-flush cost)",
+                  legacy_runs == [], str(legacy_runs))
+            H.LEGACY_BASE = ""                              # MEMHUB_RULEBOOK_BASE in force
+            with open(os.path.join(legacy, "ledger", "fires.jsonl"), "a", encoding="utf-8") as f:
+                f.write(json.dumps({"fire_id": "old-3", "rule_id": "r", "fired_at": "t"}) + "\n")
+            flush_lane()
+            check("legacy ledger: with an override there is no old ledger to drain",
+                  "old-3" not in posted, str(posted))
+            # A send failure during the drain is loud where capture_health looks:
+            # the flush lane breadcrumbs under the base it is flushing (the old
+            # one), so the drain re-raises it in THIS install's .last_error.
+            H.LEGACY_BASE = legacy
+            with open(os.path.join(legacy, "ledger", "fires.jsonl"), "a", encoding="utf-8") as f:
+                f.write(json.dumps({"fire_id": "old-4", "rule_id": "r", "fired_at": "t"}) + "\n")
+            before = json.load(open(legacy_sent, encoding="utf-8"))["fires_offset"]
+
+            class _Down:
+                @staticmethod
+                def rest(url, bearer, method, body=None, headers=None, timeout=None):
+                    raise OSError("connection refused (harness)")
+            H._api = lambda: ("http://x", "t", _Down)
+            own_crumb = os.path.join(keyed, "ledger", ".last_error")
+            if os.path.exists(own_crumb):
+                os.unlink(own_crumb)
+            flush_lane()
+            try:
+                crumb = json.load(open(own_crumb, encoding="utf-8"))
+            except Exception:
+                crumb = {}
+            check("legacy ledger: a send failure while draining lands in this install's own .last_error",
+                  crumb.get("what") == "flush" and "old shared ledger" in str(crumb.get("error"))
+                  and "connection refused" in str(crumb.get("error")), str(crumb))
+            check("legacy ledger: …and the old rows stay behind their watermark",
+                  json.load(open(legacy_sent, encoding="utf-8"))["fires_offset"] == before)
+            with open(HOOK, encoding="utf-8") as f:
+                src = f.read()
+            lane = src[src.index('if mode == "flush":'):]
+            check("legacy ledger: the hook's flush lane runs the drain after its own flush",
+                  lane.find("_rbp.drain_legacy(") > lane.find("flush_fires(final=final)") >= 0)
+        finally:
+            H.BASE, H.LEGACY_BASE, H._api, H._ACTIVE_BASE = saved
+
+
 def main() -> int:
     portability_check()
+    env_keyed_base_checks()      # ENG-1201: one state dir per backend
     with tempfile.TemporaryDirectory() as td:
         repo = os.path.join(td, "xmem")           # fake git repo named xmem
         os.makedirs(os.path.join(repo, ".git"))
@@ -1320,9 +1592,11 @@ def main() -> int:
                          tool_response={"stdout": "ok"}), cenv)
         with open(os.path.join(td, "ledger", "fires.jsonl"), encoding="utf-8") as f:
             rows = [json.loads(l) for l in f if l.strip() and '"cap-' in l]
-        modes = {r["rule_id"]: r["mode"] for r in rows}
+        modes = [(r["rule_id"], r["mode"]) for r in rows]
         check("cap: the cut rule is logged mode=suppressed, never silently dropped",
-              modes == {"cap-0": "advise", "cap-1": "advise", "cap-2": "suppressed"}, str(modes))
+              modes[:3] == [("cap-0", "advise"), ("cap-1", "advise"), ("cap-2", "suppressed")], str(modes))
+        check("cap: a rule the cap cut is not spent — it fires on the next matching call",
+              modes[3:] == [("cap-2", "advise")], str(modes))
         check("cap: raw_matches_before_fire recorded", all(r["raw_matches_before_fire"] == 1 for r in rows))
         with open(os.path.join(td, "ledger", "events.jsonl"), encoding="utf-8") as f:
             evs = [json.loads(l) for l in f if l.strip()]
@@ -1575,10 +1849,77 @@ def main() -> int:
               "gives up quickly rather than reading it all",
               got is None and (time.time() - t0) < 1.0)
 
-    # --- what the recall lane sends ---------------------------------------
-    # /recall is the one lane that carries content: the relevance judge needs
-    # the call itself. A command line is also where credentials live, and they
-    # are worth nothing to the judge.
+    # --- anchor rules: matched locally, as whole identifiers (ENG-1203) ------
+    anc = {"id": "a", "on": "anchor", "anchors": ["agent-plugins", "SKILL.md",
+                                                  "app/core/config.py", "docs/specs/", "/"]}
+    for label, text, want in [
+        ("a longer name containing the anchor does not match",
+         "cd ~/xtrace/agent-plugins-internal && ls", []),
+        ("the anchor itself matches", "gh repo view XTraceAI/agent-plugins", ["agent-plugins"]),
+        ("a file name matches after a directory", "cat skills/x/SKILL.md", ["SKILL.md"]),
+        ("a relative path matches the tail of an absolute one",
+         "/Users/f/MemHub-Backend/app/core/config.py", ["app/core/config.py"]),
+        ("…but not a longer file name", "app/core/config.pyc", []),
+        ("…nor a different directory prefix", "myapp/core/config.py", []),
+        ("a trailing-slash anchor matches the directory named whole", "ls docs/specs", ["docs/specs/"]),
+        ("…and any path under it", "cat docs/specs/x.md", ["docs/specs/"]),
+        ("…but not a longer directory name", "ls docs/specs-old/x.md", []),
+        ("case-sensitive", "cat skill.md", []),
+        ("a bare `/` anchor never matches", "ls /", []),
+    ]:
+        check("anchor_hits: %s" % label, rb.anchor_hits(anc, text) == want, str(rb.anchor_hits(anc, text)))
+    check("the /recall client is gone", not hasattr(rb, "recall_anchor_rules"))
+
+    with tempfile.TemporaryDirectory() as td:
+        repo = os.path.join(td, "anchrepo")
+        os.makedirs(os.path.join(repo, ".git"))
+        with open(os.path.join(repo, ".git", "HEAD"), "w", encoding="utf-8") as f:
+            f.write("ref: refs/heads/main\n")
+        seed_book(td, "anchrepo", [
+            _row("anc-cfg", delivery="anchor_recall", anchors=["config.py"], statement="CFG ANCHOR"),
+            _row("anc-scoped", delivery="anchor_recall", anchors=["models.py"],
+                 statement="SCOPED ANCHOR", scope_paths=["app/**"]),
+            _row("anc-draft", delivery="anchor_recall", anchors=["config.py"],
+                 statement="DRAFT ANCHOR", status="draft"),
+            _row("anc-other", delivery="anchor_recall", anchors=["config.py"],
+                 statement="OTHER REPO ANCHOR", scope_repos=["some-other-repo"]),
+        ] + [_row("anc-cap%d" % i, delivery="anchor_recall", anchors=["cap.py"],
+                  statement="CAP ANCHOR %d" % i) for i in (1, 2, 3)])
+        # No token and no server: the lane must not need either.
+        aenv = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_RULEBOOK_FETCH": "0",
+                "MEMHUB_RULEBOOK_JUDGE": "0", "MEMHUB_TOKEN": "",
+                "MEMHUB_MCP_BASE_URL": "http://127.0.0.1:9"}
+
+        def edit(sid, path):
+            return run("pre", {"cwd": repo, "session_id": sid, "tool_name": "Edit",
+                               "tool_input": {"file_path": os.path.join(repo, path),
+                                              "old_string": "a", "new_string": "b"}}, aenv)[1]
+        out = edit("an1", "src/config.py")
+        check("anchor lane: an edit naming the anchor fires it locally, with no server",
+              "CFG ANCHOR" in ctx(out), out)
+        check("anchor lane: a draft or other-repo anchor rule does not fire",
+              "DRAFT ANCHOR" not in ctx(out) and "OTHER REPO ANCHOR" not in ctx(out), out)
+        check("anchor lane: path scope — outside `app/**` the scoped rule stays quiet",
+              "SCOPED ANCHOR" not in ctx(edit("an2", "src/models.py")))
+        check("anchor lane: path scope — inside `app/**` it fires",
+              "SCOPED ANCHOR" in ctx(edit("an3", "app/models.py")))
+        out = run("pre", {"cwd": repo, "session_id": "an4", "tool_name": "Bash",
+                          "tool_input": {"command": "python -m pytest app/models.py"}}, aenv)[1]
+        check("anchor lane: a Bash call carries no path, so an include-scoped rule stays quiet",
+              "SCOPED ANCHOR" not in ctx(out), out)
+        out1, out2 = ctx(edit("an6", "cap.py")), ctx(edit("an6", "cap.py"))
+        check("anchor lane: at most MAX_ADVISE anchors per call, first by book order; "
+              "the one left over is still unspent and fires on the next call",
+              "CAP ANCHOR 1" in out1 and "CAP ANCHOR 2" in out1 and "CAP ANCHOR 3" not in out1
+              and "CAP ANCHOR 3" in out2 and "CAP ANCHOR 1" not in out2, out1 + " || " + out2)
+        out = run("pre", {"cwd": repo, "session_id": "an5", "tool_name": "Bash",
+                          "tool_input": {"command": "python config.py"}},
+                  dict(aenv, MEMHUB_RULEBOOK_RECALL="0"))[1]
+        check("anchor lane: MEMHUB_RULEBOOK_RECALL=0 turns it off", "CFG ANCHOR" not in ctx(out), out)
+
+    # --- credentials out of command text ---------------------------------
+    # The judge sees the call itself, and a command line is where credentials
+    # live; they are worth nothing to the judge.
     for label, cmd in [
         ("Authorization header", 'curl -H "Authorization: Bearer sk-live-abcdefghij1234567890" https://x'),
         ("credentials in a URL", 'psql "postgres://admin:hunter2@db.internal/prod"'),
@@ -1590,7 +1931,7 @@ def main() -> int:
         ("our own access key", 'curl -H "x: mhk_AbCdEf123456789" https://x'),
     ]:
         out = rb.redact_secrets(cmd)
-        check("recall redacts: %s" % label,
+        check("redact_secrets: %s" % label,
               "<redacted>" in out and "hunter2" not in out and "p4ssw0rd" not in out
               and "super-secret-value" not in out and "ghp_AAAABBBBCCCCDDDDEEEEFFFF1111" not in out
               and "AKIAIOSFODNN7EXAMPLE" not in out, out)
@@ -1605,14 +1946,14 @@ def main() -> int:
         ('curl --user user:"pass"', 'curl --user admin:"s3cr3t pw" https://x.com', "s3cr3t pw"),
     ]:
         out = rb.redact_secrets(cmd)
-        check("recall redacts a quoted value: %s" % label,
+        check("redact_secrets: a quoted value: %s" % label,
               "<redacted>" in out and secret not in out, out)
 
     # Over-redaction is not free: it costs the judge the verb of the command.
     for cmd in ["git push --force origin main", "gh auth login", "kubectl get secrets",
                 "npm run build -- --token-budget 500", "pytest tests/ -k rulebook",
                 "ls -la ~/.ssh"]:
-        check("recall leaves an innocent command intact: %s" % cmd[:34],
+        check("redact_secrets leaves an innocent command intact: %s" % cmd[:34],
               rb.redact_secrets(cmd) == cmd, rb.redact_secrets(cmd))
 
     check("redaction never raises on empty or None",
@@ -2044,10 +2385,17 @@ def main() -> int:
     apply_patch_checks()
     read_lane_checks()
     diff_base_checks()
+    spec_pending_probe_checks()
     armed_lane_checks()
     min_hook_version_checks()
     prompt_lane_checks()
+    edit_added_checks()
+    server_shape_edge_checks()
     spec_untouched_text_checks()
+    run_cache_checks()
+    fresh_book_fetch_checks()
+    first_fetch_checks()
+    ledger_rotation_checks()
 
     print()
     if FAILURES:
@@ -2550,7 +2898,9 @@ def armed_lane_checks() -> None:
                            ("Approach this assignment about staging", False),
                            ("<system-reminder>staging</system-reminder>", True),
                            ("Base directory for this skill: /x staging", True),
-                           ("This session is being continued about staging", True)):
+                           ("This session is being continued about staging", True),
+                           ('Another Claude session sent a message:\n<agent-message from="a">'
+                            '\n[Subagent hand-back] staging is broken', True)):
             check(f"harness_prompt({text[:34]!r}...) is {want}",
                   rb_mod.harness_prompt(text) is want, str(rb_mod.harness_prompt(text)))
 
@@ -2649,6 +2999,546 @@ def armed_lane_checks() -> None:
                                                          armed_by_rx=bad))) is None)
         check("prompt-armed: a good armed_by_rx still loads",
               rb_mod.to_hook_rule(dict(probe_rule)) is not None)
+
+
+def fresh_book_fetch_checks() -> None:
+    """SessionStart and a prompt start NO fetch child when the cached book is
+    younger than REFRESH_AFTER_S: one was spawned on every SessionStart, a
+    fresh interpreter re-fetching a book a minute old. A stale book is still
+    fetched synchronously, bounded, and still starts no child."""
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(os.path.dirname(HOOK)))
+    import rulebook_hook as H
+
+    calls = []
+    saved = (H.spawn_fetch, H.fetch_book, H.load_rules, os.environ.get("MEMHUB_RULEBOOK_FETCH"))
+    H.spawn_fetch = lambda repo: calls.append(("spawn", repo))
+    H.fetch_book = lambda repo, timeout=None: calls.append(("fetch", repo, timeout))
+    H.load_rules = lambda repo: (["new"], "v", H._now(), {"s": 2})
+    os.environ["MEMHUB_RULEBOOK_FETCH"] = "1"
+    try:
+        fresh = H._now()
+        out = H.refresh_if_stale("r", ["old"], fresh, {"s": 1})
+        check("fresh book: no detached fetch child, no fetch, the cache as it is",
+              calls == [] and out == (["old"], fresh, {"s": 1}), str((calls, out)))
+        stale = (datetime.now(timezone.utc) - timedelta(seconds=H.REFRESH_AFTER_S + 5)).isoformat()
+        out = H.refresh_if_stale("r", ["old"], stale, {"s": 1})
+        check("stale book: one bounded synchronous fetch, then the reloaded book, no child",
+              calls == [("fetch", "r", H.SESSION_FETCH_TIMEOUT_S)] and out[0] == ["new"],
+              str((calls, out)))
+    finally:
+        H.spawn_fetch, H.fetch_book, H.load_rules = saved[:3]
+        if saved[3] is None:
+            os.environ.pop("MEMHUB_RULEBOOK_FETCH", None)
+        else:
+            os.environ["MEMHUB_RULEBOOK_FETCH"] = saved[3]
+
+
+def first_fetch_checks() -> None:
+    """A call in a repo with NO cached book gets one bounded synchronous fetch
+    before it is judged (ENG-1249: a session started above a bare `.git` and
+    its worktrees had no SessionStart fetch, and the detached refresh landed
+    after the first edit — which fired nothing). Once a minute per repo through
+    the `.refresh` stamp, so a dead server costs one timeout a minute; a cached
+    book, stale or not, is still maybe_refresh's detached business."""
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(os.path.dirname(HOOK)))
+    import rulebook_hook as H
+
+    calls = []
+    saved = (H.spawn_fetch, H.fetch_book, H.load_rules, H.upgrade_status, H.BASE,
+             os.environ.get("MEMHUB_RULEBOOK_FETCH"))
+    H.spawn_fetch = lambda repo: calls.append(("spawn", repo))
+    H.fetch_book = lambda repo, timeout=None: calls.append(("fetch", repo, timeout))
+    H.load_rules = lambda repo: (["new"], "v", H._now(), {"s": 2})
+    H.upgrade_status = lambda repo: None
+    os.environ["MEMHUB_RULEBOOK_FETCH"] = "1"
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            H.BASE = td
+            out = H.first_fetch("r", [], None, {})
+            check("no cached book: one bounded synchronous fetch, then the reloaded book, no child",
+                  calls == [("fetch", "r", H.SESSION_FETCH_TIMEOUT_S)] and out == (["new"], out[1], {"s": 2})
+                  and out[1] is not None, str((calls, out)))
+            calls.clear()
+            out = H.first_fetch("r", [], None, {})
+            check("still no book a moment later (server down): no second fetch within the minute",
+                  calls == [] and out == ([], None, {}), str((calls, out)))
+            H.maybe_refresh("r", None)
+            check("…and maybe_refresh starts no detached child either: the stamp is shared",
+                  calls == [], str(calls))
+            os.remove(H.book_path("r") + ".refresh")
+            H.maybe_refresh("r", None)
+            check("stamp gone: maybe_refresh's detached child again, as before",
+                  calls == [("spawn", "r")], str(calls))
+            calls.clear()
+            stale = (datetime.now(timezone.utc) - timedelta(seconds=H.REFRESH_AFTER_S + 5)).isoformat()
+            out = H.first_fetch("s", ["old"], stale, {"s": 1})
+            check("a cached book, however stale, is not first_fetch's: untouched, no fetch",
+                  calls == [] and out == (["old"], stale, {"s": 1}), str((calls, out)))
+            out = H.first_fetch("", [], None, {})
+            # A projectless Claude call's book (repo="": rules binding every
+            # repo) is fetched like any other; Codex never reaches here.
+            check("no repo named: the projectless book is fetched like any other",
+                  calls == [("fetch", "", H.SESSION_FETCH_TIMEOUT_S)] and out[0] == ["new"], str((calls, out)))
+            calls.clear()
+            H.upgrade_status = lambda repo: {"scope": "org", "minimum_version": "9.9.9"}
+            out = H.first_fetch("u", [], None, {})
+            check("an upgrade notice suspends the book: no fetch", calls == [], str(calls))
+            H.upgrade_status = lambda repo: None
+            os.environ["MEMHUB_RULEBOOK_FETCH"] = "0"
+            out = H.first_fetch("f", [], None, {})
+            check("MEMHUB_RULEBOOK_FETCH=0: nothing", calls == [], str(calls))
+    finally:
+        H.spawn_fetch, H.fetch_book, H.load_rules, H.upgrade_status, H.BASE = saved[:5]
+        if saved[5] is None:
+            os.environ.pop("MEMHUB_RULEBOOK_FETCH", None)
+        else:
+            os.environ["MEMHUB_RULEBOOK_FETCH"] = saved[5]
+
+
+_ROTATION_CRASH = r"""
+import os, sys
+sys.path.insert(0, sys.argv[1])
+import rulebook_hook as H
+H.BASE = sys.argv[2]
+when, real = sys.argv[3], os.replace
+def replace(src, dst):
+    if when == "before-intent" and dst.endswith(".sent") and "rotating" in open(src).read():
+        os._exit(9)
+    if when == "before-swap" and dst.endswith("fires.jsonl"):
+        os._exit(9)
+    real(src, dst)
+    if when == "after-swap" and dst.endswith("fires.jsonl"):
+        os._exit(9)
+H.os.replace = replace
+H.rulebook_ledger.rotate(os.path.join(H.BASE, "ledger"), [x[:2] for x in H.LEDGERS],
+                         H._LEDGER_TAIL_BYTES)
+os._exit(0)
+"""
+
+
+def ledger_rotation_checks() -> None:
+    """fires.jsonl / events.jsonl are rotated (ENG-1201) — and rotation may
+    only ever drop rows the server already confirmed: rows below the `.sent`
+    watermark. Every check here compares what the NEXT flush would post with
+    exactly the rows that were unsent before, so a lost row and a re-sent row
+    both fail it. Crashes are real (`os._exit` in a child) at each step."""
+    import sys as _sys
+    import threading
+    _sys.path.insert(0, os.path.join(os.path.dirname(HOOK)))
+    import rulebook_hook as H
+    L = H.rulebook_ledger
+
+    def rotate(ldir):        # what flush_fires runs first, under .flush.lock
+        L.rotate(ldir, [x[:2] for x in H.LEDGERS], H._LEDGER_TAIL_BYTES)
+
+    saved_base = H.BASE
+
+    def setup(td, n=3000, sent_rows=2000, pad=480):
+        H.BASE = td
+        ldir = H._ledger_dir()
+        rows = [{"fire_id": f"f{i:05d}", "rule_id": "r", "session_id": f"s{i % 7}",
+                 "fired_at": f"2026-10-05T00:{i // 60 % 60:02d}:{i % 60:02d}+00:00",
+                 "excerpt": "x" * pad} for i in range(n)]
+        data = b"".join((json.dumps(r) + "\n").encode() for r in rows)
+        with open(os.path.join(ldir, "fires.jsonl"), "wb") as f:
+            f.write(data)
+        wm = sum(len((json.dumps(r) + "\n").encode()) for r in rows[:sent_rows])
+        H._atomic_json(H._sent_path(), {"fires_offset": wm, "events_offset": 0,
+                                         "last_flush_at": None})
+        return ldir, [r["fire_id"] for r in rows], wm
+
+    def next_flush_ids():
+        batches, _ = H.pending_batches(H.load_sent())
+        return [r["fire_id"] for b, _ in batches for r in b]
+
+    def on_disk_ids(ldir):
+        return [json.loads(x)["fire_id"] for x in
+                open(os.path.join(ldir, "fires.jsonl"), "rb").read().splitlines() if x]
+
+    try:
+        # ── the happy path ───────────────────────────────────────────────
+        with tempfile.TemporaryDirectory() as td:
+            ldir, ids, wm = setup(td)
+            size0 = os.path.getsize(os.path.join(ldir, "fires.jsonl"))
+            tails = {f"s{k}": H._earliest_fire_after(f"s{k}", "2026-10-05T00:00:00+00:00")
+                     for k in range(7)}
+            rotate(ldir)
+            kept = on_disk_ids(ldir)
+            size1 = os.path.getsize(os.path.join(ldir, "fires.jsonl"))
+            check("rotation: a ledger past 1 MB shrinks", size0 > L.ROTATE_AT and size1 < size0,
+                  f"{size0} -> {size1}")
+            check("rotation: what stays is a whole-line suffix of the ledger (every unsent row kept)",
+                  kept == ids[len(ids) - len(kept):] and len(kept) >= 1000, str(len(kept)))
+            check("rotation: the next flush posts exactly the rows that were unsent",
+                  next_flush_ids() == ids[2000:], str(next_flush_ids()[:3]))
+            check("rotation: the newest 256 KB stay, so the turn_end tail reader sees the same fires",
+                  size1 >= H._LEDGER_TAIL_BYTES - 1024 and tails == {
+                      k: H._earliest_fire_after(k, "2026-10-05T00:00:00+00:00") for k in tails},
+                  str(size1))
+            sent = H.load_sent()
+            check("rotation: no intent and no half-written file left behind",
+                  "rotating" not in sent and not [n for n in os.listdir(ldir) if n.startswith(".rot-")],
+                  str((sent, os.listdir(ldir))))
+            rotate(ldir)
+            check("rotation: a second pass with nothing confirmed to drop changes nothing",
+                  on_disk_ids(ldir) == kept and next_flush_ids() == ids[2000:])
+
+        # Mostly confirmed: the cut is set by the 256 KB tail, not the
+        # watermark, so confirmed rows stay above the cut and the watermark
+        # must move down by exactly the cut.
+        with tempfile.TemporaryDirectory() as td:
+            ldir, ids, wm = setup(td, sent_rows=2900)
+            tails = {f"s{k}": H._earliest_fire_after(f"s{k}", "2026-10-05T00:00:00+00:00")
+                     for k in range(7)}
+            rotate(ldir)
+            kept = on_disk_ids(ldir)
+            check("rotation (tail-bound cut): keeps a whole-line suffix past the unsent rows",
+                  kept == ids[len(ids) - len(kept):] and 100 < len(kept) < 1000, str(len(kept)))
+            check("rotation (tail-bound cut): the next flush posts exactly the unsent rows",
+                  next_flush_ids() == ids[2900:], str(next_flush_ids()[:3]))
+            check("rotation (tail-bound cut): the tail reader sees the same fires",
+                  os.path.getsize(os.path.join(ldir, "fires.jsonl")) >= H._LEDGER_TAIL_BYTES - 1024
+                  and tails == {k: H._earliest_fire_after(k, "2026-10-05T00:00:00+00:00")
+                                for k in tails})
+
+        # flush_fires runs it, under its lock, before (and whatever) it posts
+        with tempfile.TemporaryDirectory() as td:
+            ldir, ids, wm = setup(td)
+            real_api, H._api = H._api, lambda: None      # no credential: nothing posts
+            try:
+                H.flush_fires(final=True)
+            finally:
+                H._api = real_api
+            check("rotation: flush_fires rotates an oversized ledger, exactly",
+                  len(on_disk_ids(ldir)) < len(ids) and next_flush_ids() == ids[2000:])
+
+        # ── when it must not rotate ──────────────────────────────────────
+        with tempfile.TemporaryDirectory() as td:
+            ldir, ids, wm = setup(td, n=1500)            # < 1 MB
+            rotate(ldir)
+            check("rotation: a ledger under 1 MB is left alone", on_disk_ids(ldir) == ids)
+        with tempfile.TemporaryDirectory() as td:
+            ldir, ids, wm = setup(td, sent_rows=200)     # mostly unsent
+            rotate(ldir)
+            check("rotation: little confirmed → nothing to gain, nothing cut",
+                  on_disk_ids(ldir) == ids and next_flush_ids() == ids[200:])
+        with tempfile.TemporaryDirectory() as td:
+            ldir, ids, wm = setup(td)
+            with open(os.path.join(ldir, "conversions.jsonl"), "w") as f:
+                f.write(json.dumps({"fire_id": "f00001", "converted": True}) + "\n")
+            rotate(ldir)
+            check("rotation: fires stay whole while pre-v0.59 verdicts wait to drain "
+                  "(the drain reads fire rows from the start)", on_disk_ids(ldir) == ids)
+
+        # ── a crash at every step ────────────────────────────────────────
+        for when, n_sent in [(w, n) for w in ("before-intent", "before-swap", "after-swap")
+                             for n in (2000, 2900)]:
+            with tempfile.TemporaryDirectory() as td:
+                ldir, ids, wm = setup(td, sent_rows=n_sent)
+                p = subprocess.run([sys.executable, "-c", _ROTATION_CRASH,
+                                    os.path.dirname(HOOK), td, when],
+                                   capture_output=True, text=True, timeout=60)
+                crashed = p.returncode == 9
+                H.BASE = td
+                pending = H.load_sent().get("rotating")
+                L.finish(ldir)                 # what the next flush does first
+                check(f"rotation crash {when}/{n_sent}: the next flush posts exactly the unsent rows",
+                      crashed and next_flush_ids() == ids[n_sent:],
+                      f"rc={p.returncode} {p.stderr[-300:]} intent={pending} "
+                      f"first={next_flush_ids()[:2]} n={len(next_flush_ids())}")
+                check(f"rotation crash {when}/{n_sent}: the intent and any half-written file are gone",
+                      "rotating" not in H.load_sent()
+                      and not [n for n in os.listdir(ldir) if n.startswith(".rot-")])
+                rotate(ldir)                   # and a later rotation still works
+                check(f"rotation crash {when}/{n_sent}: a later rotation completes, still exact",
+                      next_flush_ids() == ids[n_sent:] and len(on_disk_ids(ldir)) < len(ids))
+
+        # ── an append waits for a rotation in progress ──────────────────
+        with tempfile.TemporaryDirectory() as td:
+            ldir, ids, wm = setup(td, n=10)
+            lock = L.append_lock(ldir)
+            done = threading.Event()
+            t = threading.Thread(target=lambda: (H.log_event({"session": "s"}, "turn_end"), done.set()))
+            t.start()
+            waited = not done.wait(0.5)
+            L.release(lock)
+            t.join(10)
+            ev = os.path.join(ldir, "events.jsonl")
+            check("rotation: a ledger append waits while a rotation holds the append lock",
+                  waited and done.is_set() and os.path.exists(ev) and len(open(ev).readlines()) == 1)
+    finally:
+        H.BASE = saved_base
+
+
+def server_shape_edge_checks() -> None:
+    """Two rule shapes the server accepts that this hook used to drop silently:
+    a regex past 400 characters (the server allows 2000, floored at 0.88.0) and
+    an edit rule with content_rx but no path_rx (validation takes either)."""
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(os.path.dirname(HOOK)))
+    import rulebook_hook as H
+
+    long_rx = "longpattern-hit|" + "|".join("alt%04d" % i for i in range(70))
+    r = H.to_hook_rule(_row("long-rx", {"event": "bash", "command_rx": long_rx},
+                            min_hook_version="0.88.0"))
+    check("edge: a %d-char regex the server accepted loads" % len(long_rx),
+          len(long_rx) > 400 and r is not None, str(r)[:200])
+    check("edge: …and fires on its command",
+          r is not None and bool(H.evaluate(r, hook_phase="pre", tool="Bash",
+                                            cmd="echo longpattern-hit")))
+    check("edge: a regex past the server's 2000 cap is still dropped",
+          H.to_hook_rule(_row("too-long", {"event": "bash", "command_rx": "a" * 2001})) is None)
+
+    r = H.to_hook_rule(_row("content-only", {"event": "edit", "content_rx": "TODO"}))
+    check("edge: a content-only edit rule loads", r is not None, str(r))
+    check("edge: …and fires on any path whose body matches",
+          r is not None and bool(H.evaluate(r, hook_phase="pre", tool="Edit",
+                                            file_path="/x/a.py", body="# TODO later")))
+    check("edge: …and stays silent when the body does not match",
+          r is not None and not H.evaluate(r, hook_phase="pre", tool="Edit",
+                                           file_path="/x/a.py", body="# done"))
+
+
+def run_cache_checks() -> None:
+    """The hook process keeps two caches so a tool call pays for neither the
+    per-row lint of an unchanged book nor a `git` subprocess to name an
+    unchanged checkout. Both must be invisible: a hit returns exactly what a
+    cold load returns, any change to what the answer depends on misses, and a
+    corrupt cache is the cold path. In-process, `H._rc` is set by hand (only
+    `__main__` imports rulebook_cache) and BASE points at a temp dir."""
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(os.path.dirname(HOOK)))
+    import rulebook_cache as RC
+    import rulebook_hook as H
+    RI = H.repo_identity     # the hook's own pinned copy, not a second import
+
+    rows = [
+        _row("rc-bash", {"event": "bash", "command_rx": r"\bgit\s+push\b",
+                         "command_not_rx": "--dry-run", "warn_once_per": "turn"}, mode="gate"),
+        _row("rc-given", {"event": "bash", "command_rx": r"\bpytest\b",
+                          "given": {"repo": {"branch_rx": "^main$"}}}),
+        _row("rc-output", {"event": "output", "command_rx": "pytest", "content_rx": "FAILED"}),
+        _row("rc-prompt", {"event": "prompt", "prompt_rx": "ship it"}),
+        _row("rc-session", delivery="session_context"),
+        _row("rc-future", {"event": "bash", "command_rx": "deploy"}, mode="gate",
+             min_hook_version="99.0.0"),
+        _row("rc-bad-rx", {"event": "bash", "command_rx": "(a+)+"}),
+        _row("rc-bash", {"event": "bash", "command_rx": "dup"}),   # duplicate id: first wins
+        {"id": "rc-pilot", "on": "edit", "path_rx": r"\.py$", "text": "pilot", "why": "w"},
+    ]
+    old_base, old_flag = H.BASE, H._rc
+    with tempfile.TemporaryDirectory() as td:
+        H.BASE = td
+        try:
+            seed_book(td, "cache-repo", rows)
+            book = H.book_path("cache-repo")
+            norm = book + ".norm"
+            H._rc = None
+            fresh = H.load_rules("cache-repo")
+            check("cache: an import never writes the normalised book", not os.path.exists(norm))
+            H._rc = RC
+            cold = H.load_rules("cache-repo")
+            check("cache: the hook process writes it beside the book", os.path.exists(norm))
+
+            calls = []
+            real = H.to_hook_rule
+            H.to_hook_rule = lambda row: calls.append(row) or real(row)
+            try:
+                hit = H.load_rules("cache-repo")
+                check("cache: a hit re-lints no row", calls == [], str(len(calls)))
+                check("cache: a hit returns exactly the cold load (rules, fetched_at, sources)",
+                      hit == cold == fresh and [r["id"] for r in hit[0]][0] == "rc-bash"
+                      and "rc-bad-rx" not in hit[3] and len(hit[0]) == 7, str(hit)[:300])
+
+                # Same length, same file (in place, so the inode stays): only the bytes differ.
+                with open(book, encoding="utf-8") as f:
+                    text = f.read()
+                with open(book, "w", encoding="utf-8") as f:
+                    f.write(text.replace("rc-session text", "rc-sessXon text"))
+                calls.clear()
+                edited = H.load_rules("cache-repo")
+                check("cache: an edited book misses and is re-linted",
+                      len(calls) == len(rows)
+                      and any(r.get("text") == "rc-sessXon text" for r in edited[0]),
+                      str([r.get("text") for r in edited[0]]))
+
+                H._HOOK_VERSION[:] = [(99, 0, 0)]
+                calls.clear()
+                newer = H.load_rules("cache-repo")
+                future = [r for r in newer[0] if r["id"] == "rc-future"]
+                check("cache: a different hook version misses (min_hook_version re-judged)",
+                      len(calls) == len(rows) and future and future[0].get("mode") == "gate"
+                      and "_degraded" not in future[0], str(future))
+                H._HOOK_VERSION[:] = []
+
+                # the last one carries the RIGHT key: only the row check refuses it
+                real_key = [H.hashlib.sha1(open(book, "rb").read()).hexdigest(),
+                            RC.hook_identity(H.__file__, H.hook_version(), H._ACTIVE_BASE)]
+                for garbage in ("{not json", json.dumps({"key": "x", "rules": []}),
+                                json.dumps({"key": real_key, "rules": [{"id": ""}]})):
+                    with open(norm, "w", encoding="utf-8") as f:
+                        f.write(garbage)
+                    calls.clear()
+                    H._HOOK_VERSION[:] = []
+                    got = H.load_rules("cache-repo")
+                    H._rc = None
+                    want = H.load_rules("cache-repo")
+                    H._rc = RC
+                    check("cache: a corrupt or foreign cache is the cold path (%s…)" % garbage[:12],
+                          got == want and len(calls) >= len(rows), str(got)[:200])
+            finally:
+                H.to_hook_rule = real
+                H._HOOK_VERSION[:] = []
+
+            # End to end, through the real process: the second call is served
+            # from the cache and fires the same gate with the same text.
+            repo = os.path.join(td, "cache-repo")
+            os.makedirs(os.path.join(repo, ".git"))
+            with open(os.path.join(repo, ".git", "HEAD"), "w", encoding="utf-8") as f:
+                f.write("ref: refs/heads/feature\n")
+            os.remove(norm)
+            env = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_RULEBOOK_FETCH": "0"}
+            outs = []
+            for i in range(2):
+                _, out = run("pre", {"session_id": f"rc-{i}", "cwd": repo, "tool_name": "Bash",
+                                     "tool_input": {"command": "git push origin feature"}}, env)
+                outs.append(out)
+            check("cache: the hook process writes the cache on a cold call", os.path.exists(norm))
+            check("cache: a cached call denies with the same text as the cold one",
+                  '"deny"' in outs[0] and outs[0] == outs[1].replace("rc-1", "rc-0"), outs[1][:300])
+            with open(norm, "w", encoding="utf-8") as f:
+                f.write("\0garbage")
+            _, out = run("pre", {"session_id": "rc-0", "cwd": repo, "tool_name": "Bash",
+                                 "tool_input": {"command": "git push origin feature"}}, env)
+            check("cache: a corrupt cache still gates, silently", out == outs[0], out[:300])
+        finally:
+            H.BASE, H._rc = old_base, old_flag
+
+    # The repo name: no `git` on a hit, a new name the moment the remote moves.
+    with tempfile.TemporaryDirectory() as td:
+        H.BASE = td
+        H._rc = RC
+        real_remote = RI._remote_basename
+        try:
+            main = os.path.join(td, "dir-name")
+            os.makedirs(main)
+            _git(main, "init", "-q")
+            _git(main, "remote", "add", "origin", "https://github.com/Org/first.git")
+            gitdir = os.path.join(main, ".git")
+            names = os.path.join(td, RC.REPO_NAMES_FILE)
+
+            def name():
+                RC._REPO_NAME_MEMO.clear()
+                RI._CACHE.clear()
+                return H.repo_info(main)[0]
+
+            check("repo cache: a cold call names the repo from its remote", name() == "first")
+            check("repo cache: …and stores it under BASE", os.path.exists(names))
+            spawned = []
+            RI._remote_basename = lambda d: spawned.append(d) or real_remote(d)
+            check("repo cache: a hit spawns no git", name() == "first" and spawned == [], str(spawned))
+            _git(main, "remote", "set-url", "origin", "https://github.com/Org/second.git")
+            check("repo cache: a changed remote URL misses and re-resolves",
+                  name() == "second" and spawned, str(spawned))
+
+            # A linked worktree reads the MAIN checkout's config.
+            wt = os.path.join(td, "wt-dir")
+            _git(main, "commit", "-q", "--allow-empty", "-m", "x")
+            _git(main, "worktree", "add", "-q", wt)
+            RC._REPO_NAME_MEMO.clear()
+            first = H.repo_info(wt)[0]
+            _git(main, "remote", "set-url", "origin", "https://github.com/Org/third.git")
+            RC._REPO_NAME_MEMO.clear()
+            RI._CACHE.clear()
+            check("repo cache: a worktree follows its main checkout's remote",
+                  first == "second" and H.repo_info(wt)[0] == "third", f"{first} {H.repo_info(wt)[0]}")
+
+            with open(names, "w", encoding="utf-8") as f:
+                f.write("[corrupt")
+            check("repo cache: a corrupt map re-resolves", name() == "third")
+
+            # git could not answer (missing / past its half second): the
+            # fallback name is served but never stored.
+            os.remove(names)
+            RI._remote_basename = lambda d: None
+            check("repo cache: an unsettled lookup falls back to the directory",
+                  name() == "dir-name")
+            check("repo cache: …and is not stored", not os.path.exists(names))
+            RI._remote_basename = real_remote
+            check("repo cache: the next call asks git again", name() == "third")
+
+            # A git that fails for any reason but "no such remote" (exit 128,
+            # say) did not answer: its fallback is served, never stored.
+            os.remove(names)
+            fake_bin = os.path.join(td, "fake-bin")
+            os.makedirs(fake_bin)
+            with open(os.path.join(fake_bin, "git"), "w", encoding="utf-8") as f:
+                f.write("#!/bin/sh\necho 'fatal: unexpected failure' >&2\nexit 128\n")
+            os.chmod(os.path.join(fake_bin, "git"), 0o755)
+            old_path = os.environ["PATH"]
+            os.environ["PATH"] = fake_bin + os.pathsep + old_path
+            try:
+                check("repo cache: a git failing with exit 128 falls back to the directory",
+                      name() == "dir-name")
+            finally:
+                os.environ["PATH"] = old_path
+            check("repo cache: …and that guess is not stored", not os.path.exists(names))
+            # "No such remote" IS an answer: a remote-less checkout's name is stored.
+            bare = os.path.join(td, "no-origin")
+            os.makedirs(bare)
+            _git(bare, "init", "-q")
+            RC._REPO_NAME_MEMO.clear()
+            RI._CACHE.clear()
+            check("repo cache: a checkout with no origin is named by its directory and stored",
+                  H.repo_info(bare)[0] == "no-origin" and os.path.exists(names)
+                  and any(k.startswith(bare + "\0") for k in json.load(open(names))),
+                  str(os.path.exists(names)))
+        finally:
+            RI._remote_basename = real_remote
+            RC._REPO_NAME_MEMO.clear()
+            RI._CACHE.clear()
+            H.BASE, H._rc = old_base, old_flag
+
+
+def edit_added_checks() -> None:
+    """An edit rule's `content_rx` reads what the edit ADDED, not the lines its
+    new_string kept: a gate on `create_task(` blocked an Edit that only kept an
+    existing call (24 such files in MemHub-Backend app/), and comment rules
+    fired on comments the edit merely re-wrapped. `content_not_rx` still reads
+    the whole new text — the complied-with form may sit on a kept line."""
+    with tempfile.TemporaryDirectory() as td:
+        repo = os.path.join(td, "editrepo")
+        os.makedirs(repo)
+        assert _git(repo, "-c", "init.defaultBranch=main", "init", "-q").returncode == 0
+        env = {"MEMHUB_RULEBOOK_BASE": td, "MEMHUB_RULEBOOK_FETCH": "0", "MEMHUB_RULEBOOK_JUDGE": "0"}
+        seed_book(td, "editrepo", [_row("task-gate", {"event": "edit", "path_rx": r"\.py$",
+                                                      "content_rx": r"create_task\(",
+                                                      "content_not_rx": "# task-ok"},
+                                        mode="gate", statement="No bare create_task")])
+        kept = "x = 1\nasyncio.create_task(job())"
+
+        def edit(sid, old, new, **inp):
+            ti = dict({"file_path": os.path.join(repo, "a.py"), "old_string": old, "new_string": new}, **inp)
+            return run("pre", {"cwd": repo, "session_id": sid, "tool_name": "Edit", "tool_input": ti}, env)[1]
+
+        out = edit("e1", kept, kept + "\ny = 2")
+        check("edit: an Edit that only KEEPS a create_task line is not blocked", "task-gate" not in out, out)
+        out = edit("e2", "x = 1", kept)
+        check("edit: an Edit that ADDS a create_task line is", "task-gate" in out, out)
+        out = edit("e3", "x = 1", kept + "  # task-ok")
+        check("edit: content_not_rx still exempts the added line", "task-gate" not in out, out)
+        out = edit("e4", "x = 1\nasyncio.create_task(job())  # task-ok", "x = 2\nasyncio.create_task(job())  # task-ok")
+        check("edit: a kept, complied-with line beside a changed one stays quiet", "task-gate" not in out, out)
+        out = run("pre", {"cwd": repo, "session_id": "e5", "tool_name": "MultiEdit", "tool_input": {
+            "file_path": os.path.join(repo, "a.py"),
+            "edits": [{"old_string": kept, "new_string": kept + "\nz = 3"},
+                      {"old_string": "q = 0", "new_string": "q = 0\nloop.create_task(other())"}]}}, env)[1]
+        check("edit: MultiEdit — the one edit that adds a create_task line fires", "task-gate" in out, out)
+        out = run("pre", {"cwd": repo, "session_id": "e6", "tool_name": "Write", "tool_input": {
+            "file_path": os.path.join(repo, "b.py"), "content": kept}}, env)[1]
+        check("edit: a Write is still read whole (its old file is not read)", "task-gate" in out, out)
 
 
 def prompt_lane_checks() -> None:
@@ -2769,6 +3659,24 @@ def prompt_lane_checks() -> None:
                             "tool_use_id": "x1",
                             "tool_input": {"command": "echo '<task-notification>'"}}, env)[1])
         check("prompt: a prompt rule never fires on a tool call", c == "", c)
+
+        # Another agent's message — a subagent's hand-back — is nobody's prompt:
+        # a rule written for what the person asked must not fire on a report
+        # that merely mentions it. A wake-up still does (the lane's purpose).
+        spec = _row("spec-ask", {"event": "prompt", "prompt_rx": r"\bspec\b",
+                                 "warn_once_per": "turn"})
+        seed_book(td, "promptrepo", [spec, every])
+        out = prompt("h1", "find the spec behind this work")
+        check("prompt: a typed prompt fires a prompt rule", "spec-ask" in out, out)
+        handback = ('Another Claude session sent a message:\n<agent-message from="a1">\n'
+                    "[Subagent hand-back] I read the spec and the code.\n" + wake + "\n</agent-message>")
+        n_spec, n_every = len(fires("spec-ask")), len(fires("every-tick"))
+        out = prompt("h1", handback)
+        check("prompt: a subagent hand-back fires no prompt rule, even one it quotes a wake-up for",
+              out.strip() == "" and len(fires("spec-ask")) == n_spec
+              and len(fires("every-tick")) == n_every, out)
+        out = prompt("h1", wake)
+        check("prompt: …a real wake-up still fires", "every-tick" in out, out)
 
 
 def min_hook_version_checks() -> None:
@@ -3477,6 +4385,7 @@ def min_hook_version_checks() -> None:
                   orphan_only == [([], os_)] and os_["conversions_offset"] == os.path.getsize(cpath), str(orphan_only))
         finally:
             H.BASE = old_base
+
 
 
 if __name__ == "__main__":

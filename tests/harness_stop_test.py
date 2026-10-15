@@ -105,7 +105,7 @@ def _classifier(reply):
     """Substitute the one server call; yields the windows it was sent."""
     sent = []
     real = hx.server_classify
-    hx.server_classify = lambda window, repo="", timeout=0: (sent.append(window), (reply, 0.1))[1]
+    hx.server_classify = lambda window, repo="", timeout=0, **_kw: (sent.append(window), (reply, 0.1))[1]
     try:
         yield sent
     finally:
@@ -365,6 +365,73 @@ def test_the_handoff_command_prints_the_fork_instruction():
         # a kind that is not a plain label never reaches the prompt
         assert "`touch x`" not in run("--moment", "sess#2", "--kind", "`touch x`").stdout
     print("PASS test_the_handoff_command_prints_the_fork_instruction")
+
+
+def test_a_cost_verdict_hands_a_repair_once_and_handoff_prints_the_repair_prompt():
+    """Live repair (harness-self-improvement-spec §4). The flush recorded a
+    `cost` verdict for one of this session's fires; the next Stop says one
+    line for the person naming the rule and the turn the fire happened on,
+    and the `handoff --repair` command prints a fork prompt that repairs that
+    rule as a proposed supersede. The same cost is never handed twice, and a
+    verdict below the bar hands nothing."""
+    import fire_effect as fe
+    import rulebook_hook as rh
+    with _Env() as env:
+        tp = env.base / "sess.jsonl"
+        _transcript(tp, [("tidy the notes", "done", [("Edit", {"file_path": "n.md"}, "ok", False)]),
+                         ("thanks", "ok", []),
+                         ("next", "ok", [])])
+        ld = rh._ledger_dir()
+        os.makedirs(ld, exist_ok=True)
+        with open(os.path.join(ld, "fires.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps({"fire_id": "f-cost", "session_id": "sess", "rule_id": "R-1",
+                                "title": "Resolve bot review threads", "tool_use_id": "t1-0",
+                                "mode": "advise", "hook_phase": "pre",
+                                "fired_at": "2026-10-13T10:00:00+00:00"}) + "\n")
+            f.write(json.dumps({"fire_id": "f-low", "session_id": "sess", "rule_id": "R-2",
+                                "title": "Low cost", "tool_use_id": "t1-0", "mode": "advise",
+                                "hook_phase": "pre", "fired_at": "2026-10-13T10:00:01+00:00"}) + "\n")
+        fe.record_verdicts(ld, [{"fire_id": "f-low", "effect": "cost", "effect_helped": 0.2, "effect_cost": 0.5}])
+        with _classifier({"signal": False, "reason": "quiet"}):
+            out = _stop(env, tp)
+        assert out is None, f"a cost below the bar hands nothing: {out}"
+        fe.record_verdicts(ld, [{"fire_id": "f-cost", "effect": "cost", "effect_helped": 0.1, "effect_cost": 0.9}])
+        with _classifier({"signal": False, "reason": "quiet"}):
+            out = _stop(env, tp)
+        ctx = (out or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
+        assert ctx.startswith(hs.REPAIR_PREFIX) and "Resolve bot review threads" in ctx and "at turn 1" in ctx, ctx
+        assert hs.FORK_MARK not in ctx, "the fork prompt never reaches the person's screen"
+        log = hx.log_path("stop.log").read_text()
+        assert "repair sess t1: fork requested for rule R-1" in log, log
+        with _classifier({"signal": False, "reason": "quiet"}):
+            again = _stop(env, tp)
+        assert again is None, f"the same cost is handed once: {again}"
+        run = lambda *args: subprocess.run(  # noqa: E731
+            [sys.executable, str(SCRIPTS / "harness_stop.py"), "handoff", *args],
+            capture_output=True, text=True, timeout=30,
+            env=dict(os.environ, MEMHUB_HARNESS_EXTRACT="0", CLAUDE_CONFIG_DIR=str(env.base / "claude")))
+        proj = env.base / "claude" / "projects" / "-w"
+        proj.mkdir(parents=True)
+        shutil.copy(tp, proj / "sess.jsonl")
+        ok = run("--moment", "sess#1", "--repair")
+        assert ok.returncode == 0, ok.stderr
+        reason = ok.stdout
+        assert reason.startswith(hs.BLOCK_PREFIX) and "a rule cost the work at turn 1" in reason, reason
+        assert f"{hs.FORK_MARK}, moment sess#1" in reason and "to REPAIR one team rule" in reason, reason
+        assert 'Rule "Resolve bot review threads" (rule_id R-1)' in reason and "p_cost 0.90" in reason, reason
+        assert "Harness-repair path" in reason and "supersedes_rule_id" in reason, reason
+        assert f'stamp --transcript "{proj / "sess.jsonl"}" --turn 1' in reason, reason
+        assert f'"{hs.FORK_MARK}: repaired <title>"' in reason and 'says "filed" or "repaired"' in reason, reason
+        bad = run("--moment", "sess#2", "--repair")
+        assert bad.returncode == 2 and "no repair noted" in bad.stderr, bad
+    print("PASS test_a_cost_verdict_hands_a_repair_once_and_handoff_prints_the_repair_prompt")
+
+
+def test_the_standing_rule_names_the_repair_line_and_its_handoff():
+    rule = hs.session_rule("sess")
+    assert hs.REPAIR_PREFIX in rule and "handoff --moment sess#N --repair" in rule, rule
+    assert "files or repairs a rule" in rule, rule
+    print("PASS test_the_standing_rule_names_the_repair_line_and_its_handoff")
 
 
 def test_session_start_carries_the_standing_rule():
