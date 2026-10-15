@@ -97,6 +97,19 @@ Neither the option nor `$MEMHUB_TOKEN` reaches the MCP tools, because Claude
 Code gives the `headersHelper` neither of them. Skill scripts that run through
 the Bash tool don't see the option either.
 
+**Cloud and CI machines.** No browser can sign them in, so give them a
+personal access key instead. Set `MEMHUB_TOKEN=mhk_…` as a secret in the
+environment, and run the installer from its setup script:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/XTraceAI/agent-plugins/main/install.sh | sh
+```
+
+With `$MEMHUB_TOKEN` set, the sign-in step opens no browser. Once the server
+accepts the key, it is stored as the machine's key, so the MCP tools use it
+as well as the hooks. The environment's network policy must allow
+`api.memhub.xtrace.ai`.
+
 ## Skills
 
 Each skill runs as `/memhub:<name>`, or when you ask for it in plain words.
@@ -105,17 +118,17 @@ Each skill runs as `/memhub:<name>`, or when you ask for it in plain words.
 | --- | --- |
 | `login` | Signs the plugin in and stores its access key (see Authentication). |
 | `onboard` | Signs the plugin in when it is not (as `login`), checks capture health, then creates or reuses the repository's agent brain and records it in `rooms.json`. Lists the repository's tracked Markdown files (`git ls-files`) and uploads the ones that look important to that brain without asking. It also saves a short repo overview it writes. With `MEMHUB_HARNESS_EXTRACT=1` on Claude Code it adds `CLAUDE_CODE_FORK_SUBAGENT=1` under `env` in `~/.claude/settings.json`. On Codex it installs the Codex hooks bridge (see [Codex and Cursor](#codex-and-cursor)) and asks you to approve it in Codex. `--status` only reports; `--remove` takes those machine settings out. |
-| `save-artifact` | Uploads a file you name as an artifact, to the repository's brain when there is one, else to your personal memory. |
-| `import-session` | Reads a past Claude Code, Codex or Cursor transcript from this machine and uploads it to your personal memory, in chunks when it is large. |
-| `search-memory` | Read-only search of the brain and your memory through the MCP tools. |
+| `save-artifact` | Uploads a file you name, as it is on disk, to the repository's shared brain when there is one, else to your personal memory. Saving under an existing name adds a new version. |
+| `import-session` | Reads a past Claude Code, Codex or Cursor transcript from this machine and uploads it to your personal memory (never a team brain), in chunks when it is large. For sessions automatic capture missed: from before install, a failed upload, or a host without capture hooks. |
+| `search-memory` | Read-only. Answers what the team knows or decided by searching the repository's brain and your personal memory with the same query, opening the best match, and saying which one each answer came from. |
 | `handoff-session` | Writes a handoff brief (goal, state, decisions, next steps, gotchas) into the standing handoff brain for exactly you and the teammates you name, so they can search it from their own agent; creates and shares that brain when there is none, or a one-off brain with `--new`. The session itself is not shared. |
-| `link-pr` | Links or unlinks a session and a pull request in MemHub. Asks the agent to run `gh pr view`. |
-| `find-contributing-sessions` | Reads this machine's Claude Code, Codex and Cursor session history to find the sessions behind your pull requests. Its script runs `gh pr view` and `gh api` for each PR's files. It prints paths, branches and commit ids, never transcript content, and links only the sessions you approve. |
-| `pr-babysit` | Polls a pull request's review bots and CI with `gh`. The agent fixes findings, commits, pushes and replies on review threads. Once the PR is clean, it saves a review record to the repository's brain. The `pr_babysit_trigger` hook asks the agent to start it after `gh pr create`. |
-| `create-rule` | Drafts a team rule, replays it over this machine's sessions, and files it as `proposed` with `create_rule`. |
+| `link-pr` | Links or unlinks a session and a pull request in MemHub. Asks the agent to run `gh pr view`. With `--find`, reads this machine's Claude Code, Codex and Cursor session history to find the sessions behind your pull requests: its script runs `gh pr view` and `gh api` for each PR's files, prints paths, branches and commit ids, never transcript content, and the skill links only the sessions you approve. |
+| `pr-babysit` | Polls a pull request's review bots and CI with `gh`. The agent fixes findings, commits, pushes and replies on review threads. Once the PR is clean, it files a `proposed` rule with `create_rule` for any fixed finding whose mistake would recur. The `pr_babysit_trigger` hook asks the agent to start it after `gh pr create`. |
+| `create-rule` | Turns a lesson into a rule that warns the agent or stops the command when its situation comes up. The rule is for just you unless it is plainly right for everyone working in the repo or the organisation. Drafts the check, replays it over this machine's sessions, and files it for review as `proposed`; you turn on your own rules, and an org admin turns on the team's. |
 | `start-rulebook` | Fills starter rules in from a scan of the repository. If you choose, it also mines rules from your CLAUDE.md, the last 30 days of Claude Code, Codex and Cursor sessions on this machine, and Claude Code `/insights` facets. Working files go to a temp directory or `mine-out/` in the current directory. It files rules as `proposed` and never activates one. |
 | `spec`, `spec-work`, `spec-check`, `spec-maintain` | Spec-driven work against Git specs or brain documents. A `--cloud` bootstrap runs on the MemHub backend. |
-| `companion` | Checks, shows or hides the companion (see [Companion](#companion-claude-code-21287)). |
+| `companion` | Checks, shows or hides the companion animal; with it hidden a one-line status strip stands in its place (see [Companion](#companion-claude-code-21287)). |
+| `repos` | Lists, adds or removes the repositories MemHub is active in on this machine, or clears the list so it is active everywhere (see [Which repositories MemHub is active in](#which-repositories-memhub-is-active-in)). Outside the listed repositories the plugin does nothing: no rules, no capture, no companion. |
 
 ## What it runs, sends, and fetches
 
@@ -138,12 +151,55 @@ loads `hooks/claude-hooks.json` without setting it gets the path
 PreToolUse, UserPromptSubmit and Stop as a block. Set `CLAUDE_PLUGIN_ROOT` to
 the plugin folder when you run these hooks in another host.
 
+#### Which repositories MemHub is active in
+
+You can limit MemHub to the repositories you choose, so a client's repository
+is never touched. The list is `~/.config/memhub-plugin/repos.json`
+(`{"version": 1, "mode": "allowlist", "repos": ["XTraceAI/MemHub-Backend"]}`),
+managed by `/memhub:repos` (`list`, `add .`, `add org/name`, `remove`, `all`)
+or by `install.sh --repos org/a,org/b` / `--selected-repos` / `--all-repos`
+(a first install asks). A repository is named
+as its `origin` remote spells it, `<org>/<name>`, matched case-insensitively; a
+checkout with no remote is named by its directory. Linked worktrees carry
+their repository's name.
+
+- **No file:** MemHub is active in every repository (every install before
+  this option existed, and any upgrade).
+- **A file:** everywhere it does not list, the plugin is dormant — every
+  session-wide hook in the table below (capture, Markdown capture, the brief,
+  the harness, PR linking, the Rulebook's session and prompt lanes) is
+  skipped by `hook_entry.py` for a session whose directory is not in a listed
+  checkout, the Rulebook's per-call lanes (`rulebook_hook pre` / `post`) judge
+  each tool call by the checkout it acts in and stay silent for an unlisted
+  one, and the Claude Code mod claims no lane and shows no animal there. The
+  only hook that still runs is the rule-fire upload, which ships rows already
+  recorded. A session in an unlisted repository is told so once, at its start,
+  through `additionalContext`; nothing else prints. A session started in a
+  folder that is not a repository (the parent of several) is not captured, but
+  its tool calls into a listed checkout are still judged. An **empty** list is
+  dormant everywhere; `install.sh` writes one on a first install it cannot
+  ask about (`/memhub:repos add .` in each repository you want, or
+  `/memhub:repos all`). A file that cannot be read counts as empty.
+- **Asked, not guessed (ENG-1253):** in Claude Code, a session started in a
+  checkout the list leaves out is asked once, on the status strip above the
+  prompt: `MemHub · enable in <org/repo>?` with **1 Yes / 2 No / 3 Later**.
+  Yes lists it, exactly as `/memhub:repos add .` does, and MemHub is active
+  there from that moment (the hooks read the file per call); No records it
+  under `declined` in the same file, so it stays dormant and is never asked
+  about again — `/memhub:repos list` and `status` show declined repositories,
+  and `add` or `remove` clears a decline; Later hides the ask for that session
+  only. Nothing asks when there is no file, outside a checkout, in a listed or
+  declined repository, or while no one is signed in.
+
+The list applies to the Claude Code hooks and to every host's Rulebook check
+(`rulebook_hook.py`, which Codex and Cursor call too). Codex and Cursor's own
+capture paths do not read it yet.
+
 | Event (matcher) | Name | What it does | Sends data? |
 | --- | --- | --- | --- |
 | PreToolUse (`Bash`, `Edit`, `MultiEdit`, `Write`, `NotebookEdit`, `Read`) | `rulebook_hook pre` | Checks the call against your cached team rules. It can add an advisory or **deny** the call when a gate rule matches. It refreshes the rule cache in a detached background process once the cache is a minute old. | Yes, see [Rulebook](#rulebook) |
-| PreToolUse (`mcp__*__add_memory`) | `add_memory_gate` | Denies MemHub's `add_memory` while this plugin is already capturing the session, so a turn isn't stored twice. | No |
 | PreToolUse (`mcp__*__create_rule`) | `create_rule_origin` | Adds this session's id and the current turn to MemHub's `create_rule` call (not to a harness draft, which carries its own), so the rule records the session it was filed from. Never approves or blocks the call. | Yes, the session id and turn, inside the `create_rule` call |
-| PostToolUse (`Bash`) | `flush_session` | After a command that actually ran `git commit`, `gh pr create` or `gh pr merge`, uploads the transcript so far. Runs in the background. | Yes, the transcript |
+| PostToolUse (`Bash`) | `flush_session` | After a command that actually ran `git commit`, `gh pr create` or `gh pr merge`, uploads the transcript so far, then each agent the session spawned (`subagents/`) as its own conversation linked to it — never the MemHub harness fork or a plugin's own fork, and only to a server that accepts agents. Runs in the background. | Yes, the transcript and its agents' |
 | PostToolUse (`Edit`, `MultiEdit`, `Write`, `NotebookEdit`) | `artifact_sync_reminder` | If the edited file belongs to a spec in the repository (by spec frontmatter), reminds the agent once per session. | No |
 | PostToolUse (`Bash`) | `pr_babysit_trigger` | After a successful `gh pr create`, tells the agent to start a `/memhub:pr-babysit` loop on the new PR. | No |
 | PostToolUse (`Edit`, `MultiEdit`, `Write`, `Bash`) | `md_capture` | Records which Markdown files the session wrote, or for Bash the working directory, in a local state file, and touches a per-session activity marker. | No |
@@ -160,7 +216,7 @@ the plugin folder when you run these hooks in another host.
 | Stop | `md_capture_flush` | Saves qualifying Markdown files as draft artifacts. Runs in the background. See [Markdown capture](#markdown-capture). | Yes, file contents |
 | Stop | `rulebook_hook flush` | Uploads the rule-fire and rule-event logs. Once a day it also deletes stale local state. Runs in the background. | Yes, identifiers |
 | Stop | `harness_stop stop` | Unless `MEMHUB_HARNESS_EXTRACT` turns it off. | Yes, when on |
-| SessionEnd | `session_end` | Runs `flush_session.py` (re-sends the whole transcript as a backstop), then `rulebook_hook flush final`. Runs in the background. | Yes, the transcript |
+| SessionEnd | `session_end` | Runs `flush_session.py` (re-sends the whole transcript as a backstop, then the session's agents as above), then `rulebook_hook flush final`. Runs in the background. | Yes, the transcript and its agents' |
 
 ### Session capture
 
@@ -287,11 +343,32 @@ prompt text), `offsets/` (where the next transcript read may start) and
 `companion/register.ts` is part of the plugin's Claude Code mod (a
 function-hook module: `hooks/hooks.json` loads `mod/register.ts`, which
 registers the companion last). Mods are on by default from Claude Code 2.1.287
-(the desktop Code tab from 2.1.286) and load with the plugin; there is
-nothing to turn on, and `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS` is ignored.
-`disableAllHooks`, `--safe-mode`, an organization policy or Anthropic
-switching mods off remotely stops it. `/<animal> off` hides it. It writes nothing to `~/.claude/settings.json`. The
-module draws an animal above the prompt and reacts to session, turn, prompt
+(the desktop Code tab from 2.1.286) and load with the plugin;
+`CLAUDE_CODE_ENABLE_FUNCTION_HOOKS` is ignored. `disableAllHooks`,
+`--safe-mode`, an organization policy or Anthropic switching mods off remotely
+stops the mod altogether. It writes nothing to `~/.claude/settings.json`.
+
+**The animal is off by default.** The `companion` option (`/plugin` →
+MemHub → configure, or `claude plugin install … --config companion=true`;
+`install.sh --companion`; a first install asks) turns it on for every session. With the option off,
+the module draws a plain one-line **status strip** above the prompt in the
+animal's place, so you can still see MemHub working: the last rule that fired
+(`📏 Rule fired: …`, `⛔️ Blocked: …`), a proposed rule with the same
+**1 Activate / 2 Reject / 3 Later** buttons and its name as the link to
+MemHub Studio, else a dim `MemHub · N rules armed for <repo>` /
+`MemHub · capturing` / `MemHub · inactive in this repo (/memhub:repos add .)`.
+The strip never animates. In a repository the list leaves out — neither
+listed nor declined — it asks once, at session start, `MemHub · enable in
+<org/repo>?` with **1 Yes / 2 No / 3 Later** (ENG-1253): Yes lists the
+repository (what `/memhub:repos add .` writes) and the line flips to the active
+one at once; No records it as `declined` in the same file, so it is never asked
+again; Later hides the ask for that session. Any animal's command (`/goose`, `/hippo`,
+`/penguin`, `/shiba`) shows the animal in that session and remembers the
+choice; `/<animal> off` returns to the strip. In a repository the
+[repository list](#which-repositories-memhub-is-active-in) leaves out, the
+strip says MemHub is inactive and the animal stays away.
+
+With the animal on, the module reacts to session, turn, prompt
 and tool events, including rule fires. It saves its preferences in Claude
 Code's plugin store. It reads the rules that fired from the mod's own
 session state, and the classic hook answer only where the mod's Rulebook
@@ -321,6 +398,22 @@ handlers, backs up a file it changes, and copies a launcher to
 `$CODEX_HOME/memhub_hook_bridge.py`. Codex asks you to review the hooks
 before they run.
 
+On Cursor, `scripts/cursor_rulebook.py` runs team rules through the same
+`rulebook_hook.py pre` call Claude Code uses. A shell command is judged at
+`beforeShellExecution` and a file read at `beforeReadFile`. Cursor's
+`preToolUse` for Read leaves out the agent's offset and limit, so the line
+count comes from the slice Cursor is about to send to the model. A deny keeps
+that slice out of the model and puts the rule's words in `user_message`, the
+one field Cursor shows the agent on a deny. A read is judged only when the
+agent's own Read tool asked for that file; a file you attached is not
+judged. A Cursor subagent runs under its own conversation id, so
+`sessionStart` marks your conversation as the main one, and a `Task` call in
+flight marks any other conversation as its subagent, which `given.agent.main`
+rules leave alone. That state lives in `cursor/` under the rulebook
+directory. At `stop` and `sessionEnd` the rule fires are sent to MemHub, as
+the Stop hook does on the other hosts. Rules on edits do not run on Cursor:
+Cursor has no hook before an edit that the plugin uses.
+
 ### Network destinations
 
 - `https://api.memhub.xtrace.ai`: the MCP server (`/mcp-server/mcp`) and REST
@@ -333,6 +426,13 @@ before they run.
   also carry an `X-MemHub-Plugin-Version` header and don't follow redirects.
   The access-key calls (`scripts/pak.py`) carry no version header and use
   Python's default URL opener, which follows a redirect on a GET.
+  Every request verifies the server's certificate: against Python's own
+  bundle, and when that bundle is empty or rejects the issuer, against the
+  roots the machine already trusts — `certifi`, the OS bundle, the macOS
+  keychains (`scripts/_tls.py`). A python.org build of Python has an empty
+  bundle until its "Install Certificates.command" is run; without this,
+  every call from it failed with CERTIFICATE_VERIFY_FAILED. Verification
+  is never skipped, and no root ships with the plugin.
 - `https://mem.xtrace.ai`: the plugin sends nothing here. After
   `/memhub:login` succeeds, your browser is sent to the setup guide on this
   site.
@@ -352,7 +452,7 @@ The plugin itself makes no other network calls. In particular, it makes no
 calls to the GitHub API of its own. GitHub traffic comes only from `gh` and
 `git`: the commands the agent runs, for example in `/memhub:pr-babysit` or
 `/memhub:link-pr`, and the `gh pr view` and `gh api` calls the
-`find-contributing-sessions` script makes with your `gh` login.
+`link-pr --find` script makes with your `gh` login.
 
 ### Commands it starts
 
@@ -366,9 +466,9 @@ calls to the GitHub API of its own. GitHub traffic comes only from `gh` and
   browser opens for `/memhub:login`, and for the `save-artifact`, `onboard`
   and `import-session` scripts when they find no access key or usable cached
   login.
-- The plugin's hooks never run `gh`. The `find-contributing-sessions` script
-  runs `gh pr view` and `gh api`. The `pr-babysit`, `link-pr` and
-  `find-contributing-sessions` skills ask the agent to run `gh`, and
+- The plugin's hooks never run `gh`. The `link-pr --find` script
+  runs `gh pr view` and `gh api`. The `pr-babysit` and `link-pr`
+  skills ask the agent to run `gh`, and
   `pr-babysit` also has it commit, push and reply on review threads.
 
 ### Local state
@@ -382,6 +482,9 @@ Everything lives under `~/.config/memhub-plugin/` unless noted:
 - `rulebook/`: cached rule books, per-session state, the fire and event logs;
 - `overview/`: brain-brief caches;
 - `rooms.json`: which brain each repository maps to;
+- `repos.json`: the repositories MemHub is active in, when you limited it
+  (`/memhub:repos`), and under `declined` those you answered No to when the
+  status strip asked; absent means every repository;
 - `prlink/`: the PR-link negative cache;
 - `compatibility/`, `releases/`: upgrade-check results;
 - `harness/stop.log`, `harness/offsets/`, `harness/judged/`: unless `MEMHUB_HARNESS_EXTRACT` turns the harness off;
@@ -420,6 +523,9 @@ them reads one, and none of that text is ever run:
 | Setting | Effect |
 | --- | --- |
 | `memhub_token` (userConfig) | Credential for hooks, ahead of everything else |
+| `harnessDrafting` (userConfig) | `false` turns off harness-tied rule drafting (on by default) |
+| `companion` (userConfig) | `true` shows the companion animal above the Claude Code prompt in every session; off (the default) draws a one-line MemHub status strip in its place. `/<animal>` and `/<animal> off` override it per machine |
+| `MEMHUB_REPOS_FILE` | Moves the repository list (`repos.json`, see [Which repositories MemHub is active in](#which-repositories-memhub-is-active-in)) |
 | `MEMHUB_TOKEN` | Credential for hooks and scripts when the option is unset |
 | `MEMHUB_TURN_FLUSH=0` | Turns off per-turn capture, and with it the session-start capture-health, compatibility and update notices |
 | `MEMHUB_RULEBOOK_RECALL=0` | Turns off anchor rules (rules tied to files or commands, matched locally) |
@@ -432,13 +538,13 @@ them reads one, and none of that text is ever run:
 | `MEMHUB_PRLINK_NEGATIVE_TTL_S` | PR-link negative cache lifetime; `0` turns it off |
 | `MEMHUB_RULEBOOK_BASE`, `MEMHUB_STATE_DIR`, `MEMHUB_ROOMS_FILE`, `MEMHUB_HARNESS_DIR` | Move local state |
 | `MEMHUB_SPEC_DIR` | Where the spec reminder and onboarding look for specs |
-| `MEMHUB_PLUGIN_SCRIPTS` | Where the `find-contributing-sessions` and `start-rulebook` scripts load the plugin's scripts from, ahead of this plugin's own folder |
+| `MEMHUB_PLUGIN_SCRIPTS` | Where the `link-pr --find` and `start-rulebook` scripts load the plugin's scripts from, ahead of this plugin's own folder |
 | `MEMHUB_RULEBOOK_BASE_BRANCH` | Base branch for rule diff checks |
 | `MEMHUB_FLUSH_DEADLINE_S`, `MEMHUB_TURN_FLUSH_TIMEOUT_S`, `MEMHUB_RULEBOOK_TIMEOUT_S`, `MEMHUB_HARNESS_CLASSIFY_TIMEOUT`, `MEMHUB_OAUTH_TIMEOUT`, `MEMHUB_OAUTH_BIND_TIMEOUT` | Timeouts |
 | `MEMHUB_PAK_LABEL` | Label for the access key `/memhub:login` mints |
 | `MEMHUB_RULEBOOK_DEBUG`, `MEMHUB_HARNESS_DEBUG` | Print hook tracebacks to stderr |
 | `MEMHUB_RULEBOOK_HOOK_VERSION` | Test override for the hook version that rules' minimum-version checks compare against |
-| `MEMHUB_HARNESS_CHILD` | Marks a `claude` process started by XTrace's test tooling: it is not captured, `add_memory` is not gated, and harness drafting is off. The plugin never sets it |
+| `MEMHUB_HARNESS_CHILD` | Marks a `claude` process started by XTrace's test tooling: it is not captured, and harness drafting is off. The plugin never sets it |
 
 ## License
 

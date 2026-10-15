@@ -5,6 +5,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import {
+  askPaths,
   Book,
   FETCH_REFUSED,
   isFetchRefused,
@@ -12,6 +13,7 @@ import {
   isSecure,
   msOfIso,
   parseBook,
+  type PathsAnswer,
   quoteAll,
   REFRESH_GAVE_UP,
   REFRESH_MS,
@@ -19,7 +21,7 @@ import {
   shapeRules,
 } from '../book'
 import { Claims, StatusLine } from '../claims'
-import { BOOK, fakeCtx, fakeEngine, type FakeIo, fakeIo, REPO, reply, ROOT, toHook } from './fakes'
+import { BOOK, defaultRun, fakeCtx, fakeEngine, type FakeIo, fakeIo, ok, REPO, reply, ROOT, toHook } from './fakes'
 
 const CACHED = JSON.stringify({ etag: '"v1"', fetched_at: '2026-10-06T00:00:00.000000+00:00', rules: [{ id: 'r1' }] })
 const SERVED = { code: 0, msg: 'ok', data: { rules: [{ id: 'r1' }, { id: 'r2' }, { id: 'r2' }, { nope: true }] } }
@@ -60,6 +62,64 @@ describe('load', () => {
     const status = new StatusLine(io)
     const book = new Book(io, fakeCtx(io), fakeEngine(), new Claims(io, 'staging', status), status, { toHook })
     expect(await book.load('/work')).toBe(false)
+  })
+
+  test('a repository the allowlist leaves out (`paths` says enabled false): nothing loaded, nothing claimed, and the shell is told', async () => {
+    const io = fakeIo({
+      onRun: argv => (argv[2] === 'paths'
+        ? ok(JSON.stringify({ book: BOOK, repo: REPO, ledger: '/l', enabled: false, restricted: true }))
+        : defaultRun(argv)),
+    })
+    io.files.set(BOOK, CACHED)
+    const engine = fakeEngine()
+    const status = new StatusLine(io)
+    const told: [boolean, string][] = []
+    const book = new Book(io, fakeCtx(io), engine, new Claims(io, 'staging', status), status, {
+      toHook, onPaths: a => told.push([a.enabled, a.repo]),
+    })
+    expect(await book.load('/work')).toBe(false)
+    expect(told).toEqual([[false, REPO]])
+    expect(engine.books).toEqual([])      // the cached book is there, and not handed over
+    expect(io.fetches).toHaveLength(0)    // and not refreshed
+    expect(io.envWrites).toEqual([])      // no lane claimed: Python serves, and stays silent there too
+  })
+
+  test('the ask\'s fields ride along (ENG-1253): restricted, declined and the identity repos.json names, read off `paths`', async () => {
+    const io = fakeIo({
+      onRun: argv => (argv[2] === 'paths'
+        ? ok(JSON.stringify({ book: BOOK, repo: REPO, ledger: '/l', enabled: false, restricted: true, declined: true, identity: 'Acme/demo' }))
+        : defaultRun(argv)),
+    })
+    const status = new StatusLine(io)
+    const told: PathsAnswer[] = []
+    const book = new Book(io, fakeCtx(io), fakeEngine(), new Claims(io, 'staging', status), status, {
+      toHook, onPaths: a => told.push(a),
+    })
+    expect(await book.load('/work')).toBe(false)
+    expect(told.map(a => [a.enabled, a.restricted, a.declined, a.identity])).toEqual([[false, true, true, 'Acme/demo']])
+    // an older CLI answers none of them: nothing to ask about
+    const older = await askPaths(fakeIo(), fakeCtx(fakeIo()), '/work')
+    expect([older.restricted, older.declined, older.identity]).toEqual([false, false, ''])
+  })
+
+  test('an older CLI with no `enabled` in its answer: active, as before the list existed', async () => {
+    const { engine } = await loaded()
+    expect(engine.books).toHaveLength(1)
+  })
+
+  test('outside any checkout with a repos.json: no book, and the shell is still told it is dormant there', async () => {
+    const io = fakeIo({
+      onRun: argv => (argv[2] === 'paths'
+        ? ok(JSON.stringify({ book: null, repo: '', ledger: '/l', enabled: false, restricted: true }))
+        : defaultRun(argv)),
+    })
+    const status = new StatusLine(io)
+    const told: [boolean, string][] = []
+    const book = new Book(io, fakeCtx(io), fakeEngine(), new Claims(io, 'staging', status), status, {
+      toHook, onPaths: a => told.push([a.enabled, a.repo]),
+    })
+    expect(await book.load('/parent-of-repos')).toBe(false)
+    expect(told).toEqual([[false, '']])
   })
 })
 

@@ -106,10 +106,9 @@ def main() -> None:
         "unless the user asked not to babysit PRs (in this session or in memory), "
         "start a self-paced loop NOW that babysits it — invoke the loop skill with "
         f'no interval and the prompt "{skill_command("pr-babysit")} {url}". Each loop pass '
-        "polls the PR's review bots (Cursor bugbot, OpenAI Codex) and CI, fixes "
-        "real findings, pushes, and when the PR is clean saves a review record "
-        "(each finding, whether it was fixed or rejected, and why) to the repo's "
-        "MemHub agent brain and ends the loop. Tell the "
+        "polls the PR's review bots and CI, fixes real findings, pushes, and "
+        "when the PR is clean proposes a team rule for any fixed finding whose "
+        "mistake would recur (usually none) and ends the loop. Tell the "
         "user the babysit loop is running and that saying 'stop the loop' ends it."
     )
     print(

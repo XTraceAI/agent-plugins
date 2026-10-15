@@ -160,6 +160,15 @@ private one. The candidate cannot be deleted mid-test by a re-fetch. Still
 write `fetched_at` as **now**: it keeps the sub-agent's first minute from
 spawning a pointless fetch of the shared book.
 
+**The Rulebook mod hands the sub-agent's calls to the Python hook.** On a
+Claude Code that loads the mod, the mod serves the session's lanes from the
+book it loaded at start, with every `candidate-…` row dropped, and its claim
+covers the sub-agent too (same session id). While your claim file is live it
+hands every sub-agent call — and any call whose cwd is under the prefix — to
+the Python hook for that call (`mod/redirect.ts`), so the candidate is judged
+from the private book exactly as above. Nothing for you to do; it is why the
+claim file must exist before the sub-agent starts and be removed after.
+
 **No cached book for this repo** (nothing fetched yet, or no rulebook binds the
 user here) → `cp -R` copies nothing and you simply write the private book
 yourself, containing exactly the candidate plus a `fetched_at` of now. Nothing

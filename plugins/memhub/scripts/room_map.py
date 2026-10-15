@@ -8,7 +8,7 @@ each told the agent to build the name `Repo: <org>/<name>` and exact-match it in
 than something each caller rediscovers (and occasionally gets wrong).
 
 Its readers are the ARTIFACT writers (`save_artifact.py`, the `.md`
-auto-capture, the skills that save a PR review record or a spec) and the
+auto-capture, the skills that save a spec) and the
 SessionStart brief that names the brain (`brain_brief.py`). On a cache
 miss they call `brain_resolve.resolve_repo_brain`, which does the same
 exact-name lookup against the server and caches what it finds; a save the

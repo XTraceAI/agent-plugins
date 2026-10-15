@@ -1,5 +1,5 @@
 // Which checkout a call works in: a port of rulebook_hook.py repo_info,
-// _branch, _acted_on_dir, repo_of_call, command_root and worktree_key, over
+// _branch, _call_seed, repo_of_call, command_root and worktree_key, over
 // EngineIO (stat / readText) instead of os.path.
 //
 // The repo NAME is the one thing not re-derived here: repo_identity resolves
@@ -9,14 +9,14 @@
 import type { EngineIO } from './index'
 import { dirname, pyMatch, sha1Hex } from './py'
 import { pyStrip } from './rules'
-import { basename, cdPrefixTarget, expanduser, isabs, join, normpath, under } from './shell'
+import { findOverride, stripOverride } from './override'
+import { basename, bashReads, bashWriteTargets, callDir, expanduser, isabs, join, normpath, type Env } from './shell'
 
 export type RepoInfo = { repo: string; root: string; gitdir: string; branch: string }
 export const NO_REPO: RepoInfo = { repo: '', root: '', gitdir: '', branch: '' }
 
 const ARG = String.raw`(?:'([^']*)'|"([^"]*)"|([^\s;&|]+))`
 const CD_PREFIX = String.raw`^\s*cd\s+` + ARG + String.raw`\s*(?:&&|;)`
-const SEED_MAX_HOPS = 64
 
 /** `worktree_key(root)`: the 16-hex checkout id. */
 export const worktreeKey = (root: string): string | null => (root ? sha1Hex(root).slice(0, 16) : null)
@@ -94,26 +94,17 @@ export class Repos {
     return (await this.io.stat(p, true))?.realPath
   }
 
-  /** `_acted_on_dir(cwd, inp)`: the acted-on file's directory, inside the session cwd, else "". */
-  async actedOnDir(cwd: string, inp: Readonly<Record<string, unknown>>): Promise<string> {
-    if (!cwd) return ''
-    const base = normpath(cwd)
+  /** `_call_seed(cwd, data)` for a Claude Code call: the directory the call acts in, or "". */
+  callSeed(cwd: string, tool: string, inp: Readonly<Record<string, unknown>>, env: Env): string {
     for (const key of ['file_path', 'notebook_path']) {
       const fp = inp[key]
-      if (typeof fp !== 'string' || !fp || fp.includes('\0')) continue
+      if (typeof fp !== 'string' || !pyStrip(fp) || fp.includes('\0')) continue
       let d = dirname(fp.replace(/\\/g, '/'))
       if (!isabs(d)) d = join(cwd, d)
-      d = normpath(d)
-      if (!under(d, base)) continue
-      let probe = d
-      let hops = 0
-      while (!(await this.io.stat(probe)) && dirname(probe) !== probe && hops < SEED_MAX_HOPS) {
-        probe = dirname(probe)
-        hops += 1
-      }
-      const [rp, rc] = await Promise.all([this.realpath(probe), this.realpath(cwd)])
-      if (rp !== undefined && rc !== undefined && under(rp, rc)) return d
+      return normpath(d)
     }
+    const command = inp.command
+    if (tool === 'Bash' && typeof command === 'string') return callDir(cwd, command, env)
     return ''
   }
 
@@ -129,20 +120,48 @@ export class Repos {
     return (await this.repoInfo(path)).root
   }
 
-  /** `repo_of_call(data)` for a Claude Code call (no apply_patch). */
-  async ofCall(cwd: string, tool: string, inp: Readonly<Record<string, unknown>>): Promise<RepoInfo> {
-    const seed = await this.actedOnDir(cwd, inp)
+  /**
+   * `repo_of_call(data)` for a Claude Code call (no apply_patch): the checkout
+   * the call acts in — the file it edits or reads, wherever it is, or where
+   * its Bash command runs — else the cwd's. A target that is the cwd's own
+   * checkout spelled another way answers with the cwd's spelling (one
+   * worktree, one ordering key).
+   */
+  async ofCall(cwd: string, tool: string, inp: Readonly<Record<string, unknown>>, env: Env = {}): Promise<RepoInfo> {
+    const here = await this.repoInfo(cwd)
+    const seed = this.callSeed(cwd, tool, inp, env)
     if (seed) {
       const info = await this.repoInfo(seed)
-      if (info.repo) return info
+      if (info.repo) {
+        if (here.repo && info.root !== here.root &&
+            ((await this.realpath(info.root)) ?? info.root) === ((await this.realpath(here.root)) ?? here.root)) return here
+        return info
+      }
     }
-    const info = await this.repoInfo(cwd)
-    if (info.repo) return info
-    const command = inp.command
-    if (tool === 'Bash' && typeof command === 'string' && cdPrefixTarget(command) !== null) {
-      const root = await this.commandRoot(cwd, command)
-      if (root) return this.repoInfo(root)
+    // Neither the cwd nor where the command runs is a checkout: the first
+    // file the command writes or reads that is in one decides (`_bash_targets`).
+    if (!here.repo) {
+      for (const p of this.bashTargets(cwd, tool, inp, env)) {
+        const info = await this.repoInfo(dirname(p))
+        if (info.repo) return info
+      }
     }
-    return info
+    return here
+  }
+
+  /** `_bash_targets(cwd, data)`: the files a Bash call writes, then reads (override stripped); [] otherwise. */
+  bashTargets(cwd: string, tool: string, inp: Readonly<Record<string, unknown>>, env: Env): string[] {
+    let cmd = inp.command
+    if (tool !== 'Bash' || typeof cmd !== 'string' || !cmd) return []
+    try {
+      const found = findOverride(cmd)
+      if (found) cmd = stripOverride(cmd, found)
+      return [
+        ...bashWriteTargets(cwd, cmd as string, env).map(([p]) => p),
+        ...bashReads(cwd, cmd as string, this.io.home).map(([p]) => p),
+      ]
+    } catch {
+      return []
+    }
   }
 }

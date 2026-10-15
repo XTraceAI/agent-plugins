@@ -35,9 +35,14 @@
 //   * no `show_upgrade` (a book suspended by an upgrade notice is never loaded:
 //     book.ts), no `maybe_refresh` / `refresh_if_stale` (book.ts refreshes on a
 //     timer), no `.sources` audit file, no breadcrumbs, no legacy conversions;
-//   * a call whose checkout belongs to ANOTHER repo than the loaded book
-//     throws ForeignRepoError: the lane hands that call to Python (which loads
-//     that repo's book) rather than judge it against the wrong rules;
+//   * ONE book per session: a call whose checkout belongs to ANOTHER repo
+//     than the loaded book — the file it edits or reads, or where its Bash
+//     command runs (`cd ~/other && …`, `git -C ../x`, `$VAR` expanded:
+//     Repos.ofCall, the port of `repo_of_call`) — throws ForeignRepoError,
+//     and the shell hands BOTH halves of that call to Python (lanes.ts),
+//     which loads that repo's book, rather than judge it against the wrong
+//     rules. A hand-off for a foreign repo is not a failure: it never costs
+//     the session its claim;
 //   * a rule pyre cannot express (`_unportable`) is never skipped: while one
 //     is in the book every tool and prompt lane throws UnportableRuleError,
 //     the shell hands the call to Python and, on the second, releases the
@@ -66,12 +71,14 @@ import {
 import { givenOk, Probes, pyCompare, type SpecHit } from './probes'
 import { isoMicros, pyExec, pyMatch } from './py'
 import { pySearch } from './pyre'
+import { dirname } from './py'
 import { Repos, sessionFileName, worktreeKey, type RepoInfo } from './repo'
 import {
   bookRank, cpLen, cpSlice, disclosureLine, EDIT_TOOLS, editAddedText, evaluate, isDict, oneLine, pyStr, pyStrip, READ_TOOLS, truthy,
 } from './rules'
 import {
-  anchorHits, bashReads, join, pathInScope, redactSecrets, relpath, shellOnly, stripComments,
+  anchorHits, bashDirs, bashReads, bashWriteTargets, basename, join, pathInScope, redactSecrets, relpath, shellOnly, stripComments,
+  varNames, type Env,
 } from './shell'
 
 type Dict = Record<string, unknown>
@@ -233,10 +240,15 @@ type SessionState = JudgeState & {
   armed_version: Record<string, unknown>
   spec_pending: Record<string, unknown>
   bash_t0: Map<string, number>
+  /** Per Bash call: [rule id, real path] its pre lane fired on (`bash_pre`). */
+  bash_pre: Map<string, [string, string][]>
 }
 
 function freshState(): SessionState {
-  return { fired: [], counts: {}, raw: {}, armed: {}, armed_once: [], armed_version: {}, spec_pending: {}, bash_t0: new Map() }
+  return {
+    fired: [], counts: {}, raw: {}, armed: {}, armed_once: [], armed_version: {}, spec_pending: {}, bash_t0: new Map(),
+    bash_pre: new Map(),
+  }
 }
 
 /** `load_state`'s defaulting, over a parsed file. */
@@ -256,11 +268,21 @@ function stateFrom(doc: unknown): SessionState {
   if (isDict(doc.bash_t0)) {
     for (const [k, v] of Object.entries(doc.bash_t0)) if (typeof v === 'number') st.bash_t0.set(k, v)
   }
+  if (isDict(doc.bash_pre)) {
+    for (const [k, v] of Object.entries(doc.bash_pre)) {
+      if (Array.isArray(v)) {
+        st.bash_pre.set(k, v.filter((x): x is [string, string] =>
+          Array.isArray(x) && x.length === 2 && typeof x[0] === 'string' && typeof x[1] === 'string'))
+      }
+    }
+  }
   return st
 }
 
 const cloneState = (st: SessionState): SessionState => {
-  const c = stateFrom(JSON.parse(JSON.stringify({ ...st, bash_t0: Object.fromEntries(st.bash_t0) })))
+  const c = stateFrom(JSON.parse(JSON.stringify({
+    ...st, bash_t0: Object.fromEntries(st.bash_t0), bash_pre: Object.fromEntries(st.bash_pre),
+  })))
   if (!st.judge) delete c.judge
   return c
 }
@@ -277,8 +299,11 @@ type Ev = {
   added?: string | null
   rtext: string
   resp: { text: string; isError: boolean } | null
-  via: 'bash' | 'bash-read' | null
+  /** 'bash-pre': a file the Bash command is about to write; 'bash': one it wrote (post lane). */
+  via: 'bash' | 'bash-pre' | 'bash-read' | null
   read: Dict | null
+  /** The worktree a synthetic edit's file is in, when not the call's. */
+  root?: string
 }
 
 type Ctx = {
@@ -288,6 +313,9 @@ type Ctx = {
   branch: string
   tool: string
   worktree: string | null
+  /** The call this fire is anchored on — local-only, like `host`; the Stop
+   *  lane builds the effect judge's window from it (fire_effect.py). */
+  tool_use_id?: string | null
 }
 
 // ── the engine ──────────────────────────────────────────────────────────────
@@ -326,11 +354,48 @@ class RulebookEngine implements Engine {
     return this.rules.map((r) => ({ ...r }))
   }
 
-  private async where(cwd: string, tool: string, inp: Dict): Promise<RepoInfo | undefined> {
-    const info = await this.repos.ofCall(cwd, tool, inp)
+  private async where(cwd: string, tool: string, inp: Dict, vars: Env = {}): Promise<RepoInfo | undefined> {
+    const info = await this.repos.ofCall(cwd, tool, inp, vars)
     if (!info.repo) return undefined
     if (info.repo !== this.repo) throw new ForeignRepoError(info.repo, this.repo)
     return info
+  }
+
+  /**
+   * A Bash command that writes or reads a file in ANOTHER repo's checkout
+   * (`echo > ../other/x.csv`, `tee ~/other/app/x.py`, `cat $HOME/other/README.md`)
+   * has that file judged by that repo's book (rulebook_hook `_file_book`).
+   * The mod holds one book, so it hands the call to Python, which loads it.
+   */
+  private async foreignTargets(cwd: string, cmd: string, vars: Env): Promise<void> {
+    if (!cmd) return
+    let cleaned = cmd
+    const found = findOverride(cmd)
+    if (found) cleaned = stripOverride(cmd, found)
+    let paths: string[]
+    try {
+      paths = [
+        ...bashWriteTargets(cwd, cleaned, vars).map(([p]) => p),
+        ...bashReads(cwd, cleaned, this.io.home).map(([p]) => p),
+      ]
+    } catch {
+      return   // the lane itself meets the same input and answers as Python does
+    }
+    for (const p of paths) {
+      const info = await this.repos.repoInfo(dirname(p))
+      if (info.repo && info.repo !== this.repo) throw new ForeignRepoError(info.repo, this.repo)
+    }
+  }
+
+  /** The environment a Bash command's paths expand in: HOME and the variables it names. */
+  private async varsFor(cmd: string): Promise<Env> {
+    const env: Record<string, string> = this.io.home ? { HOME: this.io.home } : {}
+    for (const name of varNames(cmd)) {
+      if (name === 'HOME' || !this.io.getenv) continue
+      const v = await this.io.getenv(name).catch(() => undefined)
+      if (v !== undefined) env[name] = v
+    }
+    return env
   }
 
   private async baseOf(root: string): Promise<string> {
@@ -399,6 +464,10 @@ class RulebookEngine implements Engine {
       agent_id: ctx.agent_id,
       worktree: ctx.worktree,
       source_message_id: null,
+      tool_use_id: ctx.tool_use_id ?? null,
+      // Local-only, as Python writes it: the rule's label for the one line a
+      // repair shows the person (live repair, ENG-1231).
+      title: pyStr(r._label || r.title || '').slice(0, 120),
       repo: ctx.repo,
       branch: ctx.branch,
       tool: ctx.tool,
@@ -482,6 +551,27 @@ class RulebookEngine implements Engine {
     return (await this.io.stat(p, true))?.realPath ?? p
   }
 
+  /** `os.path.realpath` of a file that may not exist yet: its directory's, resolved. */
+  private async realFile(p: string): Promise<string> {
+    const st = await this.io.stat(p, true)
+    if (st?.realPath) return st.realPath
+    const d = (await this.io.stat(dirname(p), true))?.realPath
+    return d ? join(d, basename(p)) : p
+  }
+
+  /** `_same_dir(a, b)` */
+  private async sameDir(a: string, b: string): Promise<boolean> {
+    return (await this.realpath(a)) === (await this.realpath(b))
+  }
+
+  /** `_write_root(path, repo, root)`: [worktree, path] when the file is in a checkout of `repo`, else ['', path]. */
+  private async writeRoot(path: string, repo: string, root: string): Promise<[string, string]> {
+    const info = await this.repos.repoInfo(dirname(path))
+    if (!info.repo || info.repo !== repo) return ['', path]
+    if (root && info.root !== root && (await this.sameDir(info.root, root))) return [root, join(root, relpath(path, info.root))]
+    return [info.root, path]
+  }
+
   /** `_worktrees(root)` */
   private async worktrees(root: string): Promise<string[]> {
     let r: { code: number; stdout: string }
@@ -512,14 +602,20 @@ class RulebookEngine implements Engine {
     return [...names]
   }
 
-  /** `bash_written_files(root, cmd, since)` */
-  private async bashWrittenFiles(root: string, cmd: string, since: number): Promise<[string, boolean][]> {
+  /** `bash_written_files(root, cmd, since, also)` */
+  private async bashWrittenFiles(root: string, cmd: string, since: number, also: readonly string[]): Promise<[string, boolean, string][]> {
     if (!root || pySearch(TREE_REWRITE_RX, shellOnly(cmd || ''), 'm')) return []
     const roots: string[] = []
     for (const w of await this.worktrees(root)) {
       if (w === root || (await this.namesOf(w)).some((n) => (cmd || '').includes(n))) roots.push(w)
     }
-    const out: [string, boolean][] = []
+    for (const w of also) {
+      if (!w) continue
+      let same = false
+      for (const r of roots) if (await this.sameDir(w, r)) same = true
+      if (!same) roots.push(w)
+    }
+    const out: [string, boolean, string][] = []
     for (const wt of roots) {
       let r: { code: number; stdout: string }
       try {
@@ -545,7 +641,7 @@ class RulebookEngine implements Engine {
         const path = join(wt, rel)
         const st = await this.io.stat(path)
         if (!st || st.kind !== 'file' || st.mtimeMs / 1000 < since) continue
-        out.push([path, isNew])
+        out.push([path, isNew, wt])
         if (out.length > BASH_EDIT_MAX_FILES) return []
       }
     }
@@ -615,13 +711,17 @@ class RulebookEngine implements Engine {
     const out: Verdict = { context: [], fires: [], ledger: [] }
     if (!this.loaded) return out
     const inp = (e.input ?? {}) as Dict
-    const info = await this.where(e.cwd, e.tool, inp)
-    if (!info) return out
+    const vars = e.tool === 'Bash' ? await this.varsFor(typeof inp.command === 'string' ? inp.command : '') : {}
+    const info = await this.where(e.cwd, e.tool, inp, vars)
+    // No checkout at all: Python judges it on the book of rules that bind
+    // every repo (rulebook_hook `main`, projectless); the mod holds one repo's.
+    if (!info) throw new ForeignRepoError('', this.repo)
+    if (e.tool === 'Bash') await this.foreignTargets(e.cwd, typeof inp.command === 'string' ? inp.command : '', vars)
     const base = await this.baseOf(info.root)
     const st = await this.state(e.sessionId, base)
     const saved = cloneState(st)
     try {
-      return await this.callInner(mode, e, inp, info, base, st, out)
+      return await this.callInner(mode, e, inp, info, base, st, out, vars)
     } catch (err) {
       if (err instanceof ForeignRepoError || err instanceof UnportableRuleError) throw err
       // Python's main(): any exception is a silent exit 0, its state unsaved.
@@ -631,7 +731,7 @@ class RulebookEngine implements Engine {
   }
 
   private async callInner(
-    mode: 'pre' | 'post', e: CallEvent, inp: Dict, info: RepoInfo, base: string, st: SessionState, out: Verdict,
+    mode: 'pre' | 'post', e: CallEvent, inp: Dict, info: RepoInfo, base: string, st: SessionState, out: Verdict, vars: Env,
   ): Promise<Verdict> {
     const io = this.io
     const { repo, root, gitdir, branch } = info
@@ -641,7 +741,10 @@ class RulebookEngine implements Engine {
     const session = e.sessionId
     const cwd = e.cwd
     const agentId = e.agentId && pyStrip(e.agentId) ? cpSlice(pyStrip(e.agentId), 0, 64) : null
-    const ctx: Ctx = { session, agent_id: agentId, repo, branch, tool, worktree: worktreeKey(root) }
+    const ctx: Ctx = {
+      session, agent_id: agentId, repo, branch, tool, worktree: worktreeKey(root),
+      tool_use_id: e.toolUseId ? pyStr(e.toolUseId) : null,
+    }
     const ledger = out.ledger
     const cmdText = tool === 'Bash' ? pyStr(inp.command || '') : ''
     let probeRoot = root
@@ -701,13 +804,26 @@ class RulebookEngine implements Engine {
     // The events this call is (main(): synthetic edits FIRST, then the call, then synthetic reads).
     const real: Ev = { tool, phase: mode, order_phase: mode, cmd, fp, body, added, rtext, resp, via: null, read: null }
     const events: Ev[] = []
+    let preWritten: [string, string][] = []
+    const callKey = e.toolUseId ? pyStr(e.toolUseId) : 'last'
     if (tool === 'Bash') {
       const marks = st.bash_t0
-      const callKey = e.toolUseId ? pyStr(e.toolUseId) : 'last'
       if (mode === 'pre') {
         marks.set(callKey, io.now() / 1000)
         const keys = [...marks.keys()]
         for (const k of keys.slice(0, Math.max(keys.length - BASH_EDIT_MARKS_KEPT, 0))) marks.delete(k)
+        if (cmd && rules.some((r) => r.on === 'edit' && isActive(r))) {
+          for (const [target, text] of bashWriteTargets(cwd, cmd, vars)) {
+            if ((await io.stat(target))?.kind === 'dir') continue
+            const [wroot, path] = await this.writeRoot(target, repo, root)
+            if (wroot) {
+              events.push({
+                tool: 'Write', phase: 'pre', order_phase: 'pre', cmd: '', fp: path, body: text, added: null, rtext: '',
+                resp: null, via: 'bash-pre', read: null, root: wroot,
+              })
+            }
+          }
+        }
       } else {
         let t0 = marks.get(callKey)
         marks.delete(callKey)
@@ -715,12 +831,26 @@ class RulebookEngine implements Engine {
           t0 = marks.get('last')
           marks.delete('last')
         }
+        const done = st.bash_pre
+        let pw = done.get(callKey)
+        done.delete(callKey)
+        if (!pw?.length && callKey !== 'last') {
+          pw = done.get('last')
+          done.delete('last')
+        }
+        preWritten = pw ?? []
         const wantsEdits = rules.some((r) => (r.on === 'edit' || r.on === 'ordering') && isActive(r))
         if (t0 !== undefined && wantsEdits) {
-          for (const [path, isNew] of await this.bashWrittenFiles(root, cmd, t0)) {
+          const also: string[] = []
+          const dirs = [...bashDirs(cwd, cmd, vars), ...bashWriteTargets(cwd, cmd, vars).map(([p]) => dirname(p)), cwd]
+          for (const d of dirs) {
+            const w = (await this.writeRoot(join(d, '_'), repo, root))[0]
+            if (w && !also.includes(w)) also.push(w)
+          }
+          for (const [path, isNew, wt] of await this.bashWrittenFiles(root, cmd, t0, also)) {
             const text = await this.readEditBody(path, isNew)
             if (text === null) continue
-            events.push({ tool: 'Write', phase: 'pre', order_phase: 'post', cmd: '', fp: path, body: text, rtext: '', resp: null, via: 'bash', read: null })
+            events.push({ tool: 'Write', phase: 'pre', order_phase: 'post', cmd: '', fp: path, body: text, rtext: '', resp: null, via: 'bash', read: null, root: wt })
           }
         }
       }
@@ -811,7 +941,8 @@ class RulebookEngine implements Engine {
         if (firedOn.has(rid)) continue
 
         if (r.on === 'ordering') {
-          if (EDIT_TOOLS.includes(etool) && !pathInScope(sc(r), efp, root)) continue
+          if (ev.via === 'bash-pre') continue
+          if (EDIT_TOOLS.includes(etool) && !pathInScope(sc(r), efp, ev.root || root)) continue
           if (rid in st.armed && rid in st.armed_version && (st.armed_version[rid] ?? null) !== (r._version ?? null)) dropArming(rid)
           let outcome: string | null
           try {
@@ -831,9 +962,13 @@ class RulebookEngine implements Engine {
           continue
         }
 
-        if (!pathInScope(sc(r), EDIT_TOOLS.includes(etool) || READ_TOOLS.includes(etool) ? efp : '', root)) continue
+        if (!pathInScope(sc(r), EDIT_TOOLS.includes(etool) || READ_TOOLS.includes(etool) ? efp : '', ev.root || root)) continue
+        if (ev.via === 'bash' && preWritten.length) {
+          const realFp = await this.realFile(efp)
+          if (preWritten.some(([a, b]) => a === rid && b === realFp)) continue
+        }
         let scope = has(r, 'fire_scope') ? r.fire_scope : 'session'
-        if (ephase === 'pre' && r.mode === 'gate' && (ev.via === null || ev.via === 'bash-read') &&
+        if (ephase === 'pre' && r.mode === 'gate' && (ev.via === null || ev.via === 'bash-read' || ev.via === 'bash-pre') &&
             ((etool === 'Bash' && r.on === 'bash') || (EDIT_TOOLS.includes(etool) && r.on === 'edit') ||
               (READ_TOOLS.includes(etool) && r.on === 'read'))) {
           scope = 'call'
@@ -884,7 +1019,7 @@ class RulebookEngine implements Engine {
 
     const excerptOf = (r: HookRule): string => {
       const ev = firedOn.get(r.id)
-      if (ev?.via === 'bash') return `bash-edit ${ev.fp}`
+      if (ev?.via === 'bash' || ev?.via === 'bash-pre') return `bash-edit ${ev.fp}`
       if (ev?.via === 'bash-read') return `bash-read ${ev.fp}`
       return cmd || fp || ''
     }
@@ -935,7 +1070,9 @@ class RulebookEngine implements Engine {
       if (mode !== 'pre' || r.mode !== 'gate') return false
       const via = fireOf(r)?.via ?? null
       if (via === 'bash') return false
-      if (tool === 'Bash') return r.on === 'bash' || r.on === 'ordering' || (r.on === 'read' && via === 'bash-read')
+      if (tool === 'Bash') {
+        return r.on === 'bash' || r.on === 'ordering' || (r.on === 'read' && via === 'bash-read') || (r.on === 'edit' && via === 'bash-pre')
+      }
       if (READ_TOOLS.includes(tool)) return r.on === 'read'
       return EDIT_TOOLS.includes(tool) && r.on === 'edit'
     }
@@ -994,9 +1131,11 @@ class RulebookEngine implements Engine {
 
     const whereOf = (r: HookRule): string => {
       const ev = firedOn.get(r.id)
-      if (!ev || (ev.via !== 'bash' && ev.via !== 'bash-read')) return ''
+      if (!ev || (ev.via !== 'bash' && ev.via !== 'bash-pre' && ev.via !== 'bash-read')) return ''
       let path = ev.fp
-      if (root && path.startsWith(root.replace(/\/+$/, '') + '/')) path = relpath(path, root)
+      const eroot = ev.root || root
+      if (eroot && path.startsWith(eroot.replace(/\/+$/, '') + '/')) path = relpath(path, eroot)
+      if (ev.via === 'bash-pre') return ` _(in \`${path}\`, which that command writes)_`
       if (ev.via === 'bash-read') {
         const n = (ev.read ?? {}).lines
         return n !== undefined && n !== null ? ` _(\`${path}\`, ${pyStr(n)} lines, read by that command)_` : ` _(\`${path}\`, read by that command)_`
@@ -1073,6 +1212,21 @@ class RulebookEngine implements Engine {
     }
     for (const r of cut) {
       ledger.push(this.fireRow(ctx, r, mode, 'suppressed', excerptOf(r), { raw, dedup: dedupKeys, at: firedAt, judge: judged }))
+      // Cut, not spent: the rule was not shown, so it may fire on a later call.
+      unfire(st, r, dedupKeys[r.id], marks, true)
+    }
+    if (mode === 'pre' && tool === 'Bash') {
+      const wrote: [string, string][] = []
+      for (const r of shown) {
+        const ev = firedOn.get(r.id)
+        if (ev?.via === 'bash-pre') wrote.push([r.id, await this.realFile(ev.fp)])
+      }
+      if (wrote.length) {
+        st.bash_pre.delete(callKey)
+        st.bash_pre.set(callKey, wrote)
+        const keys = [...st.bash_pre.keys()]
+        for (const k of keys.slice(0, Math.max(keys.length - BASH_EDIT_MARKS_KEPT, 0))) st.bash_pre.delete(k)
+      }
     }
     for (const r of shown) {
       st.raw[r.id] = 0
@@ -1137,6 +1291,7 @@ class RulebookEngine implements Engine {
     const probes = new Probes(this.io, root, branch, '', null, this.turns(), cwd, env.baseBranch ?? '')
     const fired: HookRule[] = []
     const dedupKeys: Record<string, string> = {}
+    const marks: Marks = { fired: [...st.fired], counts: { ...st.counts }, spec_pending: { ...st.spec_pending } }
     for (const r of live) {
       const rid = r.id
       const scope = has(r, 'fire_scope') ? r.fire_scope : 'session'
@@ -1176,7 +1331,10 @@ class RulebookEngine implements Engine {
       const m = pyExec(pyStr(r.rx), text, 'im')
       out.ledger.push(this.fireRow(ctx, r, 'prompt', 'advise', m ? m[0] : '', { raw, dedup: dedupKeys, at: firedAt }))
     }
-    for (const r of cut) out.ledger.push(this.fireRow(ctx, r, 'prompt', 'suppressed', '', { raw, dedup: dedupKeys, at: firedAt }))
+    for (const r of cut) {
+      out.ledger.push(this.fireRow(ctx, r, 'prompt', 'suppressed', '', { raw, dedup: dedupKeys, at: firedAt }))
+      unfire(st, r, dedupKeys[r.id], marks, true)   // cut, not spent
+    }
     for (const r of shown) st.raw[r.id] = 0
   }
 

@@ -3,8 +3,8 @@
 the texts the hook injects.
 
 Stdlib only, no network at import, every public function pure except
-``check()``. The hook entry point is ``pr_link_trigger.py``; the two skills
-(`/memhub:link-pr`, `/memhub:find-contributing-sessions`) and
+``check()``. The hook entry point is ``pr_link_trigger.py``; the link-pr skill
+(`/memhub:link-pr`, every mode including `--find`) and
 ``capture.py current`` share ``conversation_id_for`` from here so a host cannot
 silently stop linking because one call site spelled a prefix differently.
 
@@ -367,7 +367,7 @@ def _explicit_method(tokens: list[str], client: str = "curl") -> str | None:
 # The segment is taken up to the FIRST `__`, not with `[^_]*`: server names
 # contain underscores all the time. `github_enterprise` is one, and any
 # plugin-provided server is another — this repo's own tools arrive as
-# `mcp__plugin_memhub-staging_memhub__add_memory`. `[^_]*` stopped at the first
+# `mcp__plugin_memhub-staging_memhub__save_artifact`. `[^_]*` stopped at the first
 # underscore and rejected every tool from such a server, so neither the create
 # link nor the in-play judgment could ever fire for them.
 _MCP_SPLIT = re.compile(r"(?i)^mcp__(.+?)__(.+)$")
@@ -1753,7 +1753,7 @@ CREATED = (
     "{recovery}"
     "Then, ONLY IF most of the code in this pull request was written in OTHER sessions (you "
     "opened it for work done earlier, or you are shipping someone else's branch), add one "
-    "sentence offering `/memhub:find-contributing-sessions {pr_url}` so those sessions get "
+    "sentence offering `/memhub:link-pr --find {pr_url}` so those sessions get "
     "linked too. A pull request has many sessions; yours does not displace them. Do not run it "
     "without a yes."
 )
@@ -1769,7 +1769,7 @@ IN_PLAY = (
     "did, and it is idempotent.\n"
     "IF IT WAS NOT — you are reviewing, checking out, or commenting on someone else's work, or "
     "work from an earlier session — do not link. Instead offer, in one sentence, to run "
-    "`/memhub:find-contributing-sessions {pr_url}` to find the sessions that did write it. Do "
+    "`/memhub:link-pr --find {pr_url}` to find the sessions that did write it. Do "
     "not run it without the user saying yes.\n"
     "{recovery}"
     "If this session already linked itself to this pull request, say nothing at all."

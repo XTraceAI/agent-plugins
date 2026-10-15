@@ -1,5 +1,5 @@
 ---
-description: Use when the user wants the MemHub companion — the small animal above the prompt that shows what the plugin is doing — turned on, turned off, swapped for another animal, or explained (e.g. "turn on the companion", "activate the goose", "enable my companion", "what is that goose above my prompt", "show me the hippo instead", "turn the companion off", "/memhub:companion"). Checks whether this Claude Code loads it (mods are on by default from 2.1.287; there is nothing to turn on), shows or hides it, and says what each of its states means.
+description: Use when the user wants the MemHub companion — the small animal above the prompt that shows what the plugin is doing — turned on, turned off, swapped for another animal, or explained, or asks about the one-line MemHub status text above the prompt (e.g. "turn on the companion", "activate the goose", "enable my companion", "what is that goose above my prompt", "why do I see only a MemHub status line and no animal", "show me the hippo instead", "turn the companion off", "/memhub:companion"). Checks whether this Claude Code loads it (mods are on by default from 2.1.287), explains that the animal is off by default with a plain status line in its place, shows or hides it, and says what each of its states means.
 argument-hint: "[on | off | status]"
 allowed-tools: Bash, Read, Edit
 ---
@@ -7,7 +7,26 @@ allowed-tools: Bash, Read, Edit
 The companion is a pixel animal drawn in the band above the prompt — Gus the
 Goose, Hugo the Hippo, Penelope the Penguin or Popo the Shiba, one per session, picked from the session
 id unless the person pins one. It shows, without costing a token, what MemHub
-is doing in the session:
+is doing in the session.
+
+**The animal is off by default.** Unless the plugin's `companion` option is
+on, or the person ran an animal's command once, the band shows a plain
+one-line **status strip** instead: the last rule that fired (`📏 Rule fired:
+…`, `⛔️ Blocked: …` for a blocked call), a proposed rule with the same
+**1 Activate / 2 Reject / 3 Later** buttons and its name as the link to MemHub
+Studio, else a dim quiet line — `MemHub · N rules armed for <repo>`,
+`MemHub · capturing`, `MemHub · inactive in this repo (/memhub:repos add .)`
+where this machine's repository list leaves the repository out, or
+`MemHub · inactive here: not in a repository (…)` for a session started in a
+folder that is no checkout while such a list exists. The strip
+never animates; it is there so MemHub's presence stays visible. Someone who
+sees only that line and asks about it is seeing the default, and has two ways
+to the animal: the `companion` option (in `/plugin` → MemHub → configure,
+`claude plugin install … --config companion=true`, or `install.sh --companion`)
+for every session, or any animal's command (`/goose`) in a session, which is
+remembered. `/<animal> off` returns to the strip.
+
+When the animal shows, what it does:
 
 | It does this | Because |
 | --- | --- |
@@ -16,6 +35,7 @@ is doing in the session:
 | Rises and says a rule | a MemHub rule fired on a tool call |
 | Says it crossly | a rule **blocked** that call |
 | Hops up under a gold `!` and asks, in a gold bubble — every animal in its own way | MemHub proposed a new rule; it is **not active** yet. The bubble names the rule and who it would apply to, and its **rule↗** is clickable — click it to open the rule in MemHub Studio, the page the Stop notice links. Buttons inside the bubble, where others say Got it, answer it — **1 Activate**, **2 Reject**, **3 Later** (press the digit from an empty prompt, or click). Activating takes an org admin (or you, for a rule that applies to just you); for anyone else the animal says so and the rule waits in MemHub Studio (the Stop notice carries the link) |
+| Says you are not signed in, and keeps a dim `not signed in · /memhub:login` row under it | MemHub has no sign-in on this machine (or the server refused the stored key), so sessions are not saved and team rules cannot sync. It says so once a session; run `/memhub:login`, and within a turn (or five minutes) it says you are signed in and the row goes |
 | Shows a heart | you clicked the small ♥ just left of its ground: that pets it (asleep, it wakes first; saying a rule, the click is Got it and the bubble goes; a proposal is never dismissed by a click) |
 | Opens your browser | you clicked a proposal's **rule↗** (or the rule's name on the "new rule waiting:" row): that rule's page in MemHub Studio. Where the machine has no `open` / `xdg-open` (SSH, a container) the click does nothing |
 
@@ -72,9 +92,14 @@ PY2
   nothing to set — not the old env var, not a setting — and it returns on its
   own when Anthropic switches it back (a new session picks it up). Everything
   else in the plugin (capture, the Rulebook) works without it.
-- Tests pass, version and plugin fine: the companion loads. If no animal is
-  showing, it was hidden with `/<animal> off` — any animal's command
-  (`/goose`) brings it back.
+- Tests pass, version and plugin fine: the companion loads. If only the
+  status strip is showing and no animal, that is the default (the `companion`
+  option is off) or it was hidden with `/<animal> off` — any animal's command
+  (`/goose`) brings the animal back, or the option turns it on for every
+  session. If the strip says `inactive in this repo`, MemHub is limited to
+  listed repositories on this machine and this one is not listed:
+  `/memhub:repos add .` enables it (see `/memhub:repos`); the animal stays
+  away there whatever is asked of it.
 
 ## `on`
 
@@ -103,11 +128,14 @@ PY2
 ## `off`
 
 `/goose off` in the session — any animal's command hides whichever is
-showing. It is remembered across sessions, and running that command again
-brings it back. The companion has no separate switch beyond that: it is part
-of the plugin, and disabling the plugin would also stop capture and the
-Rulebook hooks, so do not suggest it for this. Do **not** remove an env var to
-turn it off — `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS` is ignored at any value.
+showing; the one-line status strip takes its place. It is remembered across
+sessions, and running that command again brings the animal back. The other
+switch is the plugin's `companion` option, which decides the default for
+every session; the per-session command overrides it either way. There is no
+"nothing at all" state: the strip stays so MemHub's presence is visible.
+Disabling the plugin would also stop capture and the Rulebook hooks, so do
+not suggest it for this. Do **not** remove an env var to turn it off —
+`CLAUDE_CODE_ENABLE_FUNCTION_HOOKS` is ignored at any value.
 
 ## Which animal
 

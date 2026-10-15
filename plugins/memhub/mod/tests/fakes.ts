@@ -148,6 +148,11 @@ export function fakeCtx(io: Io, env: Env = 'staging'): Ctx {
     root: io.root,
     api: async () => ({ base: 'https://api.example.test', bearer: 'tok' }),
     forgetApi() {},
+    active: async () => ({ enabled: true, repo: REPO }),
+    setActive() {},
+    book: () => undefined,
+    setBook() {},
+    signIn: () => 'in',
   }
 }
 

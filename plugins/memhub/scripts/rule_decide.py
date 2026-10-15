@@ -52,6 +52,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import _tls  # noqa: E402 — stdlib-only, sits beside this file
+
 _TIMEOUT_S = 20
 _UUID = re.compile(r"^[0-9a-fA-F-]{36}$")
 _STATUS = {"activate": "active", "reject": "dismissed"}
@@ -90,7 +92,7 @@ def decide(rule_id: str, action: str, env: str = "") -> dict:
         data=json.dumps({"status": _STATUS[action]}).encode(),
         headers={**headers, "Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:
+        with _tls.urlopen(req, timeout=_TIMEOUT_S) as resp:
             payload = json.loads(resp.read() or b"{}")
     except urllib.error.HTTPError as e:
         try:
@@ -124,7 +126,7 @@ def proposed(session: str) -> dict:
         req = urllib.request.Request(
             f"{base}/v1/team/rulebook/rules?status=eq.proposed&author=eq.xtrace"
             "&order=created_at.desc", headers=headers)
-        with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:
+        with _tls.urlopen(req, timeout=_TIMEOUT_S) as resp:
             payload = json.loads(resp.read() or b"{}")
     except Exception as exc:
         return {"proposed": [], "error": type(exc).__name__}

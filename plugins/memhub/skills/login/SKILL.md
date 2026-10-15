@@ -129,9 +129,10 @@ from the next session. Only if the user needs them in this one: `/mcp` →
 needed). Cursor and Codex sign their tools in separately (Codex:
 `codex mcp login memhub`).
 
-`$MEMHUB_TOKEN` authenticates the hooks and scripts but not the MCP tools:
-Claude Code strips credential variables from a plugin's helper. A headless setup
-that relies on it still needs a stored key for the tools.
+`$MEMHUB_TOKEN` alone authenticates the hooks and scripts but not the MCP
+tools: Claude Code strips credential variables from a plugin's helper. Running
+login (not `--status`) with it set to an `mhk_` key stores that key for the
+tools too, with no browser; that is what a cloud or CI setup should run.
 
 ## After a successful first login
 

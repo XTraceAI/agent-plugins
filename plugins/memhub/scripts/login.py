@@ -38,6 +38,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import _tls  # noqa: E402 — stdlib-only, sits beside this file
 import atomic_write  # noqa: E402 — stdlib-only, sits beside this file
 import pak  # noqa: E402 — stdlib-only, sits beside this file
 from plugin_onboarding import HOSTS, LoginCompletion, active_completion, guide_url
@@ -187,6 +188,35 @@ def _ensure_key(url: str, env: str) -> str:
     return "ok"
 
 
+def _store_explicit_key(url: str, explicit: tuple[str, str]) -> None:
+    """Keep a verified explicit access key as this machine's stored key.
+
+    Claude Code gives a plugin's headersHelper neither credential variables
+    nor option values, so an explicit token signs in the hooks but never the
+    MCP tools; the helper reads only the stored key. A cloud or CI machine starts with none, so
+    without this its tools stay signed out while every hook works. Only an
+    access key is kept: an OAuth JWT expires within the day. A stored key that
+    differs is the person's own sign-in and is left alone.
+    """
+    token, source = explicit
+    if not token.startswith("mhk_"):
+        return
+    stored = pak.load(url)
+    if stored and stored.get("secret") == token:
+        print(f"access key  : {source} already stored for the MCP tools")
+        return
+    if stored:
+        print(f"access key  : kept the stored key; {source} is not stored "
+              "(the MCP tools use the stored one)")
+        return
+    try:
+        pak.save(url, {"secret": token, "label": f"from {source}"})
+    except OSError as exc:
+        print(f"access key  : NOT stored ({exc}); the MCP tools stay signed out")
+        return
+    print(f"access key  : stored {source} so the MCP tools sign in with it too")
+
+
 async def _run(status_only: bool, force: bool) -> int:
     url = default_url()
     env = env_for_url(url)
@@ -299,6 +329,15 @@ async def _run(status_only: bool, force: bool) -> int:
                 return 1
             leaf = _leaf(exc)
             print(f"status      : FAILED ({type(leaf).__name__}: {leaf})")
+            if _tls.is_cert_failure(exc):
+                # The transport already retried with the roots this machine
+                # trusts (see _tls.py); reaching here means those did not
+                # cover the issuer either, so name the two fixes that do.
+                print("cause       : this python3 cannot verify the server's certificate "
+                      "(its trust store is empty, or lacks your network's root)")
+                print("fix         : run the \"Install Certificates.command\" that came with "
+                      "your Python (python.org builds), or set SSL_CERT_FILE to a CA bundle "
+                      "that trusts it")
             return 1
 
         # Proven against the server — only now may the stash be discarded.
@@ -309,6 +348,8 @@ async def _run(status_only: bool, force: bool) -> int:
             # Provisioned outside this flow entirely; nothing here owns its
             # lifecycle, so there is no renewal story to tell and no key to mint.
             print(f"renewal     : n/a ({explicit[1]} is supplied explicitly)")
+            if not status_only:
+                _store_explicit_key(url, explicit)
             return 0
 
         if headers and headers.get("Authorization"):

@@ -15,6 +15,9 @@ import tempfile
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cursor_rulebook  # noqa: E402 — beside this file
+
 
 _MAX_PAYLOAD_BYTES = 4 * 1024 * 1024
 
@@ -69,6 +72,23 @@ def spawn_cursor_flush(raw: bytes, event: str) -> None:
                 stdin=payload_file, **kwargs)
     except OSError as exc:
         _log(f"could not launch cursor_flush.py ({exc!r})")
+
+
+def spawn_rulebook_flush(payload: bytes, event: str) -> None:
+    """Ship the rulebook's fires at a turn's end, detached like the flusher."""
+    try:
+        planned = cursor_rulebook.flush_call(event, json.loads(payload))
+        if planned is None:
+            return
+        args, call = planned
+        script = Path(__file__).resolve().with_name("rulebook_hook.py")
+        with tempfile.TemporaryFile() as payload_file:
+            payload_file.write(json.dumps(call).encode("utf-8"))
+            payload_file.seek(0)
+            subprocess.Popen([sys.executable, str(script), *args],
+                             stdin=payload_file, **_detached_kwargs())
+    except (OSError, ValueError) as exc:
+        _log(f"could not launch rulebook flush ({exc!r})")
 
 
 def _normalize_payload(raw: bytes) -> bytes | None:
@@ -143,13 +163,35 @@ def capture_context(payload: bytes) -> str | None:
 
 def main() -> int:
     event = sys.argv[1] if len(sys.argv) > 1 else "unknown"
-    output = {"permission": "allow"}
+    # sessionStart and postToolUse take no permission; the rest are asked one.
+    output = {} if event in ("sessionStart", "postToolUse") else {"permission": "allow"}
     try:
         raw = sys.stdin.buffer.read(_MAX_PAYLOAD_BYTES + 1)
         payload = _normalize_payload(raw)
         if payload is not None:
-            spawn_cursor_flush(payload, event)
-            contexts = []
+            if event in cursor_rulebook.NOTE_EVENTS + ("beforeReadFile",):
+                # Rulebook-only events: capture never read them.
+                try:
+                    cursor_rulebook.note(event, json.loads(payload))
+                except Exception as exc:
+                    _log(f"rulebook note failed ({exc!r})")
+            else:
+                spawn_cursor_flush(payload, event)
+            if event in cursor_rulebook.FLUSH_EVENTS:
+                spawn_rulebook_flush(payload, event)
+                cursor_rulebook.note(event, json.loads(payload))
+            ruled = None
+            if event in cursor_rulebook.GATE_EVENTS:
+                try:
+                    ruled = cursor_rulebook.gate(event, json.loads(payload))
+                except Exception as exc:
+                    _log(f"rulebook gate failed ({exc!r})")
+            if ruled and ruled.get("permission") == "deny":
+                print(json.dumps(ruled), flush=True)
+                return 0
+            if ruled:
+                output.update(ruled)
+            contexts = [ruled["agent_message"]] if ruled and ruled.get("agent_message") else []
             if event == "beforeSubmitPrompt":
                 from plugin_compatibility import startup_message
                 try:
@@ -169,10 +211,11 @@ def main() -> int:
                     _log(f"context check failed ({exc!r})")
             context = "\n\n".join(contexts)
             if context:
-                output.update(agent_message=context, user_message=context)
+                output.update(agent_message=context,
+                              user_message=output.get("user_message") or context)
 
     except Exception as exc:
-        # Capture observes; it must never gate the user's prompt or command.
+        # Capture observes; only a team rule's deny above may gate a call.
         _log(f"could not launch hook capture ({exc!r})")
     print(json.dumps(output), flush=True)
     return 0

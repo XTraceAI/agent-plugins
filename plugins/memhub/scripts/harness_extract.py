@@ -414,16 +414,25 @@ def _api():
 
 
 def server_classify(window: str, repo: str = "",
-                    timeout: float = 0) -> tuple[dict, float]:
+                    timeout: float = 0, session_id: str = "", at: str = "") -> tuple[dict, float]:
     """ONE bounded POST. Returns ({signal, reason, kind?, derivable?}, seconds).
 
     Every failure is a reply with `signal: false` and a CLIENT_REASONS reason,
     so a caller never has to catch anything. No retry: the caller is a
-    detached best-effort child."""
+    detached best-effort child.
+
+    `session_id` and `at` (the turn's time, ISO) let the server record a
+    `correction` / `claim_challenge` verdict as a session-wide fire event —
+    corrections per session, harness-self-improvement-spec §3. Optional: an
+    older server ignores neither nor refuses them? It refuses unknown fields
+    (`extra="forbid"`), so they are sent only together and only when set."""
     t0 = time.time()
     body = {"window": window[:WINDOW_MAX_CHARS]}
     if repo:
         body["repo"] = repo[:200]
+    if session_id and at:
+        body["session_id"] = str(session_id)[:200]
+        body["at"] = str(at)
     try:
         api = _api()
     except Exception as exc:                 # noqa: BLE001 — a hook path

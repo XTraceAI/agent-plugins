@@ -30,6 +30,19 @@ For every route it keeps the shell's exact semantics:
   the fire flush, capture and harness never are;
 * an empty ``CLAUDE_PLUGIN_ROOT`` skips the handler (the flush lane says so
   on stderr);
+* the repository allowlist (``repo_allow.py``: ``~/.config/memhub-plugin/
+  repos.json``) gates each lane by its ``scope``. With no file every lane
+  runs, as always. With one, a ``session`` lane (capture, the brief, the
+  harness, the Rulebook's prompt and session lanes) runs only when the
+  payload's ``cwd`` is inside a LISTED checkout — a cwd outside any checkout
+  is dormant too; a ``call`` lane (the Rulebook's pre and post lanes) always
+  reaches ``rulebook_hook``, which judges each tool call by the checkout the
+  call acts in (``repo_of_call``), so a session started in a parent folder
+  of several repos still gets its rules in the listed ones; an ``always``
+  lane (the fire flush) runs regardless, since it only ships rows already
+  recorded. A dormant session is told so once: the SessionStart
+  ``capture_health`` route answers with one ``additionalContext`` line
+  (``repo_allow.dormant_note``) instead of running, and nothing else prints;
 * ``claude_hook_guard`` gates every lane, then an optional prefilter must
   exit 0, then the script runs with this interpreter and writes to this
   process's stdout and stderr, so a PreToolUse block's exit code and JSON
@@ -154,6 +167,10 @@ class Lane(NamedTuple):
     run: Tuple[str, ...]            # script, then its arguments
     prefilter: Optional[str] = None  # must exit 0 before ``run`` starts
     isolated: bool = False          # run ``run`` in its own interpreter
+    # The repository allowlist's reach: ``session`` lanes need the session's
+    # cwd in a listed checkout; ``call`` lanes judge per tool call inside
+    # rulebook_hook; ``always`` lanes run whatever the list says.
+    scope: str = "session"
 
 
 class Route(NamedTuple):
@@ -165,17 +182,19 @@ class Route(NamedTuple):
     claim: Optional[str] = None     # mod lane that, when claimed, skips this route
 
 
+SCOPES = ("session", "call", "always")
+
+
 def _one(guard: str, *run: str, prefilter: Optional[str] = None,
-         isolated: bool = False, **route: object) -> Route:
-    return Route(lanes=(Lane(guard, tuple(run), prefilter, isolated),), **route)
+         isolated: bool = False, scope: str = "session", **route: object) -> Route:
+    return Route(lanes=(Lane(guard, tuple(run), prefilter, isolated, scope),), **route)
 
 
 # Every lane not marked ``isolated`` runs in-process (see the docstring); the
 # isolated ones are exactly the hooks claude-hooks.json marks ``async``.
 ROUTES = {
     ("PreToolUse", "rulebook_hook"): _one(
-        "ignore", "rulebook_hook.py", "pre", claim="pre"),
-    ("PreToolUse", "add_memory_gate"): _one("ignore", "add_memory_gate.py"),
+        "ignore", "rulebook_hook.py", "pre", claim="pre", scope="call"),
     ("PreToolUse", "create_rule_origin"): _one("ignore", "create_rule_origin.py"),
 
     # Stage 1 is a cheap test of tool_input.command; flush_prefilter.py is the
@@ -192,7 +211,11 @@ ROUTES = {
         subject=_command_text),
     ("PostToolUse", "md_capture"): _one("ignore", "md_capture.py"),
     ("PostToolUse", "rulebook_hook"): _one(
-        "ignore", "rulebook_hook.py", "post", claim="post"),
+        "ignore", "rulebook_hook.py", "post", claim="post", scope="call"),
+    # A failed call's error text, through the same post lane (ENG-1236); the
+    # mod serves its own error results in-process, so the same claim.
+    ("PostToolUseFailure", "rulebook_hook"): _one(
+        "ignore", "rulebook_hook.py", "post", claim="post", scope="call"),
     # All four are needed: see docs/specs/pr-linking-plugin-spec.md §5.1.
     ("PostToolUse", "pr_link_trigger"): _one(
         "ignore", "pr_link_trigger.py",
@@ -206,6 +229,9 @@ ROUTES = {
     ("SessionStart", "harness_stop"): _one(
         "ignore", "harness_stop.py", "session", harness=True),
 
+    # The person typed a command and the host expanded it: noted, so the
+    # submit that follows is known to be a body, not their words (ENG-1235).
+    ("UserPromptExpansion", "rulebook_hook"): _one("ignore", "rulebook_hook.py", "expansion"),
     ("UserPromptSubmit", "brain_brief"): _one("ignore", "brain_brief.py", "prompt"),
     ("UserPromptSubmit", "rulebook_hook"): _one(
         "ignore", "rulebook_hook.py", "prompt", claim="prompt"),
@@ -220,15 +246,17 @@ ROUTES = {
     ("Stop", "md_capture_flush"): _one(
         "ignore", "md_capture_flush.py", prefilter="md_capture_prefilter.py",
         isolated=True),
+    # The fire flush ships rows already recorded, so the allowlist never
+    # stops it: a dormant session has no rows, a listed one owes its fires.
     ("Stop", "rulebook_hook"): _one(
-        "ignore", "rulebook_hook.py", "flush", isolated=True),
+        "ignore", "rulebook_hook.py", "flush", isolated=True, scope="always"),
     ("Stop", "harness_stop"): _one("ignore", "harness_stop.py", "stop", harness=True),
 
     # One handler, two lanes, in order: Claude Code runs an event's handlers
     # in parallel, and the fire flush can only link rows capture has stored.
     ("SessionEnd", "session_end"): Route(lanes=(
         Lane("capture", ("flush_session.py",), isolated=True),
-        Lane("ignore", ("rulebook_hook.py", "flush", "final"), isolated=True),
+        Lane("ignore", ("rulebook_hook.py", "flush", "final"), isolated=True, scope="always"),
     )),
 }
 
@@ -267,6 +295,42 @@ def _claimed(lane: Optional[str], payload: object, environ) -> bool:
         return bool(mod_lanes.claimed(lane, payload, environ, root=str(SCRIPTS.parent)))
     except Exception:
         return False
+
+
+def _session_cwd(payload: object) -> str:
+    cwd = payload.get("cwd") if isinstance(payload, dict) else None
+    return cwd if isinstance(cwd, str) and cwd else os.getcwd()
+
+
+def session_enabled(payload: object) -> bool:
+    """repo_allow's verdict for the session's cwd; any failure runs the lane
+    (a broken allowlist module must not silence every hook)."""
+    try:
+        import repo_allow
+        return bool(repo_allow.session_enabled(_session_cwd(payload)))
+    except Exception:
+        return True
+
+
+# The one SessionStart route that speaks for a dormant session. Any of the
+# four would do; this one is never claimed by the mod and never turned off by
+# a flag, so the note always has a lane to ride.
+DORMANT_NOTE_ROUTE = ("SessionStart", "capture_health")
+
+
+def _dormant_note(payload: object) -> Optional[str]:
+    """The ``additionalContext`` answer for a dormant SessionStart, or None
+    for a compaction (the session was told at its start)."""
+    source = payload.get("source") if isinstance(payload, dict) else None
+    if source == "compact":
+        return None
+    try:
+        import repo_allow
+        note = repo_allow.dormant_note(_session_cwd(payload), str(SCRIPTS))
+    except Exception:
+        return None
+    return json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart",
+                                              "additionalContext": note}})
 
 
 def _flush() -> None:
@@ -364,9 +428,23 @@ def dispatch(event: str, name: str, raw: bytes, environ=None) -> int:
             print("[memhub-flush] CLAUDE_PLUGIN_ROOT unset; cannot locate "
                   "flush scripts, skipping", file=sys.stderr)
         return 0
+    # The repository allowlist, asked once per hook and only when a lane
+    # needs it: a ``session`` lane in a dormant session is skipped silently,
+    # except the one SessionStart route that says so to the model.
+    allowed: Optional[bool] = None
     status = 0
     for lane in route.lanes:
         status = 0
+        if lane.scope == "session":
+            if allowed is None:
+                allowed = session_enabled(payload)
+            if not allowed:
+                if (event, name) == DORMANT_NOTE_ROUTE:
+                    note = _dormant_note(payload)
+                    if note:
+                        print(note)
+                        _flush()
+                continue
         if not _guard(lane.guard, event, raw, payload):
             continue
         if lane.prefilter and _run((lane.prefilter,), raw) != 0:

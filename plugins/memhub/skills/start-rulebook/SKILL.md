@@ -112,6 +112,12 @@ parses.
   what was read and how many older transcripts were not — repeat it to the
   user. (Claude Code itself deletes transcripts after about 30 days unless
   `cleanupPeriodDays` was raised, so for most people `--all` adds little.)
+- **What a session counts as.** Its own transcript plus its subagents'
+  (their commands and edits count; their prompts are not the person's
+  corrections). It belongs to the repo of its cwd, remembered across runs, so
+  a session in a worktree deleted since still counts for its repo. The
+  report's `subagents:` and `repo placement:` lines say how many of each.
+  `--repo` takes the repo's name or any path inside it.
 - Inputs it takes: `--days N` / `--all`, `--claude-md <path>` (repeatable), `--candidates <json
   list>` (repeatable: the checks you derive in step 2), `--rule-file <body>`
   (one check — what `create-rule` calls for its backtest), `--facets <file
@@ -130,17 +136,22 @@ parses.
   everything except the `create_rule` calls.
 
 **Decide who the rules apply to before you file anything — one scope for the
-whole batch.** Every rule goes into one scope: `org` (everyone in the
-organisation — **the default**), `personal` (just the user), or `workspace`
-(the people in one workspace — only when the user asks for it). Call
-`list_rulebooks` and read its `scopes` block (`org` / `personal` with `label`
-and `applies_to`, `supports_workspaces`, `workspaces[]`); do not enumerate
-books. `--scope` given → use it. The user's words say "just me" / "only me" /
-"personal" → `personal`. They name a workspace or teamspace that matches a
-`scopes.workspaces[].name` and `supports_workspaces` is true → `workspace` with
-that `workspace_id`. **Otherwise `org`** — do not ask, and never offer the
-workspace scope unprompted; a workspace they name that is not listed (or a
-plan without workspaces) is said once, and the batch goes to `org`. Every
+whole batch.** Every rule goes into one scope: `personal` (just the user —
+**the default**), `org` (everyone in the organisation — only with a strong
+reason), or `workspace` (the people in one workspace — only when the user asks
+for it). Call `list_rulebooks` and read its `scopes` block (`org` / `personal`
+with `label` and `applies_to`, `supports_workspaces`, `workspaces[]`); do not
+enumerate books. `--scope` given → use it. Their words say "just me" / "only me" / "personal" → `personal`, never escalated. They name a workspace or teamspace
+that matches a `scopes.workspaces[].name` and `supports_workspaces` is true →
+`workspace` with that `workspace_id`. Their words put the rules on everyone
+("the team", "everyone", "org-wide") → `org`. **Otherwise `personal`** —
+unless you can say in one sentence why EVERY rule in the batch is right for
+anyone working in this repo or org (it guards something shared, or a repo
+fact that bites every contributor), not just this user's machine, tools,
+habits or taste; then `org`, with that sentence in the proposal. Do not ask,
+and never offer the workspace scope unprompted; a workspace they name that is
+not listed (or a plan without workspaces) is said once, and the batch goes to
+`personal` unless the rest of this paragraph says `org`. Every
 proposal you show the user names who it would apply to (the scope's `label`
 and `applies_to`), because that is who the rule would reach.
 
@@ -249,8 +260,11 @@ leaves:
 **Show the WHAT THE SCAN FOUND block and let them correct it.** It is
 heuristics over file names. The two it gets wrong most: the default branch
 when the team merges somewhere other than `origin/HEAD` (a `staging` flow),
-and the test command when the repo wraps it (`make check`, `nox`, `tox`). On
-a correction, edit the slot in `signals.json` and re-run `seed` then `verify`
+and the test command when the repo wraps it (`make check`, `nox`, `tox`). For
+the branch, re-run `all` with `--default-branch` once per branch to guard
+(`--default-branch main --default-branch staging`); when pull requests land on
+another branch, the scan's branch line names it and gives that command. For
+anything else, edit the slot in `signals.json` and re-run `seed` then `verify`
 — never hand-edit a candidate's regex.
 
 **`rc=1` means a candidate failed; it is not offered and not filed.** Say

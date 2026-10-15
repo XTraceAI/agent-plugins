@@ -85,6 +85,9 @@ BLOCK_PREFIX = "MemHub harness: before you stop"
 #: What the Stop hook's one line begins with — the only harness text shown,
 #: and written for the person. `session_rule` names it, so the two move together.
 HANDOFF_PREFIX = "MemHub: possible team rule spotted in turn"
+#: The Stop hook's one line for a repair: the effect judge found a rule COST
+#: this session's work (live repair, harness-self-improvement-spec §4).
+REPAIR_PREFIX = "MemHub: rule cost this session"
 
 
 def session_rule(session: str) -> str:
@@ -95,9 +98,11 @@ def session_rule(session: str) -> str:
     return (
         f"MemHub harness: when a Stop hook line says \"{HANDOFF_PREFIX} N\", run "
         f"`python3 \"{script}\" handoff --moment {session}#N` with that N and follow its "
-        f"output. That line has already told the person, so say nothing more about it, and "
-        f"nothing about a fork that files no rule; if a fork files a rule, tell the person "
-        f"that one line."
+        f"output. When one says \"{REPAIR_PREFIX}: … at turn N\", run "
+        f"`python3 \"{script}\" handoff --moment {session}#N --repair` the same way. "
+        f"Either line has already told the person, so say nothing more about it, and "
+        f"nothing about a fork that files no rule; if a fork files or repairs a rule, tell "
+        f"the person that one line."
     )
 
 
@@ -360,7 +365,8 @@ def judge_previous_turn(session: str, transcript: str, cwd: str) -> dict | None:
     state = _stamp(session, turn, cwd)
     window = hx.redact_window(hx.build_window(turn, prev, state, earlier=turns[-5:-3],
                                               following=after.get("user") or ""))
-    reply, secs = hx.server_classify(window, repo=state.get("repo", ""))
+    reply, secs = hx.server_classify(window, repo=state.get("repo", ""),
+                                     session_id=session, at=str(state.get("at") or ""))
     at = "following" if reply.get("at") == "following" else "new"
     _log(f"judge {session[:8]} t{n}: signal={bool(reply.get('signal'))} "
          f"reason={reply.get('reason')} kind={reply.get('kind')} {secs}s "
@@ -393,6 +399,8 @@ def fork_launch_prompt(moment: dict, env: str, repo: str = "") -> str:
     read-only `stamp` command, so no JSON reaches the person's screen."""
     turn = moment["turn"]
     ref = moment["source_ref"]
+    if moment.get("repair"):
+        return _repair_launch_prompt(moment, env, repo)
     kind = moment.get("kind") or "a signal"
     derivable = (" The classifier thinks it may already be written down, so check that "
                  "first.") if moment.get("derivable") else ""
@@ -415,12 +423,50 @@ def fork_launch_prompt(moment: dict, env: str, repo: str = "") -> str:
         f"{stamp_cmd}. The turn worked in {worked_in}; choose scope_repos from the lesson, "
         f"not from that. Step 4b (the live forward test) cannot run inside a fork: skip "
         f"it and file on step 4's verifier, as the Harness-draft path says. File the rule as "
-        f"`proposed` to the {env} rulebook for everyone in the organisation; activate "
+        f"`proposed` to the {env} rulebook, for the person alone unless the Harness-draft "
+        f"path says anyone working in the repo or organisation needs it; activate "
         f"nothing, ask nothing, touch no "
         f"settings or credentials. End with exactly one line: \"{FORK_MARK}: filed "
         f"<title>\", \"{FORK_MARK}: none, <one short reason>\" or \"{FORK_MARK}: failed, "
         f"<why it could not file>\"."
     )
+
+
+def _repair_launch_prompt(moment: dict, env: str, repo: str = "") -> str:
+    """The fork prompt for a REPAIR: the effect judge found a rule cost this
+    session's work at turn N. Same shape as the lesson prompt — who launched
+    it, on whose install, what it may do — and the one difference: it repairs
+    an existing rule (a proposed supersede) instead of writing a new one. How
+    to repair lives in the create-rule skill's harness reference."""
+    turn, ref, rp = moment["turn"], moment["source_ref"], moment["repair"]
+    script = str(Path(__file__).resolve())
+    stamp_cmd = (f'python3 "{script}" stamp --transcript "{moment["transcript"]}" '
+                 f'--turn {turn} --cwd "{moment["cwd"]}"')
+    title = str(rp.get("title") or rp.get("rule_id") or "")[:120].replace('"', "'")
+    p = rp.get("p_cost")
+    pc = f" (p_cost {p:.2f})" if isinstance(p, (int, float)) else ""
+    return (
+        f"{FORK_MARK}, moment {ref}: you were launched by the MemHub plugin's Stop hook, "
+        f"installed by the person running this session, to REPAIR one team rule. Rule "
+        f"\"{title}\" (rule_id {rp.get('rule_id')}) fired on turn {turn} of this session and the "
+        f"effect judge found that showing it cost the work{pc}. Run the memhub create-rule "
+        f"skill's Harness-repair path on source_ref=\"{ref}\" for that rule_id, with the state "
+        f"stamp this read-only command prints: {stamp_cmd}. Read turn {turn} — the call the "
+        f"rule fired on and what the agent did after it — and decide which it is: the rule "
+        f"fired in a situation it is not for (add a `when_not`), its pattern matched the wrong "
+        f"shape (a `command_not_rx`), its `do` asked for something this environment refuses "
+        f"(a new `do`), or nothing was wrong (file nothing). File the repair as a `proposed` "
+        f"supersede of that rule (`supersedes_rule_id`) in the {env} rulebook; activate "
+        f"nothing, ask nothing, touch no settings or credentials. End with exactly one line: "
+        f"\"{FORK_MARK}: repaired <title>\", \"{FORK_MARK}: none, <one short reason>\" or "
+        f"\"{FORK_MARK}: failed, <why it could not file>\"."
+    )
+
+
+def repair_line(repair: dict, turn: int) -> str:
+    """The Stop hook's one line for a repair, written for the person."""
+    title = str(repair.get("title") or repair.get("rule_id") or "")[:80].replace('"', "'")
+    return f"{REPAIR_PREFIX}: \"{title}\" at turn {turn}; drafting a repair in the background."
 
 
 def handoff_line(moment: dict) -> str | None:
@@ -453,14 +499,62 @@ def fork_reason(moment: dict, env: str, repo: str = "") -> str:
     pass in silence — a rule that did not get written is not news the person
     asked for, and the full report stays in the transcript."""
     launch = fork_launch_prompt(moment, env, repo)
+    what = (f"a rule cost the work at turn {moment['turn']}" if moment.get("repair")
+            else f"turn {moment['turn']} was flagged")
     return (
-        f"{BLOCK_PREFIX}: turn {moment['turn']} was flagged. Launch ONE background fork "
+        f"{BLOCK_PREFIX}: {what}. Launch ONE background fork "
         f"of yourself with the Agent tool (subagent_type \"fork\") and give it exactly "
         f"this prompt, verbatim: <<<{launch}>>> Say nothing to the person about it and do "
         f"nothing else this turn. When the fork's completion notice arrives: if its last "
-        f"line says \"filed\", tell the person that one line; if it says \"none\" or "
-        f"\"failed\", say nothing about it and end that turn with no text."
+        f"line says \"filed\" or \"repaired\", tell the person that one line; if it says "
+        f"\"none\" or \"failed\", say nothing about it and end that turn with no text."
     )
+
+
+def _turn_of_fire(turns: list[dict], repair: dict) -> int | None:
+    """The turn whose tool results include the fire's `tool_use_id`."""
+    tid = repair.get("tool_use_id")
+    if not tid:
+        return None
+    for t in turns:
+        if any(r.get("id") == tid for r in (t.get("results") or [])):
+            return t.get("n")
+    return None
+
+
+def pending_repair(session: str, transcript: str) -> dict | None:
+    """The repair this session owes, with the turn the fire happened on, or
+    None. Reads the effect judge's verdicts through `fire_effect.py` (the
+    rulebook hook's state and ledger dirs); never raises."""
+    try:
+        import fire_effect as fe  # noqa: PLC0415 — beside this file
+        import rulebook_hook as rh  # noqa: PLC0415
+        ldir = rh._ledger_dir()
+        sdir = os.path.dirname(rh.state_path(session))
+        rp = fe.pending_repair(ldir, sdir, session)
+        if rp is None:
+            return None
+        n = _turn_of_fire(hx.turns_from_transcript(transcript), rp)
+        if n is None:
+            _log(f"repair {session[:8]}: fire {str(rp.get('fire_id'))[:8]} not in the transcript, dropped")
+            return None
+        rp["turn"] = n
+        fe._save(os.path.join(sdir, f"{fe._safe_name(session)}.repair.json"), rp)
+        return rp
+    except Exception:
+        return None
+
+
+def handed_repair(session: str) -> dict | None:
+    """The repair the last Stop noted for `session` (`handoff --repair`)."""
+    try:
+        import fire_effect as fe  # noqa: PLC0415
+        import rulebook_hook as rh  # noqa: PLC0415
+        sdir = os.path.dirname(rh.state_path(session))
+        rp = fe._load(os.path.join(sdir, f"{fe._safe_name(session)}.repair.json"))
+        return rp if rp.get("fire_id") else None
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------- commands
@@ -474,21 +568,31 @@ def cmd_stop(payload: dict) -> int:
         # A subagent's Stop is not the person's; `stop_hook_active` is the
         # continuation this hook asked for, i.e. the fork launch itself.
         return 0
+    lines = []
     moment = judge_previous_turn(session, transcript, cwd)
-    if moment is None:
-        return 0
-    line = handoff_line(moment)
-    if line is None:
-        _log(f"launch {session[:8]} t{moment['turn']}: skipped, unusable moment ref")
+    if moment is not None:
+        line = handoff_line(moment)
+        if line is None:
+            _log(f"launch {session[:8]} t{moment['turn']}: skipped, unusable moment ref")
+        else:
+            lines.append(line)
+            _log(f"launch {session[:8]} t{moment['turn']}: fork requested ({moment.get('kind')}) "
+                 f"derivable={int(bool(moment.get('derivable')))}")
+    # Live repair: a cost verdict on one of this session's fires (the flush
+    # recorded it from the server's reply) hands the rule to a fork too.
+    repair = pending_repair(session, transcript)
+    if repair is not None:
+        lines.append(repair_line(repair, repair["turn"]))
+        _log(f"repair {session[:8]} t{repair['turn']}: fork requested for rule "
+             f"{str(repair.get('rule_id'))[:8]} p_cost={repair.get('p_cost')}")
+    if not lines:
         return 0
     # `additionalContext`, not `decision: block`: both continue the agent (and
     # both set `stop_hook_active` on the continuation, probed on 2.1.286), and
-    # Claude Code prints both to the person in full — so this carries one line,
-    # and the fork prompt comes from the `handoff` command it names.
+    # Claude Code prints both to the person in full — so this carries one line
+    # per moment, and the fork prompt comes from the `handoff` command it names.
     print(json.dumps({"hookSpecificOutput": {
-        "hookEventName": "Stop", "additionalContext": line}}))
-    _log(f"launch {session[:8]} t{moment['turn']}: fork requested ({moment.get('kind')}) "
-         f"derivable={int(bool(moment.get('derivable')))}")
+        "hookEventName": "Stop", "additionalContext": "\n".join(lines)}}))
     return 0
 
 
@@ -541,7 +645,7 @@ def _logged_verdict(session: str, turn: int) -> tuple[str, bool]:
     return ("" if m.group(3) == "None" else m.group(3)), m.group(4) == "1"
 
 
-def cmd_handoff(ref: str, kind: str, derivable: bool) -> int:
+def cmd_handoff(ref: str, kind: str, derivable: bool, repair: bool = False) -> int:
     """Print what the continued agent does for the moment `ref`: launch one fork
     with `fork_launch_prompt`. The agent's own call, like `stamp`: read-only,
     not gated on the flag, and loud when it cannot answer."""
@@ -556,12 +660,18 @@ def cmd_handoff(ref: str, kind: str, derivable: bool) -> int:
         print(f"no transcript for session {session}", file=sys.stderr)
         return 2
     turns = hx.turns_from_transcript(transcript)
+    rp = None
+    if repair:
+        rp = handed_repair(session)
+        if rp is None or int(rp.get("turn") or -1) != int(turn_s):
+            print(f"no repair noted for {ref}", file=sys.stderr)
+            return 2
     for turn in turns:
         if turn.get("n") == int(turn_s):
             cwd = turn.get("cwd") or os.getcwd()
             moment = {"source_ref": ref, "turn": int(turn_s), "kind": kind or None,
                       "derivable": derivable, "state": _stamp(session, turn, cwd),
-                      "transcript": transcript, "cwd": cwd,
+                      "transcript": transcript, "cwd": cwd, "repair": rp,
                       # a moment handed over on `at=following` is the turn the
                       # Stop just ended: the person has said nothing after it yet
                       "next_known": any(t.get("n") == int(turn_s) + 1 for t in turns)}
@@ -592,6 +702,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--moment", default="", help="handoff: <session_id>#<turn>")
     p.add_argument("--kind", default="", help="handoff: the classifier's label")
     p.add_argument("--derivable", action="store_true")
+    p.add_argument("--repair", action="store_true",
+                   help="handoff: the moment is a cost verdict on turn N, not a lesson")
     return p
 
 
@@ -604,7 +716,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "handoff":
         # The continued agent's call, asked for by a Stop that already judged.
         kind = args.kind if _KIND.match(args.kind or "") else ""
-        return cmd_handoff(args.moment, kind, args.derivable)
+        return cmd_handoff(args.moment, kind, args.derivable, repair=args.repair)
     if not hx.extract_enabled():
         try:
             sys.stdin.read()          # drain the hook payload, say nothing

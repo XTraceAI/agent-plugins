@@ -3,8 +3,9 @@ import json
 import re
 import time
 from pathlib import Path
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
+import _tls
 import atomic_write
 from _memhub_auth import _plugin_root
 from plugin_version import ACTIVE_PLUGIN_VERSION, update_message
@@ -21,7 +22,7 @@ def _version(value):
 
 def _fetch(path):
     # No MemHub credentials go to the public release endpoint.
-    with urlopen(Request(RAW + path, headers={'Accept': 'application/json'}), timeout=0.75) as response:
+    with _tls.urlopen(Request(RAW + path, headers={'Accept': 'application/json'}), timeout=0.75) as response:
         raw = response.read(65537)
     if len(raw) > 65536:
         raise ValueError('release metadata too large')

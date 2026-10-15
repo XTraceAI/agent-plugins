@@ -120,8 +120,8 @@ Creating a brain is the last resort, never the first move.
 3. *Optional*, when a person is in the loop to judge a near-match: run
    `list_agent_brains(query="…")` with the repo or topic in natural language
    — it ranks brains, and an existing one may hold this subject under a
-   different name. The skills that resolve a repo room (onboard, pr-babysit)
-   skip it: the exact name is the dedup that matters.
+   different name. The skill that resolves a repo room (onboard) skips it:
+   the exact name is the dedup that matters.
 4. No exact match: `create_agent_brain` with `name: "Repo: <org>/<name>"`,
    `category: "repo"`, a description (§5), and **`repo: "<org>/<name>"`** —
    the §1 name without the `Repo: ` prefix. Omit `workspace_id`. `repo` ties

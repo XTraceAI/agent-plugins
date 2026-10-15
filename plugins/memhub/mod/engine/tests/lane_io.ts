@@ -86,6 +86,8 @@ export function fireAsWritten(row: Dict, session: string): Dict {
     repo: row.repo ?? null,
     branch: row.branch ?? null,
     tool: row.tool ?? null,
+    tool_use_id: row.tool_use_id ?? null,
+    title: row.title ?? '',
     hook_phase: row.hook_phase,
     mode: row.mode,
     dedup_key: row.dedup_key ?? null,

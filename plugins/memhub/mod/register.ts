@@ -12,20 +12,22 @@
 // `prompt.compose`, `skill.prompt` or `attribution.text` (spec §1.4, D3): the
 // built-in guard skips user mods on those for most Team/Enterprise sign-ins.
 
-import type { EngineInterface, On } from 'claude-code'
+import type { EngineInterface, On, PluginOptions } from 'claude-code'
 
 import type { FireNote, LaneName } from '../types'
 
-// The companion registers last (innermost) with the mod's ctx: it reads fires
-// from `$.state` and polls proposals over `$.http.fetch` (`register(on, ctx)`).
+// The companion registers last (innermost) with the mod's ctx and the
+// plugin's userConfig options (its `companion` switch): it reads fires from
+// `$.state` and polls proposals over `$.http.fetch` (`register(on, ctx, options)`).
 import { register as registerCompanion } from '../companion/register'
 import { Act } from './act'
 import { Book, RemoteSwitch } from './book'
 import { Claims, StatusLine } from './claims'
-import { type Ctx, type Env, envOf, type Io, lastJson, makeCtx, MOD_CLI, rootOf } from './ctx'
+import { ACTIVE, type Active, type Ctx, type Env, envOf, type Io, lastJson, makeCtx, MOD_CLI, rootOf } from './ctx'
 import type { Engine, EngineEnv, EngineIO, FileStat, HookRule, PathsInfo, TurnMessage } from './engine'
 import { createEngine } from './engine/engine'
 import { Lanes, TOOL_RX } from './lanes'
+import { forwardTestCovers } from './redirect'
 
 /**
  * The Ctx every part receives at register time. Its fields are the real
@@ -44,6 +46,12 @@ function lateCtx(): Ctx & { bind(real: Ctx): void } {
     },
     api: () => (real ? real.api() : Promise.resolve(undefined)),
     forgetApi: () => real?.forgetApi(),
+    // Before the shell is bound nothing can ask the allowlist: active, as always.
+    active: () => (real ? real.active() : Promise.resolve(ACTIVE)),
+    setActive: value => real?.setActive(value),
+    book: () => real?.book(),
+    setBook: info => real?.setBook(info),
+    signIn: () => real?.signIn() ?? 'unknown',
     bind(r) {
       real = r
     },
@@ -164,6 +172,7 @@ const COUNT_LINES_PY =
 /** The engine's own I/O, over the shell's port (and `$`, through `extras`). */
 function engineIoOf(io: Io, ctx: Ctx, extras: EngineExtras | undefined, home: string): EngineIO {
   const pathsCache = new Map<string, Promise<PathsInfo | undefined>>()
+  const envCache = new Map<string, Promise<string | undefined>>()
   return {
     git: async (argv, cwd, timeoutMs = 10_000) => {
       const r = await io.run(['git', ...argv], { cwd, timeoutMs })
@@ -186,6 +195,20 @@ function engineIoOf(io: Io, ctx: Ctx, extras: EngineExtras | undefined, home: st
     tzOffsetMinutes: ms => -new Date(ms).getTimezoneOffset(),
     home,
     env: () => (extras ? extras.env() : Promise.resolve({})),
+    // `$.env.get` takes only a literal name, so a variable a Bash command
+    // names (`cd "$WT"`) is read the way the Python hook inherits it: from
+    // this process's environment, once per name per session.
+    getenv: name => {
+      let v = envCache.get(name)
+      if (!v) {
+        v = /^[A-Za-z_][A-Za-z0-9_]*$/.test(name)
+          ? io.run(['printenv', name], { timeoutMs: 2_000 })
+            .then(r => (r.exitCode === 0 ? r.stdout.replace(/\n$/, '') : undefined), () => undefined)
+          : Promise.resolve(undefined)
+        envCache.set(name, v)
+      }
+      return v
+    },
     paths: dir => {
       let p = pathsCache.get(dir)
       if (!p) {
@@ -321,17 +344,40 @@ export async function boot(
   let isLoaded = false
   if (!makeEngine) {
     await claims.failLoad()
+    ctx.setActive(ACTIVE)   // nothing asked the allowlist: the companion shows as always
     const lanes = new Lanes(io, NO_ENGINE, claims, act)
     return { io, ctx, claims, act, lanes, book: undefined, ready: Promise.resolve(), firstPrompt: async () => {}, sessionChanged: async () => {} }
   }
   const home = opts.extras ? await opts.extras.home().catch(() => '') : ''
   const engine = makeEngine(engineIoOf(io, ctx, opts.extras, home))
   const hookVersion = await versionOf(io)
-  const book = new Book(io, ctx, engine, claims, status, { hookVersion, toHook: opts.toHook })
+  // The repository allowlist's answer for the session's cwd, as `paths`
+  // gives it with the book's location: dormant in a repository repos.json
+  // leaves out, and outside any checkout while a repos.json exists — in
+  // both no book is loaded and no lane claimed. The companion reads it
+  // through ctx.active(); it is settled below whatever the load came to, so
+  // nothing waits on it forever.
+  let active: Active = ACTIVE
+  const book = new Book(io, ctx, engine, claims, status, {
+    hookVersion,
+    toHook: opts.toHook,
+    onPaths: a => { active = { enabled: a.enabled, repo: a.repo, restricted: a.restricted, declined: a.declined, identity: a.identity } },
+    // what the companion's status strip says when nothing fired and nothing waits
+    onRules: (repo, rules) => ctx.setBook({ repo, rules }),
+  })
   // The remote switch (book.ts): a false gives every lane to Python for the
   // session, and stops the book's refresh, which then serves nothing.
   const remote = new RemoteSwitch(io, ctx, claims, status, { hookVersion, onOff: () => book.stop() })
-  const lanes = new Lanes(io, engine, claims, act)
+  // A create-rule forward test's claim (mod/redirect.ts): the call goes to
+  // Python, which serves the test's private book. Read per call from the
+  // install's own base; without `extras` (the tests) no claim can be stat'd
+  // and nothing is handed off on that account.
+  const redirectIo = {
+    readText: (p: string) => io.readFile(p).catch(() => undefined),
+    stat: (p: string, resolve?: boolean) => (opts.extras ? opts.extras.stat(p, resolve) : Promise.resolve(undefined)),
+    now: () => io.now(),
+  }
+  const lanes = new Lanes(io, engine, claims, act, (cwd, agentId) => forwardTestCovers(redirectIo, book.realBase, cwd, agentId))
   // Claim late, in the background: the first prompt never waits on the book,
   // and until it is held Python serves every lane.
   const ready = (async () => {
@@ -348,6 +394,8 @@ export async function boot(
     } catch (err) {
       act.unhealthy('load', err)
       await claims.failLoad().catch(() => undefined)
+    } finally {
+      ctx.setActive(active)
     }
   })()
   return {
@@ -379,7 +427,8 @@ const NO_ENGINE: Engine = {
   session: () => Promise.reject(new Error('no engine')),
 }
 
-export function register(on: On) {
+/** The hooks module's entry (`Register`): `options` are the manifest's userConfig values, defaults filled in. */
+export function register(on: On, options: PluginOptions = {}) {
   const ctx = lateCtx()
   let shell: Shell | undefined
 
@@ -397,6 +446,15 @@ export function register(on: On) {
         // A fresh process has no `lanes` in $.state; a hot reload keeps it.
         const pastStartup = (await io.getState('lanes')).version > 0
         shell = await boot(io, real, createEngine, { cwd: e.cwd, pastStartup, extras: extrasOf($) })
+        // The companion's status strip reads the book and the allowlist off
+        // ctx once the load has settled: draw the band again then.
+        void shell.ready.then(() => {
+          try {
+            $.ui.invalidate('ui.render')
+          } catch {
+            // a band nothing draws
+          }
+        })
       }
     } catch {
       shell = undefined
@@ -465,5 +523,5 @@ export function register(on: On) {
   }).catch(($, e, next) => next(e))
 
   // ── companion: last, so innermost ─────────────────────────────────────────
-  registerCompanion(on, ctx)
+  registerCompanion(on, ctx, options)
 }

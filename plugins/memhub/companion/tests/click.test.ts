@@ -73,7 +73,9 @@ type Beneath = {
 
 async function started($: Engine, on: On, beneath: Beneath = {}) {
   const clock = mock.clock(on)
-  const store: Record<string, unknown> = { ...(beneath.store ?? {}) }
+  // `companion.enabled` true unless the test says otherwise: the person ran
+  // `/goose` once (the `companion` option is off by default; option.test.ts holds that)
+  const store: Record<string, unknown> = { 'companion.enabled': true, ...(beneath.store ?? {}) }
   on('store.get', async (_, e) => ({ value: store[e.key] }))
   on('store.set', async (_, e) => {
     store[e.key] = JSON.parse(JSON.stringify(e.value))
@@ -277,11 +279,14 @@ describe('which animal a session shows', () => {
     expect(raster!.props.columns, 'still laid out at no scale').toBe(scaled.columns)
   })
 
-  test('drawn before session.start, a companion turned off draws nothing, not an empty band', { timeoutMs: 60_000 }, async ($, on) => {
+  test('drawn before session.start, a companion turned off draws the status line, not the animal', { timeoutMs: 60_000 }, async ($, on) => {
     const x = await started($, on, { store: { 'companion.pin': 'goose', 'companion.enabled': false }, drawFirst: true })
     await x.play(1_000)
     expect(await x.band.find({ type: 'Raster', key: 'companion' }), 'the pre-start band stayed').toBeUndefined()
     expect(await x.band.find({ type: 'Button', key: 'companion-pet' }), 'a dead ♥ stayed').toBeUndefined()
+    const strip = await x.band.find({ key: 'memhub-strip' })
+    expect(strip, 'the strip stands in for the animal').toBeDefined()
+    expect(strip!.text).toMatch(/^MemHub · /)
   })
 
   test('/<animal> always pins it; /<animal> random unpins; never and include edit the pool', async ($, on) => {
