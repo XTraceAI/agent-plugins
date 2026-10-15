@@ -20,7 +20,9 @@ import { toHookRule as shapeRow, versionTuple } from './engine/rules'
  * for this build's own version so a `min_hook_version` row degrades exactly
  * as it does in the Python hook beside it. No forward-test claim here
  * (`activeBase` false): /memhub:create-rule's private-base forward test is
- * served by the Python hook, which reads the claim.
+ * served by the Python hook, which reads the claim — the lanes hand it every
+ * call the claim covers (mod/redirect.ts), since the rows dropped here are
+ * exactly the ones that test must see fire.
  */
 export const hookRuleFor = (hookVersion: string | undefined) => (row: Record<string, unknown>): HookRule | null =>
   shapeRow(row, { hookVersion: versionTuple(hookVersion ?? null), activeBase: false })
@@ -70,7 +72,12 @@ export function msOfIso(iso: string | null | undefined): number | undefined {
 }
 
 export type BookFile = { etag?: string | null; fetched_at?: string | null; rules: Record<string, unknown>[] }
-export type Paths = { book: string; repo: string; ledger?: string }
+/**
+ * What `paths` answers for a checkout. `enabled` is the repository
+ * allowlist's verdict (scripts/repo_allow.py: `~/.config/memhub-plugin/repos.json`);
+ * false means MemHub is dormant there, and the mod claims nothing.
+ */
+export type Paths = { book: string; repo: string; ledger?: string; enabled: boolean }
 
 /** The cached book, as `load_book` accepts it: a dict whose `rules` is a list. */
 export function parseBook(text: string): BookFile | undefined {
@@ -120,18 +127,58 @@ export function isSecure(url: string): boolean {
   return m[1]!.toLowerCase() === 'http' && (host === 'localhost' || host === '127.0.0.1' || host === '::1')
 }
 
-/** `rulebook_mod_cli.py paths --env <env> --cwd <dir>`: the book file, the repo and the ledger dir. */
-export async function pathsFor(io: Io, ctx: Ctx, cwd: string): Promise<Paths | undefined> {
+/**
+ * What `paths` answers for a session's cwd, whole: the book to serve (none
+ * outside a checkout, or with no book), the repo's name ('' outside any
+ * checkout), and the allowlist's verdict — which stands even where there is
+ * no repo: a session in a folder that is no repository is dormant when a
+ * repos.json exists (repo_allow.session_enabled), and the companion says so.
+ * With it, what the companion's enable ask (ENG-1253) reads: `restricted`
+ * (a repos.json exists), `declined` (the person answered No here before) and
+ * `identity` (the checkout as repos.json names it, `org/name`; '' unknown).
+ */
+export type PathsAnswer = {
+  paths: Paths | undefined
+  repo: string
+  enabled: boolean
+  restricted: boolean
+  declined: boolean
+  identity: string
+  /**
+   * The install's own rulebook base (`real_base`), where a create-rule
+   * forward test leaves its claim file (mod/redirect.ts). `base` itself may
+   * already be that test's private copy when the claim covers the cwd.
+   * Undefined from an older CLI.
+   */
+  realBase?: string
+}
+
+/** `rulebook_mod_cli.py paths --env <env> --cwd <dir>`, as the CLI answers it. */
+export async function askPaths(io: Io, ctx: Ctx, cwd: string): Promise<PathsAnswer> {
   const r = await io.run(['python3', `${ctx.root}/${MOD_CLI}`, 'paths', '--env', ctx.env, '--cwd', cwd], { timeoutMs: 10_000 })
   if (r.exitCode !== 0) throw new Error(`paths exited ${r.exitCode}: ${r.stderr.slice(0, 200)}`)
   const got = lastJson(r.stdout) as Record<string, unknown> | undefined
   if (!got || typeof got !== 'object') throw new Error('paths printed no JSON')
   const book = got.book ?? got.book_path
-  const repo = got.repo
+  const repo = typeof got.repo === 'string' ? got.repo : ''
   const ledger = got.ledger ?? got.ledger_dir
+  // An older CLI answers no `enabled`: active, as everything was before the list existed.
+  const enabled = got.enabled !== false
+  // …and no `restricted`, `declined` or `identity`: nothing to ask about, then.
+  const rest = {
+    restricted: got.restricted === true,
+    declined: got.declined === true,
+    identity: typeof got.identity === 'string' ? got.identity : '',
+    realBase: typeof got.real_base === 'string' && got.real_base ? got.real_base : undefined,
+  }
   // No repo (not a git checkout, or no remote): no book to serve, nothing to claim.
-  if (typeof repo !== 'string' || !repo || typeof book !== 'string' || !book) return undefined
-  return { book, repo, ledger: typeof ledger === 'string' ? ledger : undefined }
+  if (!repo || typeof book !== 'string' || !book) return { paths: undefined, repo, enabled, ...rest }
+  return { paths: { book, repo, ledger: typeof ledger === 'string' ? ledger : undefined, enabled }, repo, enabled, ...rest }
+}
+
+/** `askPaths`' book, or undefined where there is none to serve. */
+export async function pathsFor(io: Io, ctx: Ctx, cwd: string): Promise<Paths | undefined> {
+  return (await askPaths(io, ctx, cwd)).paths
 }
 
 export type RefreshOutcome = 'updated' | 'unchanged' | 'upgrade' | 'skipped' | 'failed'
@@ -139,6 +186,8 @@ export type RefreshOutcome = 'updated' | 'unchanged' | 'upgrade' | 'skipped' | '
 export class Book {
   repo: string | undefined
   path: string | undefined
+  /** The install's own base (PathsAnswer.realBase), once `paths` answered. */
+  realBase: string | undefined
   private etag: string | undefined
   private timer: { cancel(): void } | undefined
   private inFlight = false
@@ -153,19 +202,33 @@ export class Book {
     private engine: Engine,
     private claims: Claims,
     private status: StatusLine,
-    private opts: { hookVersion?: string; toHook?: (row: Record<string, unknown>) => HookRule | null } = {},
+    private opts: {
+      hookVersion?: string
+      toHook?: (row: Record<string, unknown>) => HookRule | null
+      /** Told what `paths` answered for the session's cwd, once, before anything is loaded. */
+      onPaths?: (answer: PathsAnswer) => void
+      /** Told the repository and rule count each time rows are handed to the engine. */
+      onRules?: (repo: string, count: number) => void
+    } = {},
   ) {}
 
   /**
    * At session.start: find the book, read it, hand it to the engine. A
    * missing cache is fetched once, here. Resolves true once the engine holds
    * a book (then the lanes may be claimed), false when there is none to hold
-   * (signed out with no cache, no repo): Python then serves, with no book
-   * either. Rejects on a real failure (the caller releases every lane).
+   * (signed out with no cache, no repo, or a repo the machine's allowlist
+   * leaves out): Python then serves, with no book either — and in the
+   * allowlist case stays silent too, reading the same file. Rejects on a
+   * real failure (the caller releases every lane).
    */
   async load(cwd: string): Promise<boolean> {
-    const paths = await pathsFor(this.io, this.ctx, cwd)
+    const answer = await askPaths(this.io, this.ctx, cwd)
+    this.realBase = answer.realBase
+    this.opts.onPaths?.(answer)
+    const paths = answer.paths
     if (!paths) return false
+    // Dormant here (repo_allow.py): nothing to serve, nothing to claim, no refresh.
+    if (!paths.enabled) return false
     this.repo = paths.repo
     this.path = paths.book
     // A recorded upgrade notice suspends the cached rules (rulebook_hook
@@ -251,6 +314,7 @@ export class Book {
   private async hand(rows: readonly unknown[]): Promise<void> {
     const rules = shapeRules(rows, this.opts.toHook ?? hookRuleFor(this.opts.hookVersion))
     this.engine.setBook(rules, { repo: this.repo!, fetchedAt: await this.io.now() })
+    this.opts.onRules?.(this.repo!, rules.length)
   }
 
   /**

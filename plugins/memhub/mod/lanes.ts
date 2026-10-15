@@ -14,6 +14,12 @@
 //   session     the posture preamble as an isMeta user row
 //               (`$.session.append`, spec §4.5), once per session id.
 //
+// A call in a checkout of ANOTHER repo than the mod's book (engine.ts
+// ForeignRepoError: an edit there, or `cd ~/other && …`) is not a failure:
+// both halves of it go to Python, which loads that repo's book — the pre and
+// post lanes leave the claim around `next` and come back after it, and no
+// failure is counted, so a session that works across repos keeps its claim.
+//
 // Failure: a lane that throws gives the call to Python. The pre and prompt
 // lanes leave the claim before their `next`, so the Python hook beneath serves
 // that very call; the post lane has run past Python's PostToolUse by then (a
@@ -28,6 +34,7 @@ import type { Act } from './act'
 import type { Claims } from './claims'
 import type { Io } from './ctx'
 import type { CallEvent, Engine, Verdict } from './engine'
+import { ForeignRepoError } from './engine/engine'
 
 export const TOOLS = ['Bash', 'Edit', 'MultiEdit', 'Write', 'NotebookEdit', 'Read'] as const
 /**
@@ -64,19 +71,40 @@ const RESULT_KEYS = ['stderr', 'stdout', 'output', 'error', 'text'] as const
  * `tool_response.stdout`) still holds the first ~30,000 characters. A rule
  * matching past the preview fired in Python and not here.
  *
- * Falls back to `r.text` for every other tool, for a record that is not an
- * object (an error result is the error string), and for a record with no
- * non-empty field: Python would match `json.dumps(tool_response)` there,
- * which the mod does not reproduce (engine.ts, port notes).
+ * A FAILED Bash call's record is the error string itself (`Error: Exit code
+ * 1\n<stderr>`): it stands in for a missing `text`, and either is shaped as rulebook_hook.py `failure_result`
+ * shapes the PostToolUseFailure `error` — the `Exit code N` line moved last,
+ * so a content rule reads the program's own words first (ENG-1236). The
+ * Python failure lane is claim-skipped while this mod serves `post`, so this
+ * is the only engine that sees the failure.
+ *
+ * Falls back to `r.text` for every other tool, for a record that is neither
+ * an object nor a string, and for a record with no non-empty field: Python
+ * would match `json.dumps(tool_response)` there, which the mod does not
+ * reproduce (engine.ts, port notes).
  */
-export function postResultText(tool: string, r: { text?: string; result?: unknown }): string | undefined {
+export function postResultText(tool: string, r: { text?: string; result?: unknown; isError?: boolean }): string | undefined {
   if (tool !== 'Bash') return r.text
   const rec = r.result
-  if (rec === null || typeof rec !== 'object' || Array.isArray(rec)) return r.text
+  if (rec === null || typeof rec !== 'object' || Array.isArray(rec)) {
+    const text = r.text || (typeof rec === 'string' ? rec : undefined)
+    return text && r.isError ? failureText(text) : text
+  }
   const parts = RESULT_KEYS
     .map(k => (rec as Record<string, unknown>)[k])
     .filter((v): v is string => typeof v === 'string' && v !== '')
   return parts.length ? parts.join('\n') : r.text
+}
+
+const EXIT_LINE = /^\s*(?:Error: )?Exit code (\d+)[ \t]*\n?/
+
+/** `Error: Exit code 1\nboom` → `boom\nExit code 1`: the program's words first,
+ *  the exit line last, as rulebook_hook.py `failure_result` shapes it. */
+export function failureText(text: string): string {
+  const m = EXIT_LINE.exec(text)
+  if (!m) return text
+  const body = text.slice(m[0].length)
+  return body ? `${body.replace(/\n$/, '')}\nExit code ${m[1]}` : `Exit code ${m[1]}`
 }
 
 /** The tools whose rules scope by path, and the input fields the engine
@@ -95,6 +123,12 @@ export class Lanes {
     private engine: Engine,
     private claims: Claims,
     private act: Act,
+    /**
+     * A create-rule forward-test claim covers this call (mod/redirect.ts):
+     * hand it to the Python hook, which serves the test's private book. The
+     * shell wires it; a fake without it never hands off on that account.
+     */
+    private forwardTest?: (cwd: string, agentId: string | undefined) => Promise<boolean>,
   ) {}
 
   // ── tool.call ───────────────────────────────────────────────────────────
@@ -139,14 +173,29 @@ export class Lanes {
 
     let pre: Verdict | undefined
     let handed: R | undefined
+    let foreign = false
     if (this.claims.has('pre')) {
       try {
+        // A forward test's call (ENG-1250): the candidate it must prove lives
+        // only in the test's private book, which the mod never serves
+        // (book.ts `hookRuleFor`). Out of the claim for pre AND post, as for a
+        // foreign repo, so Python reads the claim and judges it on that book.
+        if (this.forwardTest && (await this.forwardTest(cwd, agentId).catch(() => false))) {
+          throw new ForeignRepoError(`a forward-test claim over ${cwd}`, "the test's private book, which Python serves")
+        }
         pre = await this.engine.pre({ ...base, phase: 'pre' })
         this.act.healthy('pre')
       } catch (err) {
-        // Python's hook serves this call's pre at `next`; the post lane below
-        // still runs here, as it would have without the failure.
-        handed = await this.handOff('pre', err, () => next(e))
+        if (err instanceof ForeignRepoError) {
+          // Another repo's call: Python's hooks serve its pre AND post with
+          // that repo's book, and the mod's post lane below stays out.
+          foreign = true
+          handed = await this.handForeign(() => next(e))
+        } else {
+          // Python's hook serves this call's pre at `next`; the post lane below
+          // still runs here, as it would have without the failure.
+          handed = await this.handOff('pre', err, () => next(e))
+        }
       }
       if (pre) {
         await this.act.record(pre, sessionId)
@@ -158,7 +207,7 @@ export class Lanes {
     if (r.deny !== undefined) return r
 
     let post: Verdict | undefined
-    if (this.claims.has('post')) {
+    if (this.claims.has('post') && !foreign) {
       try {
         post = await this.engine.post({ ...base, phase: 'post', result: { text: postResultText(tool, r), isError: r.isError } })
         this.act.healthy('post')
@@ -244,6 +293,16 @@ export class Lanes {
       this.act.unhealthy('session', err)
       await this.claims.fail('session')
       await this.claims.recover('session')
+    }
+  }
+
+  /** A foreign-repo call: pre and post out of the claim around `next`, no failure counted. */
+  private async handForeign<T>(next: () => Promise<T>): Promise<T> {
+    const lanes = await this.claims.yieldCall(['pre', 'post']).catch(() => [] as LaneName[])
+    try {
+      return await next()
+    } finally {
+      for (const l of lanes) await this.claims.recover(l).catch(() => undefined)
     }
   }
 

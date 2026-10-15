@@ -44,6 +44,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+import _tls  # noqa: E402 — stdlib-only, sits beside this file
 from plugin_version import request_headers, upgrade_message
 
 # The version this client was written and verified against. Sent so the server
@@ -274,10 +275,15 @@ _OPENER = None
 
 
 def _opener():
-    """A module-wide opener that never redirects. Built once, lazily."""
+    """A module-wide opener that never redirects. Built once, lazily.
+
+    Built by ``_tls.Opener``, so a Python whose own trust store is empty (a
+    python.org macOS build before "Install Certificates.command") still
+    verifies — against the roots the machine already trusts — instead of
+    failing every call with CERTIFICATE_VERIFY_FAILED."""
     global _OPENER
     if _OPENER is None:
-        _OPENER = urllib.request.build_opener(_NoRedirects)
+        _OPENER = _tls.Opener(_NoRedirects)
     return _OPENER
 
 

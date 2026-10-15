@@ -10,6 +10,13 @@ semantic work boundaries, so flushing there makes memory available mid-session
 (parallel sessions see fresh decisions), shapes batch episodes into work-unit
 narratives, and gives the gist's fold-forward an outcome-flavored cadence.
 
+**Then the session's agents.** Once every slice of the session landed, each
+subagent, fork and background agent it spawned (``<session>/subagents/``) is
+sent as its own conversation linked to the session — except the MemHub
+harness fork and anything under it (``agent_transcripts``). Only to a server
+whose ``import_conversation`` takes agent arguments; an older one would file
+each agent as a session of its own.
+
 **Also the SessionEnd hook.** It must stay a script rather than an
 ``agent``-type hook: headless ``claude -p`` runs reject agent-type Stop
 hooks outright (``Agent stop hooks are not yet supported outside REPL``),
@@ -50,6 +57,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import agent_transcripts  # noqa: E402
 import atomic_write  # noqa: E402
 import mcp_http  # noqa: E402 — stdlib-only now, so no reason to defer it
 import pr_provenance  # noqa: E402
@@ -174,8 +182,7 @@ def _deadline_s() -> float:
     return value if value > 0 else _DEFAULT_DEADLINE_S
 
 
-async def _flush(session_id: str, transcript_path: str) -> None:
-
+def _read_records(transcript_path) -> list:
     # Tolerant parse, NOT json.loads-or-die: this hook reads the transcript
     # while Claude Code is still appending to it, so a truncated final line
     # is the EXPECTED case here, not corruption. One partial line must not
@@ -200,10 +207,13 @@ async def _flush(session_id: str, transcript_path: str) -> None:
                 malformed += 1
     if malformed:
         _log(f"skipped {malformed} partial/malformed line(s) (mid-write read)")
-    if not records:
-        _log("empty transcript; nothing to flush")
-        return
+    return records
 
+
+def _prepare(records: list) -> tuple[list, dict | None]:
+    """The records as they may leave the machine, plus their PR provenance.
+    Shared by the session and its agents, so an agent cannot come out less
+    filtered or less redacted than the session that spawned it."""
     pr_urls, missing_pr_urls = pr_provenance.scan_tool_results(records)
     if missing_pr_urls:
         _log(f"{missing_pr_urls} direct gh pr create result(s) had no "
@@ -219,8 +229,7 @@ async def _flush(session_id: str, transcript_path: str) -> None:
         _log(f"dropped {len(records) - len(kept)} slash-command record(s)")
     records = kept
     if not records:
-        _log("transcript holds only slash-command records; nothing to flush")
-        return
+        return [], provenance
 
     # A tool result too large for any request the server accepts would
     # otherwise ride alone in its own slice and fail the whole backstop.
@@ -229,7 +238,18 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # Same reasoning as the filter above: a session must not come out with
     # credentials in it depending on which path captured it. Every upload path
     # redacts, or none of them can be relied on.
-    records = redact_records(records)
+    return redact_records(records), provenance
+
+
+async def _flush(session_id: str, transcript_path: str) -> None:
+    records = _read_records(transcript_path)
+    if not records:
+        _log("empty transcript; nothing to flush")
+        return
+    records, provenance = _prepare(records)
+    if not records:
+        _log("transcript holds only slash-command records; nothing to flush")
+        return
 
     # The name the transcript carries — the user's rename first, then the one
     # Claude Code generated, then the session's first prompt for a headless run
@@ -305,8 +325,6 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # failing on the biggest sessions is failing where it matters most.
     # Slices are disjoint and sent in order against one conversation,
     # so the server's watermark sees a normal incremental import.
-    payloads = make_slices(records)
-
     # Bounded by wall clock, not just by slice count. The hook's own
     # budget is 300s; a many-slice session can exceed it, and being
     # KILLED there is the bad ending — the process dies mid-upload,
@@ -318,17 +336,34 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # merely slow stops here — where it can name what it did not send
     # — instead of being cancelled where it cannot.
     deadline = time.monotonic() + _deadline_s() * 0.9
+    if not await _send_conversation(session, session_id, records, provenance,
+                                    {"conversation_id": session_id},
+                                    title, namespace, deadline):
+        return
+    # Agents only after the whole session landed: an agent sent first would
+    # sit unlinked, and a session that failed part-way stops this run anyway.
+    await _flush_agents(session, url, bearer, session_id, transcript_path,
+                        namespace, deadline)
+
+
+async def _send_conversation(session, session_id: str, records: list,
+                             provenance: dict | None, base: dict,
+                             title, namespace, deadline: float) -> bool:
+    """Send one conversation's records in ordered slices. True when every
+    slice landed; False when it stopped (already logged and breadcrumbed)."""
+    payloads = make_slices(records)
     for index, payload in enumerate(payloads, 1):
         if _stop_before_slice(index, time.monotonic(), deadline):
             remaining = sum(len(p) for p in payloads[index - 1:])
             _log(f"deadline reached after {index - 1}/{len(payloads)} "
-                 f"slices; {remaining} record(s) not sent. Re-run "
-                 f"{skill_command('import-session')} --session {session_id} to "
-                 "finish (it resumes from the server's watermark).")
-            return
+                 f"slices of {base['conversation_id']}; {remaining} record(s) "
+                 f"not sent. Re-run {skill_command('import-session')} --session "
+                 f"{session_id} to finish (it resumes from the server's "
+                 "watermark).")
+            return False
         arguments = {
+            **base,
             "messages": payload,
-            "conversation_id": session_id,
             "source_platform": "claude",
         }
         if provenance:
@@ -346,7 +381,72 @@ async def _flush(session_id: str, transcript_path: str) -> None:
                          budget=max(_MIN_SLICE_BUDGET_S,
                                     deadline - time.monotonic()))
         if not ok:
+            return False
+    return True
+
+
+def _agents_state_path(session_id: str) -> Path:
+    return _SESSION_STATE_DIR / f"{session_id}.agents"
+
+
+def _sent_sizes(session_id: str) -> dict:
+    try:
+        data = json.loads(_agents_state_path(session_id).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+async def _flush_agents(session, url: str, bearer: str, session_id: str,
+                        transcript_path: str, namespace, deadline: float) -> None:
+    """Send each agent the session spawned as its own conversation, linked to
+    the session (MemHub-Backend agent-sessions spec §4.1). Never the MemHub
+    harness fork — see agent_transcripts.
+
+    An agent whose transcript has not grown since it last landed whole is not
+    re-sent. Its size is recorded only after every slice of it landed, so a
+    failed or cut-short agent is sent again by the next flush."""
+    kept, skipped = agent_transcripts.agents(session_id, transcript_path)
+    for line in skipped:
+        _log(f"agent {line}; not sent")
+    sent = _sent_sizes(session_id)
+    todo = [a for a in kept if sent.get(a["agent_id"]) != a["size"]]
+    if not todo:
+        return
+    try:
+        tools = await asyncio.to_thread(mcp_http.list_tools, url, bearer)
+    except Exception as e:  # noqa: BLE001 — the session already landed
+        _log(f"agents not sent: could not read the server's tools ({e})")
+        return
+    if not agent_transcripts.server_accepts_agents(tools):
+        _log(f"agents not sent: this server predates agent capture "
+             f"({len(todo)} waiting)")
+        return
+    for agent in todo:
+        if deadline - time.monotonic() < _MIN_SLICE_BUDGET_S:
+            _log(f"deadline reached; {len(todo) - todo.index(agent)} agent(s) "
+                 "not sent — the next flush sends them")
             return
+        records = _read_records(agent["path"])
+        records, provenance = _prepare(records) if records else ([], None)
+        if records and not await _send_conversation(
+                session, session_id, records, provenance,
+                agent_transcripts.import_arguments(session_id, agent),
+                None, namespace, deadline):
+            return
+        _log(f"agent {agent['agent_id']} sent, linked to session {session_id[:8]}")
+        sent[agent["agent_id"]] = agent["size"]
+        try:
+            atomic_write.publish(_agents_state_path(session_id), json.dumps(sent))
+        except Exception:  # noqa: BLE001 — worst case the agent is re-sent
+            pass
+
+
+def _crumb_key(arguments: dict):
+    """The session a slice's outcome is recorded against. An agent's is its
+    session's: `capture_health` reads one file per session, and an agent id
+    (`<session>/agent-<id>`) is not a file name."""
+    return arguments.get("parent_conversation_id") or arguments.get("conversation_id")
 
 
 async def _send(session, arguments, title, namespace,
@@ -383,25 +483,25 @@ async def _send(session, arguments, title, namespace,
                                            arguments=args, timeout=timeout)
         except mcp_http.PluginUpgradeRequired as e:
             _log(str(e))
-            _breadcrumb(args.get("conversation_id"), "upgrade_required", str(e))
+            _breadcrumb(_crumb_key(args), "upgrade_required", str(e))
         except mcp_http.McpRateLimited as e:
             wait = f" (retry-after {e.retry_after:.0f}s)" if e.retry_after else ""
             _log(f"{label}rate limited{wait}; slices already sent are stored")
-            _breadcrumb(args.get("conversation_id"), "rate_limited", str(e))
+            _breadcrumb(_crumb_key(args), "rate_limited", str(e))
         except mcp_http.McpNoResponse as e:
             _log(f"{label}no response frame: {e}")
-            _breadcrumb(args.get("conversation_id"), "unrecognized_response", str(e))
+            _breadcrumb(_crumb_key(args), "unrecognized_response", str(e))
         except mcp_http.McpError as e:
             if e.status == 401:
                 _log(f"{label}credential rejected (401); run {skill_command('login')}")
-                _breadcrumb(args.get("conversation_id"), "auth", str(e))
+                _breadcrumb(_crumb_key(args), "auth", str(e))
             elif e.status == 403:
                 _log(f"{label}credential lacks permission (403); check its "
                      "scopes and org access")
-                _breadcrumb(args.get("conversation_id"), "forbidden", str(e))
+                _breadcrumb(_crumb_key(args), "forbidden", str(e))
             else:
                 _log(f"{label}transport error: {e}")
-                _breadcrumb(args.get("conversation_id"), "error", str(e))
+                _breadcrumb(_crumb_key(args), "error", str(e))
         return None
 
     def _texts(result) -> list[str]:
@@ -423,7 +523,7 @@ async def _send(session, arguments, title, namespace,
         # silent made the backstop's MOST LIKELY server-side failure — a slice
         # the server rejects — the one it reported least, which is the same
         # asymmetry the transport paths were fixed for one round earlier.
-        _breadcrumb(arguments.get("conversation_id"),
+        _breadcrumb(_crumb_key(arguments),
                     "compute_budget_exhausted" if mcp_http.is_compute_budget_rejection(res)
                     else "server_rejected", detail)
         return False
@@ -447,7 +547,7 @@ async def _send(session, arguments, title, namespace,
         # throttled slice would keep warning for a day even though the backstop
         # went on to work — the same crying-wolf the per-turn hook clears with
         # `_mark_success`.
-        _breadcrumb(arguments.get("conversation_id"), "", ok=True)
+        _breadcrumb(_crumb_key(arguments), "", ok=True)
         return True
     # Not an error per the protocol, but not the shape import_conversation
     # returns either — log what came back instead of claiming success on an
@@ -456,7 +556,7 @@ async def _send(session, arguments, title, namespace,
     _log(f"{label}flush response unrecognized: {detail!r}")
     # The last silent exit on this path. Every way `_send` can return False now
     # leaves a trace — the guarantee is only worth something if it has no holes.
-    _breadcrumb(arguments.get("conversation_id"), "unrecognized_response", detail)
+    _breadcrumb(_crumb_key(arguments), "unrecognized_response", detail)
     return False
 
 

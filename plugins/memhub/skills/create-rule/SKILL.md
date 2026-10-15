@@ -1,5 +1,5 @@
 ---
-description: Use when the user wants to create a team engineering rule for the Rulebook (e.g. "/memhub:create-rule", "add a rule that we never force-push", "make a rule for this mistake", "make it actually stop me"). Pins a when-X-then-Y sentence, drafts a deterministic check, and files it for review through the memhub `create_rule` tool — a rule that advises and a rule that stops the command are filed the same way, and a reviewer turns either one on.
+description: Use when the user wants to create an engineering rule for the Rulebook (e.g. "/memhub:create-rule", "add a rule that we never force-push", "make a rule for this mistake", "make it actually stop me"). Pins a when-X-then-Y sentence, drafts a deterministic check, and files it for review through the memhub `create_rule` tool — a rule that advises and a rule that stops the command are filed the same way, and a reviewer turns either one on.
 argument-hint: '[--scope org|personal|workspace] [--workspace "<name>"] [the rule, in your own words]'
 allowed-tools: 'Bash(python3 "${CLAUDE_PLUGIN_ROOT}/skills/start-rulebook/scripts/mine_sessions.py" *), Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_verify.py" *), Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_hook.py" book-path *), Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_paths.py"), Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_conflicts.py" *), Bash(git remote get-url origin), Write(//tmp/*.json), Edit(//tmp/*.json), Edit(//tmp/*/pretest-base/**), Edit(//var/folders/**/pretest-base/**), Read, Task, Agent, AskUserQuestion, mcp__plugin_memhub_memhub__list_rules, mcp__plugin_memhub_memhub__create_rule, mcp__plugin_memhub_memhub__list_rulebooks, mcp__plugin_memhub-staging_memhub__list_rules, mcp__plugin_memhub-staging_memhub__create_rule, mcp__plugin_memhub-staging_memhub__list_rulebooks'
 ---
@@ -36,27 +36,32 @@ Every rule goes into one **scope**, and the scope is who it applies to:
 
 | `scope` | applies to |
 |---|---|
-| `org` (**the default**) | everyone in the organisation |
-| `personal` | just the user |
+| `personal` (**the default**) | just the user |
+| `org` | everyone in the organisation — **only with a strong reason** |
 | `workspace` | the people in one workspace — **only when the user asks for it** |
 
 Call `list_rulebooks` and read its `scopes` block (`org` / `personal` with
-`label` and `applies_to`, `supports_workspaces`, `workspaces[]`); do not
-enumerate books. Then, in order:
+`label` and `applies_to`, `supports_workspaces`, `workspaces[]`). Then:
 
 1. `--scope` given → use it (`--workspace` names the workspace).
-2. The user's own words say "just me", "only me", "for myself" or
-   "personal" → `personal`.
-3. The user names a workspace or teamspace that matches a
+2. The user names a workspace or teamspace that matches a
    `scopes.workspaces[].name` (case-insensitive) and `supports_workspaces` is
    true → `workspace`, with that `workspace_id`.
-4. **Otherwise use `org`.** Do not ask, and never offer the workspace scope
-   unprompted.
+3. The user's words say "just me", "only me" or "personal" → `personal`,
+   never escalated. Words that put it on everyone — "the team", "everyone",
+   "org-wide" (not a passing "we never…") → `org`.
+4. **Otherwise use `personal`** — unless you can write, in one sentence, why
+   the rule is right for **anyone** working in this repo or this org, not just
+   this user: it guards something shared (a protected branch, a deploy, a
+   shared database, CI) or a repo fact that bites every contributor. Then
+   `org` — never for a good idea others might like, or the user's own
+   machine, tools, habits or taste. Do not ask, and never offer the workspace scope unprompted.
 
 A named workspace that is not listed, or no `supports_workspaces`, is said
-once and the rule goes to `org`. No `scopes` block (an older server) → file
+once and step 0 goes on from 3. No `scopes` block (an older server) → file
 without `scope`. Show the chosen scope's `label` and `applies_to` in the
-step-5 preview, so the user can change it.
+step-5 preview — for an `org` the user did not ask for, with that one
+sentence — so the user can change it.
 
 ## The flow — every step is mandatory
 
@@ -95,8 +100,8 @@ nothing in one that the other lacks.**
     restated; the pattern already matched, so it tells the judge nothing.
 - **`when_not` only for exclusions the person or the evidence actually
   named** — "except on my own branch", a step-1b sample that was plainly
-  innocent. Otherwise omit it: it is usually empty when a rule is filed, and
-  it is where confirmed misfires get written later. Each entry is a situation
+  innocent. Otherwise omit it: it is where confirmed misfires get written
+  later. Each entry is a situation
   too, never a pattern: the example's statement names one exemption, so it
   gets *"The agent is updating its own feature branch after a rebase."* —
   not *"not when the branch starts with feat/"*.
@@ -108,28 +113,26 @@ nothing in one that the other lacks.**
 
 ### 1b. Evidence: how often would it have applied?
 
-A rule is worth the team's attention in proportion to how often the
-situation actually occurs. Once step 3 has a matcher, write the candidate
-`create_rule` body to `/tmp/cand.json` (step 4 shows it) and replay it over
-the local transcripts (Claude Code, Codex, Cursor) — about a minute:
+A rule earns the team's attention in proportion to how often its situation
+occurs. Once step 3 has a matcher, write the candidate `create_rule` body to
+`/tmp/cand.json` (step 4 shows it) and replay it over the local transcripts:
 
 ```bash
 python3 "${CLAUDE_PLUGIN_ROOT}/skills/start-rulebook/scripts/mine_sessions.py" \
   --rule-file /tmp/cand.json --out /tmp/mine
 ```
 
-It prints the whole start-rulebook report; find your title under PROPOSED
-RULES and read its `evidence:` line — `applies-in N/M sessions` (by host) and
+Find your title under PROPOSED RULES in its report and read the `evidence:`
+line — `applies-in N/M sessions` (by host) and
 one sample (more in `/tmp/mine/proposals.json`). For a "do X before Y" rule
 add `"requires_prior_rx": "<X>"` to the body — the line then shows
 `precision = fired-with-no-prior-X / fired`; below ~50 % the matcher would nag
 people who already complied, so use the `ordering` shape (step 3) or make it
 `session_context`. The row's `rule_evidence` is step 5's `evidence` (Read
 `${CLAUDE_PLUGIN_ROOT}/skills/create-rule/references/labels.md`). If N is 0 across
-all hosts, say so to the user before filing — it may still be right
-(insurance for a new teammate) but it is not lift. The example scores
+all hosts, say so before filing — insurance, not lift. The example scores
 `applies-in 0/855`: insurance; the rule it replaces scores 66/855, nagging
-force-pushes to people's own branches. For many rules from sessions, use
+people's own force-pushes. For many rules from sessions, use
 `/memhub:start-rulebook`.
 
 ### 2. Duplicate check — by eye now, deterministically in step 5
@@ -137,30 +140,26 @@ force-pushes to people's own branches. For many rules from sessions, use
 Call the memhub `list_rules` tool with **no `rulebook_id`** and
 **`include_retired=True, limit=200`** so the reply spans every rulebook the
 user can see in every state, and read the new rule against every title and
-statement. Same subject → plan to replace the existing rule
-instead of adding a twin: note its `rule_id` for `supersedes_rule_id` in step 5.
-The server never picks what a rule replaces by title — you decide, with
-`supersedes_rule_id`. It does refuse a rule whose title or trigger equals a
-live rule's in the same book (step 5), and it answers an identical retry
-`unchanged`. With a `source_ref`, the re-import key is (book, `source`,
-`source_ref` minus its `@<sha>` and `#…`, normalised title): re-filing under
-the same document and title supersedes that rule (or answers `unchanged`), so
-a `source_ref` is not free text to vary between attempts. Keep the
-`list_rules` reply: step 5 runs the deterministic check over it.
+statement. Same subject → replace the existing rule instead of adding a twin:
+note its `rule_id` for `supersedes_rule_id` in step 5.
+The server never picks what a rule replaces; it refuses a same-book twin
+title or trigger (step 5). With a `source_ref`, the re-import key is (book,
+`source`, `source_ref` minus `@<sha>`/`#…`, normalised title): re-filing under
+it supersedes that rule or answers `unchanged`, so `source_ref` is not free
+text to vary. Keep the reply: step 5 checks it deterministically.
 
 `include_retired=True` matters: a rule someone already dismissed is exactly the
 twin you must not re-file, the default view hides retired rules, and step 5's
 script skips them too — this read is the only check that sees them. `limit` is
-200 at most — if the reply says `has_more`, ask again with `offset` and
-concatenate `rules` before running the check, or the comparison silently misses
-whatever fell off the first page.
+200 at most; on `has_more`, ask again with `offset` and concatenate `rules`
+first, or the comparison silently misses whatever fell off the first page.
 
 ### 3. Draft the rule — one delivery, one engine block
 
 | the rule is… | `delivery` | engine block |
 |---|---|---|
 | a Bash command with a checkable form | `agent_hook` | `matcher: {event: "bash", command_rx, command_not_rx?, warn_once_per}` |
-| an edit/write to certain paths or content — by the Edit/Write tools OR by a Bash command that wrote the file (heredoc, `write_text()`, `sed -i`; that one is seen only after the write, so it can advise but never gate) | `agent_hook` | `matcher: {event: "edit", path_rx, path_not_rx?, content_rx?, content_not_rx?}` — `content_not_rx` exempts the complied-with form |
+| an edit/write to certain paths or content — by the Edit/Write tools OR by a Bash command that writes it (heredoc, `write_text()`, `sed -i`; one the command shows can gate, others only advise) | `agent_hook` | `matcher: {event: "edit", path_rx, path_not_rx?, content_rx?, content_not_rx?}` — `content_not_rx` exempts the complied-with form |
 | a failing or noteworthy tool output | `agent_hook` | `matcher: {event: "output", content_rx, command_rx?, content_not_rx?}` |
 | a file about to be read into the agent's context — the Read tool, OR a `cat`/`head`/`tail`/`less`/`more`/`sed` on a path in a Bash command (not piped, not redirected; `cd`-relative paths resolve) | `agent_hook` | `matcher: {event: "read", path_rx?, path_not_rx?, command_not_rx?, given: {file: {lines_gt}, agent: {main}}}` — needs `path_rx` or `given.file`, or it fires on every file |
 | "run X after edits, before Y" | `agent_hook` | `ordering: {required_command_rx, gated_command_rx, armed_by_events, path_rx?, min_edits, display_name}` — `path_rx` limits which edits arm it |
@@ -183,14 +182,12 @@ Plus on every rule:
   to the agent, no effect on the pattern.
 - `categories` — zero or more; see labels.md (step 1b).
 
-**A rule that needs a newer hook.** The server sets `min_hook_version` for
-you where the rule's shape implies one (0.54.0 for a session- or prompt-armed
-ordering, 0.88.0 for a pattern over 400 characters, 0.99.0 for a prompt
-matcher) and refuses an explicit value below that floor. Pass it yourself only
-for another newer key. Where the installed hook is older it runs the rule as
-ADVICE, never as a gate, and says so once per session — instead of ignoring the
-condition and firing as if it held. A key the hook does not know degrades the
-same way.
+**A rule that needs a newer hook.** The server sets `min_hook_version` where
+the shape implies one (0.54.0 for a session- or prompt-armed ordering, 0.88.0
+for a pattern over 400 characters, 0.99.0 for a prompt matcher) and refuses a
+lower value; pass it only for another newer key. An older hook runs the rule
+(or a key it does not know) as ADVICE, never a gate, and says so once per
+session.
 
 **Advise, or stop the command?** A rule advises by default. `mode: "gate"`
 denies the matching call — only when the user's own words ask for a block
@@ -202,39 +199,41 @@ file size, main agent vs subagent), Read
 **Also say what the rule PREVENTS.** `predicts_rx` (a `matcher` key) is a
 pattern over tool output naming the failure the rule exists to stop — the
 example's `\(forced update\)`, a traceback, a 409. It lets a fire be scored as
-a catch instead of a nag; write it now, while the war story is in front of you.
-Skip it when the violation prints nothing.
+a catch, not a nag; write it now, while the war story is fresh; skip it when
+the violation prints nothing.
 
 **Matcher-authoring rules:**
-- Bash rules match the **pre-heredoc segment only** by default — heredoc bodies
-  are data (python source, commit messages) and are the main false-fire class.
-  For a rule about what a heredoc SAYS, add `body_rx`: `command_rx` then names
-  the shell form (`python3 - <<`) and `body_rx` must match the body.
+- **A heredoc body is not the command.** Bash rules match the shell text before
+  any heredoc; the body (python, SQL, a commit message) is data and the
+  main false-fire class. So ask of EVERY Bash rule: *could the agent do this
+  from inside `python - <<EOF`, `psql <<SQL` or a scratch script instead of the
+  named command?* If yes, file that form as its OWN rule: `command_rx` names
+  the interpreter shape (`\b(?:python[\d.]*|psql)\b[^|;&\n]*<<`), `body_rx`
+  the action at a line start behind an optional `await …execute(` prefix,
+  never `print(`, so a body that only *prints* SQL stays silent. With `body_rx` set the body
+  MUST match, so a command with no heredoc never fires that rule; `python -c
+  '…'` text is shell text `command_rx` sees.
 - Patterns must be **shape-specific**: match the violating *form*, never a
   keyword that also appears in innocent content. The example matches `git
-  push`, then (by lookahead) `-f`/`--force` in the same command, then a
-  protected branch as the target — so a force-push to a feature branch and a
-  plain push to staging both stay silent.
+  push`, a lookahead for `-f`/`--force`, then a protected target — so a
+  force-push to a feature branch and a plain push to staging stay silent.
 - Every known-legitimate exemption goes in `command_not_rx` now, not after it
   fires. Exempt the trigger **inside a quoted span** (`grep "git push …"`,
   `-m "…"`, `--allowedTools 'Bash(git push…)'`), not by the command's first
   word: an exemption keyed on `grep`/`echo` also silences `echo start; <the
-  real violation>`. Keep `;&|` out of the quoted span, or the exemption
-  swallows a real command chained after a quoted one.
+  real violation>`. Keep `;&|` out of the span, or it swallows a chained real
+  command.
 - Default `warn_once_per: "session"` — a rule that nags every call gets ignored.
-  `turn` means **every matching call** (no dedup at all) — only for rules
+  `turn` means **every matching call** (no dedup) — only for rules
   where each occurrence matters (force-push). `file` behaves as `session`.
 - **Never anchor a `command_rx` with `^`.** Real commands arrive chained and
-  prefixed: `cd .. && gh pr create`, `cd sub; npm test`, `(cd pkg && git push)`,
-  `env CI=1 pytest`. A pattern anchored at the start of the string matches none
-  of them, and the rule then fires for some people and not others with nothing
-  to show why — the worst failure a rule has, because it looks like the rule
-  working. Don't try to anchor at command position either — a prefix like
-  `(?:^|[;&|(]\s*)` still misses `env CI=1 git push` and fires inside
-  `Bash(git push:*)`. Use a word boundary (`\bgit\s+push\b`) and let the
-  quoted-span `command_not_rx` handle mentions. This is the mirror image of the
-  SILENT guidance in step 4: that guards the false positive, this guards the
-  false negative.
+  prefixed: `cd .. && gh pr create`, `(cd pkg && git push)`, `env CI=1 pytest`.
+  A pattern anchored at the start of the string matches none of them, and the
+  rule fires for some people and not others — the worst failure: it looks
+  like the rule working. Don't
+  anchor at command position either — `(?:^|[;&|(]\s*)` still misses
+  `env CI=1 git push` and fires inside `Bash(git push:*)`. Use a word boundary
+  (`\bgit\s+push\b`) and let the quoted-span `command_not_rx` handle mentions.
 - **The pattern stays broad; the judge decides fit.** Everything above is
   about a pattern that matches the wrong **shape** — a `grep` that mentions
   the command, a heredoc body, a quoted argument — and narrowing is still the
@@ -247,9 +246,7 @@ Skip it when the violation prints nothing.
 
 ### 4. Prove it fires — and prove it stops
 
-A rule that matches the command you had in mind can still be wrong in three
-ways that only show up once the whole team has it. Run the candidate through
-the engine that will actually run it:
+Run the candidate through the engine that will actually run it.
 
 Write the candidate with the Write tool to `/tmp/cand.json` — this is the
 whole running example, exactly as step 5 will file it:
@@ -292,16 +289,17 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_verify.py" --rule-file /tmp/cand
   --silent "claude --allowedTools 'Bash(git push -f origin main:*)'"
 ```
 
-Every line reads `ok` and it exits 0.
+Every line reads `ok` and it exits 0. A heredoc-form rule (step 3) also gets a
+heredoc `--fires` whose body is the shape people really write — `await
+c.execute("insert into …")`, not a bare statement — and a mention-only
+`--silent` (`print("insert into …")`).
 
 The `echo "start"; …` case is there because a first draft of the quoted-span
 exemption let `;` inside the span and swallowed that real push. Say what the
 rule still misses: a bare `git push -f` while *on* staging names no branch —
 that needs `given.repo.branch_rx` (gate-and-given.md).
 
-(`when` / `do` / `why` / `when_not` ride along in the body so the same file
-is what step 5 files; the verifier and the replay test the pattern and do not
-read them.)
+(The verifier and the replay ignore `when` / `do` / `why` / `when_not`.)
 
 Other shapes take other case syntax — a `read` rule (`read:<path>`,
 `bash:<command>`, `--file-lines`), an `edit` rule (`path::content`), a `given`
@@ -312,12 +310,12 @@ rule (steps joined by ` >> `, armed by `session` / `prompt:` / `edit:`), an
 It exits non-zero until every case behaves. **Do not file a rule while it
 exits non-zero, and show the table to the user.** What each line means:
 
-- **LOAD** — whether the hook would load the rule at all. A pattern over 2000
-  characters, one that does not compile, or one that backtracks is dropped
-  *silently* on every teammate's machine: the rule exists, is active, and
-  never fires. This line is the only warning you get.
-- **FIRES** — your `--fires` cases. At least one is required; without it
-  nothing has shown the rule can trigger.
+- **LOAD** — whether the hook loads the rule. A pattern over 2000 characters,
+  that does not compile, or that backtracks is dropped *silently* on every
+  teammate's machine: active, and never fires.
+- **SPEED** — a quadratic pattern loads, then stalls every call it sees; the
+  FAIL line prints the linear rewrite.
+- **FIRES** — your `--fires` cases. At least one is required.
 - **SILENT** — your `--silent` cases, plus two generated for you: `grep` and
   `python -c` quoting the rule's own trigger. They are generated only when
   `command_rx` reduces to a plain literal of at least 4 characters; anything
@@ -328,14 +326,12 @@ exits non-zero, and show the table to the user.** What each line means:
   add a `command_not_rx`.
 
 **Always give at least one `--fires` case in CHAINED form** — `--fires 'cd .. &&
-<your trigger>'` alongside your plain case. A rule whose chained form does not
-fire is not ready to file, and the anchor that broke it (step 3) is invisible
-in a table that only ever tested the bare command.
+<your trigger>'` alongside your plain case: a table that only tested the bare
+command hides the anchor (step 3) that breaks the chained one.
 
 **Always give at least one `--silent` case for the complied-with form** — in
-the example, the force-push to a feature branch. A rule that still fires after
-someone complied cannot tell a violation from a fix, and people learn to
-ignore it. If no such case passes, the rule is not a pattern — make it
+the example, the force-push to a feature branch. A rule that fires after
+someone complied cannot tell a violation from a fix. If no such case passes, the rule is not a pattern — make it
 `anchor_recall` or a `session_context` note.
 
 ### 4b. Prove it fires in a LIVE session — mandatory
@@ -366,6 +362,7 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/rulebook_conflicts.py" \
   --candidates <candidate.json> --existing <list_rules.json> --repo "<repo>" \
   --rulebook-id <scopes.<scope>.rulebook_id from step 0>
 ```
+A replacement passes the replaced rule's `rulebook_id` (its `list_rules` row).
 
 For a workspace, the id is that workspace's `rulebook_id`. When it is `null`
 (nothing has been filed into that scope yet), pass `--new-scope` instead of
@@ -415,7 +412,7 @@ On approval — or immediately, for a harness draft — call the memhub
 named, `delivery`, the engine
 block, `scope_repos`, `source_ref` (e.g. `<path/to/CLAUDE.md>@<sha>#<heading>` or
 `user correction, session <id>`), `categories` and `evidence` as labels.md
-says (a harness draft sends neither),
+says (a harness draft: no evidence),
 `supersedes_rule_id` when it replaces a
 rule, `mode: "gate"` if the user asked for a rule that stops the command, and
 `scope` from step 0 (plus `workspace_id` for a workspace) — never a guessed
@@ -441,7 +438,7 @@ owner — only a harness draft passes `author="xtrace"`. Read the reply:
 - A scope refusal (`This organisation's plan doesn't include workspaces…`,
   `That workspace is locked…`, `No workspace with that id…`, `That's the
   organisation's main workspace…`) → nothing was written. Tell the user in
-  one line and file again with `scope: "org"`. `A replacement stays in the
+  one line and file again with the scope step 0 rule 3 or 4 gives. `A replacement stays in the
   same scope…` → file it again without `scope`. `A personal rulebook only
   takes its owner's own rules…` → the rule you meant to replace is someone
   else's personal rule: tell the user, and file it only as a new rule (no

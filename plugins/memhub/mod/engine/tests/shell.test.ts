@@ -5,7 +5,7 @@ import { test, expect } from 'claude-code/testing'
 import { VECTORS as OWN, type Vector } from './vectors/shell'
 import { VECTORS as CORPUS } from './vectors/shell_corpus'
 import {
-  anchorHandle, anchorHits, anchorPattern, bashReads, blankQuoted, blankSyntax, cdPrefixTarget,
+  anchorHandle, anchorHits, anchorPattern, bashDirs, bashReads, bashWriteTargets, callDir, expandPath, blankQuoted, blankSyntax, cdPrefixTarget,
   commandFires, fnmatch, headTailLines, judgeCallText, judgeMatchedOn, judgeRedact, lastSegment,
   logicalLines, pathInScope, redactEchoes, redactIdentities, redactSecrets, redactText,
   redactedTokens, redirectBase, sedLines, segmentOp, shellOnly, shlexSplit, stripComments,
@@ -15,6 +15,8 @@ import {
 import { belowRatchet, pyKind } from './vector_checks'
 
 const HOME = '/home/vector'
+/** rule_vector_cases/shell.py ENV: the environment the call/write parsers expand in. */
+const ENV = { HOME, WT: '/w/wt', EMPTY: '' }
 
 /** Python `re` flag ints as pyre letters. */
 const flagLetters = (f: unknown): string => {
@@ -76,7 +78,10 @@ const PORTS: Record<string, (a: any[], k: Record<string, any>) => unknown> = {
   judge_matched_on: ([rule, ev, handle, root]) => judgeMatchedOn(rule, ev, handle, root),
   _under: ([p, b]) => under(p, b),
   cd_prefix_target: ([c]) => cdPrefixTarget(c),
-  repo_of_call_cd: ([c], k) => (k.tool_name ?? 'Bash') === 'Bash' && cdPrefixTarget(c) !== null,
+  call_dir: ([cwd, c]) => callDir(cwd, c, ENV),
+  bash_dirs: ([cwd, c]) => bashDirs(cwd, c, ENV),
+  bash_write_targets: ([cwd, c]) => bashWriteTargets(cwd, c, ENV),
+  expand_path: ([t, here]) => expandPath(t, here, ENV),
   _redirect_base: ([cwd, f]: [string, Facts]) => {
     let data: unknown
     if (f.text !== null) {

@@ -67,4 +67,4 @@ guessed value. A server that does not take `categories` yet usually ignores
 it (the reply carries no `categories`); if one refuses it, re-file once
 without it.
 
-A harness draft sends neither label (`references/harness.md`).
+A harness draft sends `categories` and never `evidence` (`references/harness.md`).

@@ -70,8 +70,9 @@ async function started($: Engine, on: On, beneath: Beneath = {}) {
 async function startedBare($: Engine, on: On, beneath: Beneath = {}) {
   const clock = mock.clock(on)
   // the plugin's store, in memory and read back by the test; `store` seeds it,
-  // as a module reload finds what an earlier load wrote
-  const store: Record<string, unknown> = { ...(beneath.store ?? {}) }
+  // as a module reload finds what an earlier load wrote. `companion.enabled`
+  // true: the person ran `/goose` once (the `companion` option is off by default)
+  const store: Record<string, unknown> = { 'companion.enabled': true, ...(beneath.store ?? {}) }
   on('store.get', async (_, e) => ({ value: store[e.key] }))
   on('store.set', async (_, e) => {
     store[e.key] = JSON.parse(JSON.stringify(e.value))
@@ -204,12 +205,94 @@ describe('a rule the harness filed, found by the poll', () => {
     expect(frames.length).toBeGreaterThan(10)
   })
 
-  test('signed out: no key, no request, nothing said', { timeoutMs: 60_000 }, async ($, on) => {
+  test('signed out: no key, no request, no proposal said', { timeoutMs: 60_000 }, async ($, on) => {
     const { clock, frames, rest } = await started($, on, { list: FILED, bearers: [''] })
     await turnEnds($)
     for (let t = 0; t < 5_000; t += STEP_MS) await clock.advance(STEP_MS)
     expect(rest.gets).toHaveLength(0)
     expect(frames.some(f => f.includes('not active'))).toBe(false)
+  })
+})
+
+// No one signed in to MemHub: api-info answers `{}`, or the server refuses
+// the key even freshly resolved. The animal says so once a session and keeps
+// a row under it until a poll finds a sign-in, which it says too. A lookup
+// that cannot answer at all is not a signed-out person: it says nothing.
+
+const SIGNED_OUT_ROW = 'not signed in · /memhub:login'
+/** The end of the not-signed-in bubble, so a frame holding it holds all of it. */
+const SIGNED_OUT_END = 'Run /memhub:login'
+
+describe('not signed in to MemHub', () => {
+  const hasRow = async (band: { find: (q: object) => Promise<unknown> }) =>
+    (await band.find({ type: 'Text', text: SIGNED_OUT_ROW })) !== undefined
+
+  test('signed out: the animal says so once, and the row stays under it', { timeoutMs: 120_000 }, async ($, on) => {
+    const { band, clock, frames } = await started($, on, { bearers: [''] })
+    for (let t = 0; t < PLAY_MS && !frames.some(f => f.includes(SIGNED_OUT_END)); t += STEP_MS) await clock.advance(STEP_MS)
+    const said = frames.find(f => f.includes(SIGNED_OUT_END))
+    expect(said, 'no frame ever said it is not signed in').toBeDefined()
+    expect(said).toContain('Not signed in to MemHub')
+    expect(await hasRow(band), 'no row under the animal').toBe(true)
+    // play on until the bubble has gone; later polls find it signed out still:
+    // the row stays, nothing is said again
+    const isGone = () => !frames.at(-1)!.includes('Not signed in')
+    for (let t = 0; t < PLAY_MS && !isGone(); t += STEP_MS) await clock.advance(STEP_MS)
+    expect(isGone(), 'the bubble never went').toBe(true)
+    const firstGone = frames.length
+    await turnEnds($)
+    await clock.advance(300_000)
+    for (let t = 0; t < PLAY_MS; t += STEP_MS) await clock.advance(STEP_MS)
+    expect(frames.slice(firstGone).some(f => f.includes('Not signed in')), 'said a second time').toBe(false)
+    expect(await hasRow(band)).toBe(true)
+  })
+
+  test('a key the server refuses even freshly resolved is no sign-in', { timeoutMs: 60_000 }, async ($, on) => {
+    const { band, clock, frames, rest } = await started($, on, { list: { status: 401, text: '{}' } })
+    for (let t = 0; t < PLAY_MS && !frames.some(f => f.includes(SIGNED_OUT_END)); t += STEP_MS) await clock.advance(STEP_MS)
+    expect(rest.gets, 'asked twice: once more with a fresh key').toHaveLength(2)
+    expect(frames.some(f => f.includes('Not signed in to MemHub')), 'it never said so').toBe(true)
+    expect(await hasRow(band)).toBe(true)
+  })
+
+  test('a refused key, then a poll that fails another way: still not signed in, nothing more said', { timeoutMs: 120_000 }, async ($, on) => {
+    let answer: { status: number; text: string } | 'throw' = { status: 401, text: '{}' }
+    const { band, clock, frames } = await started($, on, { list: () => answer })
+    for (let t = 0; t < PLAY_MS && !frames.some(f => f.includes(SIGNED_OUT_END)); t += STEP_MS) await clock.advance(STEP_MS)
+    expect(await hasRow(band)).toBe(true)
+    for (const next of [{ status: 503, text: '{}' }, 'throw'] as const) {
+      answer = next
+      await turnEnds($)
+      for (let t = 0; t < 10_000; t += STEP_MS) await clock.advance(STEP_MS)
+      expect(frames.some(f => f.includes('Signed in to MemHub')), `a ${JSON.stringify(next)} said signed in`).toBe(false)
+      expect(await hasRow(band), `a ${JSON.stringify(next)} took the row away`).toBe(true)
+    }
+  })
+
+  test('a lookup that cannot answer says nothing of the sign-in', { timeoutMs: 60_000 }, async ($, on) => {
+    const { band, clock, frames } = await started($, on, { bearers: ['!'] })
+    await turnEnds($)
+    for (let t = 0; t < 10_000; t += STEP_MS) await clock.advance(STEP_MS)
+    expect(frames.some(f => f.includes('signed in'))).toBe(false)
+    expect(await hasRow(band)).toBe(false)
+  })
+
+  test('signed in: no row, nothing said of it', { timeoutMs: 60_000 }, async ($, on) => {
+    const { band, clock, frames } = await started($, on)
+    for (let t = 0; t < 10_000; t += STEP_MS) await clock.advance(STEP_MS)
+    expect(frames.some(f => /signed in/i.test(f))).toBe(false)
+    expect(await hasRow(band)).toBe(false)
+  })
+
+  test('a sign-in mid-session is said, and the row goes', { timeoutMs: 120_000 }, async ($, on) => {
+    const { band, clock, frames } = await started($, on, { bearers: ['', BEARER] })
+    for (let t = 0; t < PLAY_MS && !frames.some(f => f.includes(SIGNED_OUT_END)); t += STEP_MS) await clock.advance(STEP_MS)
+    expect(await hasRow(band)).toBe(true)
+    // /memhub:login ran; the next turn's end looks again
+    await turnEnds($)
+    for (let t = 0; t < PLAY_MS && !frames.some(f => f.includes('Signed in to MemHub')); t += STEP_MS) await clock.advance(STEP_MS)
+    expect(frames.some(f => f.includes('Signed in to MemHub')), 'it never said the sign-in').toBe(true)
+    expect(await hasRow(band)).toBe(false)
   })
 })
 

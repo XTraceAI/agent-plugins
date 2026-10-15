@@ -30,17 +30,22 @@ below say what to DO at each such point.
 - **A lesson** → run this flow with it as the user's words, and **ask the
   person nothing at all**. A `session_draft` lands `proposed` and fires for
   nobody until a reviewer activates it, so every confirmation this skill asks
-  for elsewhere is already held by the org admin who reviews it. Concretely, on
-  this path:
-  - **Step 0 (who it applies to)** does not ask and does not choose: a
-    harness draft always files with `scope: "org"` — everyone in the
-    organisation, the default scope. It lands `proposed`, so it reaches
-    nobody until an org admin reads it and activates it. Never pass a
-    `rulebook_id` to `create_rule`. Call `list_rulebooks` once, only to read
-    `scopes.org.rulebook_id` for step 5's conflict check (`--rulebook-id`
-    with it; `--new-scope` when it is `null`; neither when the reply has no
-    `scopes`) — without it every hit reads `WHICH RULEBOOK?` and the check
-    cannot clear a supersede. The one exception is a replacement: with
+  for elsewhere is already held by whoever reviews it. Concretely, on this
+  path:
+  - **Step 0 (who it applies to)** does not ask: a harness draft files with
+    `scope: "personal"` — the person whose turn it was, who reviews and
+    activates it themselves. It goes to `org` only when step 0's rule 4
+    holds: the lesson is right for anyone working in that repo or org, and
+    you can say why in one sentence. That sentence then ends `why`
+    (`Org-wide because …`), the only place the org admin who reviews it will
+    read it — and `why` stays within its 400 characters, so shorten the
+    incident, never drop the sentence. A lesson about this person's own setup, habits or taste is never
+    `org`. Never pass a `rulebook_id` to `create_rule`. Call `list_rulebooks`
+    once, only to read `scopes.<scope>.rulebook_id` for step 5's conflict
+    check (`--rulebook-id` with it; `--new-scope` when it is `null`; neither
+    when the reply has no `scopes`; for a replacement, the replaced rule's own
+    `rulebook_id` from its `list_rules` row) — without it every hit reads
+    `WHICH RULEBOOK?` and the check cannot clear a supersede. The one exception is a replacement: with
     `supersedes_rule_id`, leave `scope` out — a replacement stays in the
     scope of the rule it replaces.
   - **Step 4b never runs here** — the fork prompt treats its precondition as
@@ -99,8 +104,10 @@ below say what to DO at each such point.
   repo holds them, file nothing. No checkout of that repo on this machine →
   file it anyway.
 
-  `scope_repos` says which repos the rule fires in; `scope` (always `org`
-  here) says whose agents it reaches. They are independent.
+  `scope_repos` says which repos the rule fires in; `scope` (`personal`
+  unless step 0's rule 4 holds) says whose agents it reaches. They are
+  independent: a lesson scoped to one repo is still `personal` unless anyone
+  working there needs it.
 - **`source_ref` is passed EXACTLY as the fork prompt gives it.** A draft's identity is its exact `source_ref`: a re-file under a
   different one is refused as a twin of the first filing (end with `none`).
 - **The stamp** is what the fork prompt's read-only
@@ -111,15 +118,17 @@ below say what to DO at each such point.
   the harness wrote this rule and no person asked for it; it is a label only,
   and the session's person still owns the rule.
 - **The harness draft's `create_rule` call carries these and nothing else:**
-  `scope: "org"`, `title`, `statement`, `when`, `do`, `why`, the one engine
+  `scope` (step 0 above), `title`, `statement`, `when`, `do`, `why`, the one engine
   (`matcher`, `ordering` or `anchors`), `delivery`, `mode`, `scope_repos`,
-  `source="session_draft"`, `source_ref`, `state` and `author="xtrace"` —
-  plus `supersedes_rule_id` when step 2 found one (and then no `scope`), and `when_not` only when
-  the turn itself named a situation the lesson does not cover. The tool also
-  offers `categories` and `evidence`;
-  both are for a person's or a backtest's judgement, and this path has
-  neither, so a harness draft sends neither: a guessed category or a
-  malformed evidence object is refused.
+  `source="session_draft"`, `source_ref`, `state`, `author="xtrace"` and
+  `categories` — plus `supersedes_rule_id` when step 2 found one (and then no `scope`), and `when_not` only when
+  the turn itself named a situation the lesson does not cover. **A harness
+  draft is labelled when it is filed:** `categories` is the set step 1b chose
+  from labels.md's six, by its definitions and the `agent_conduct` sorting
+  test — never a seventh, never the single `category`. There is no preview to
+  show it in; the reviewer changes it in MemHub. Leave it out only when none
+  of the six fits (a replacement then sends `[]`, labels.md). `evidence` is
+  never sent: it is a backtest's measurement and this path runs none.
 - **`when`, `do` and `why` are written here without asking**, by step 1's
   rules, from turn N and the person's reaction to it: `when` is what the agent
   was doing when it went wrong, `do` is what the person's correction asked
@@ -130,6 +139,54 @@ below say what to DO at each such point.
   field (a category, a matcher key, a repo scope), retry the SAME call with only
   that field changed. `source`, `source_ref`, `state` and `author` stay as they
   were: a retry that drops them files a rule nobody can trace to this turn,
-  shown as the person's own.
+  shown as the person's own. A `category_invalid` refusal is re-filed once
+  with `categories` dropped and nothing else changed — never a guessed set.
 
 `mode: "gate"` still needs the user's own words asking for a block (step 3).
+
+
+## Handed a cost verdict (repair)
+
+A fork prompt that says `to REPAIR one team rule` is the live-repair path
+(harness-self-improvement-spec §4): the effect judge read what the agent did
+after rule R fired on turn N of this session and found that showing it COST
+the work (`p_cost` at or above 0.8). Everything in "Handed a turn by the
+harness" holds — nothing reaches the person but the final line, ask nothing,
+file `proposed`, never activate — with these differences:
+
+- **The subject is an existing rule, and the deliverable is a supersede.**
+  Call `list_rules` with `include_retired=True, limit=200` (more pages on
+  `has_more`) and find the rule by its `rule_id` from the prompt: read its
+  `statement`, `when`, `when_not`, `do`, `why` and `trigger`. Read turn N of
+  the transcript — the call the rule fired on, the hook text the agent saw,
+  and what it did after. Then decide which ONE of these it is:
+  - **A situation the rule is not for** (it fired on the right shape in the
+    wrong moment): keep the pattern, add that situation to `when_not` in
+    situation words, never trigger vocabulary. This is the common case.
+  - **The wrong shape** (a mention in a grep, a heredoc body, a quoted
+    argument): add a `command_not_rx` for that shape; the pattern stays broad
+    otherwise (step 3's "the pattern stays broad; the judge decides fit").
+  - **A `do` this environment refuses** (the rule sent the agent into an
+    action the auto-mode classifier denies, a tool it lacks, a server it
+    cannot reach): rewrite `do` with what to do instead, and say so in the
+    statement.
+  - **Nothing wrong** (the judge misread the window, the cost was the
+    agent's own detour): file nothing and end with the `none` line, naming
+    the reason in a few words.
+- **Prove the repair the way a new rule is proved.** A pattern change goes
+  through step 4's verifier with the fired-on call as a `--silent` case when
+  the shape was wrong, and the rule's own `--fires` cases kept. A `when_not`
+  or `do` change needs no verifier run (the pattern is untouched) but the
+  statement must still say the same thing as the fields.
+- **File with `supersedes_rule_id` set to R and no `scope`** (a replacement
+  stays in the scope of the rule it replaces), `source="session_draft"`,
+  the prompt's `source_ref`, the stamp as `state`, `author="xtrace"`, and
+  every field of R you did not change copied as it was — a supersede that
+  drops a field drops it from the live rule. `scope_repos` stays R's.
+- **One open repair per rule.** The hook hands a rule over once per machine
+  per fortnight; a second cost verdict on the same rule in that window
+  attaches to the proposal in review and spawns nothing. If `create_rule`
+  answers that a proposed supersede of R already exists (a twin), end with
+  the `none` line: the repair is in the review queue.
+- **End with exactly one line:** `MemHub harness fork: repaired <title>` on a
+  filing, else the `none` or `failed` line as above.

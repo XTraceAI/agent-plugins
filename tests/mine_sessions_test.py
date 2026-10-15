@@ -10,6 +10,7 @@ SCRIPT = ROOT / "plugins" / "memhub" / "skills" / "start-rulebook" / "scripts" /
 
 sys.path.insert(0, str(ROOT / "plugins" / "memhub" / "scripts"))
 import rulebook_paths  # noqa: E402
+import rulebook_hook  # noqa: E402
 
 
 def _book_dir(home) -> Path:
@@ -18,8 +19,9 @@ def _book_dir(home) -> Path:
     return Path(home) / ".config" / "memhub-plugin" / "rulebook" / rulebook_paths.backend_key() / "book"
 
 
-def _run(*extra, home):
-    env = {k: v for k, v in os.environ.items() if k not in ("CLAUDE_PLUGIN_ROOT", "MEMHUB_PLUGIN_SCRIPTS")}
+def _run(*extra, home, **more_env):
+    env = {k: v for k, v in os.environ.items() if k not in ("CLAUDE_PLUGIN_ROOT", "MEMHUB_PLUGIN_SCRIPTS", "CLAUDE_CONFIG_DIR")}
+    env.update(more_env)
     env["HOME"] = home
     env["USERPROFILE"] = home
     return subprocess.run([sys.executable, str(SCRIPT), *extra], capture_output=True, text=True, env=env, cwd=home, timeout=120)
@@ -54,9 +56,9 @@ def main() -> int:
             {"title": "empty-origin-probe", "matcher": {"event": "bash", "command_rx": "never-happens-abc\\b"}, "claude_md": {}},
             "not-a-dict"]))
         book = _book_dir(home); book.mkdir(parents=True)
-        (book / "x.json").write_text(json.dumps({"rules": [{"delivery": "agent_hook", "matcher": {"event": "bash", "command_rx": "x"}},   # no title: must be skipped, not fatal
+        (book / os.path.basename(rulebook_hook.book_path("probe-repo"))).write_text(json.dumps({"rules": [{"delivery": "agent_hook", "matcher": {"event": "bash", "command_rx": "x"}},   # no title: must be skipped, not fatal
                                                             {"title": "ok-rule", "rule_id": "r1", "delivery": "agent_hook", "mode": "advise", "version": "not-a-number", "matcher": {"event": "bash", "command_rx": "git\\s+push\\b", "warn_once_per": "session"}, "scope_repos": [], "scope_paths": [], "scope_exclude_paths": []}]}))
-        p = _run("--out", str(out), "--rule-file", str(cand), "--rule-file", str(partial), "--rule-file", str(anchor), "--rule-file", str(sess_ord), "--rule-file", str(prompt_ord), "--rule-file", str(bare_prompt), "--candidates", str(cands), "--claude-md", str(md), "--facets", str(facets), home=home)
+        p = _run("--out", str(out), "--repo", "probe-repo", "--rule-file", str(cand), "--rule-file", str(partial), "--rule-file", str(anchor), "--rule-file", str(sess_ord), "--rule-file", str(prompt_ord), "--rule-file", str(bare_prompt), "--candidates", str(cands), "--claude-md", str(md), "--facets", str(facets), home=home)
         ok = p.returncode == 0 and "sessions read" in p.stdout and "probe-rule" in p.stdout and "WHAT CLAUDE.MD DECLARES" in p.stdout and "PROPOSED RULES" in p.stdout and "unknown friction category ['bogus_label']" in p.stderr and "=== WHAT WENT WRONG" not in p.stdout and (out / "digests").is_dir()
         print(("ok  " if ok else "FAIL"), "empty HOME: runs, backtests --rule-file, seeds from --claude-md, warns on --facets vocab but reports no facet for a session not in the corpus, writes digests/"); fails += not ok
         if not ok: print(p.stdout[-800:], p.stderr[-800:])
@@ -235,5 +237,95 @@ def main() -> int:
         if not ok: print(stamps, _offered())
     return 1 if fails else 0
 
+
+def _rec(kind, content, cwd, ts, branch="fm-feat/probe-only-branch"):
+    return json.dumps({"type": kind, "cwd": cwd, "gitBranch": branch, "timestamp": ts, "message": {"content": content}})
+
+
+def _use(i, name, inp):
+    return {"type": "tool_use", "id": f"tu{i}", "name": name, "input": inp}
+
+
+def counting() -> int:
+    """What a session counts as: its subagents' calls, a repo even after its worktree is deleted, an edit read the
+    way the hook reads it, one facet per session, and only the books of the repos the sessions are in."""
+    fails = 0
+    with tempfile.TemporaryDirectory() as home:
+        repo = Path(home) / "src" / "probe-repo"; repo.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", "https://example.com/acme/probe-repo.git"], check=True)
+        gone = repo / ".claude" / "worktrees" / "deleted-one"            # never created: a worktree removed after the session
+        proj = Path(home) / ".claude" / "projects" / "-probe"; proj.mkdir(parents=True)
+        sid = "cccccccc-1111-2222-3333-444444444444"
+        (proj / f"{sid}.jsonl").write_text("\n".join([
+            _rec("user", "fix the parser", str(gone), "2026-10-10T10:00:00Z"),
+            _rec("assistant", [_use(1, "Edit", {"file_path": "/x/a.py", "old_string": "# TODO keep\n", "new_string": "# TODO keep\nx = 1\n"})], str(gone), "2026-10-10T10:01:00Z"),
+            _rec("assistant", [_use(2, "MultiEdit", {"file_path": "/x/b.py", "edits": [{"old_string": "a", "new_string": "print('dbg')"}]})], str(gone), "2026-10-10T10:02:00Z"),
+            _rec("assistant", [_use(3, "Edit", {"file_path": "/x/c.py", "old_string": "y", "new_string": "import os\n"})], str(gone), "2026-10-10T10:03:00Z"),
+        ]))
+        sub = proj / sid / "subagents"; sub.mkdir(parents=True)
+        (sub / "agent-a1.jsonl").write_text("\n".join([
+            _rec("user", "no, push it now", str(gone), "2026-10-10T10:01:30Z"),   # the parent's prompt: never a correction by the person
+            _rec("assistant", [_use(9, "Bash", {"command": "git push origin HEAD"})], str(gone), "2026-10-10T10:01:40Z"),
+        ]))
+        rules = {
+            "push-probe": {"title": "push-probe", "matcher": {"event": "bash", "command_rx": "git\\s+push\\b"}},
+            "todo-probe": {"title": "todo-probe", "matcher": {"event": "edit", "content_rx": "TODO"}},
+            "print-probe": {"title": "print-probe", "matcher": {"event": "edit", "content_rx": "print\\("}},
+        }
+        files = []
+        for name, body in rules.items():
+            f = Path(home) / f"{name}.json"; f.write_text(json.dumps(body)); files += ["--rule-file", str(f)]
+        book = _book_dir(home); book.mkdir(parents=True)
+        (book / os.path.basename(rulebook_hook.book_path("probe-repo"))).write_text(json.dumps({"rules": [
+            {"title": "fresh-rule", "rule_id": "r1", "delivery": "agent_hook", "mode": "advise", "version": 1, "matcher": {"event": "bash", "command_rx": "git\\s+push\\b"}}]}))
+        (book / os.path.basename(rulebook_hook.book_path("some-fixture"))).write_text(json.dumps({"rules": [
+            {"title": "stale-fixture-rule", "rule_id": "r9", "delivery": "agent_hook", "mode": "advise", "version": 1, "matcher": {"event": "bash", "command_rx": "git\\s+push\\b"}}]}))
+        out = Path(home) / "out"
+        p = _run("--out", str(out), "--repo", str(repo), "--digest-top", "0", *files, home=home)
+        rows = {r["title"]: r for r in json.load(open(out / "proposals.json")) if isinstance(r, dict) and r.get("title")} if (out / "proposals.json").exists() else {}
+        fired = {k: (rows.get(k) or {}).get("fired_n") for k in rules}
+        ok = p.returncode == 0 and "--repo " + str(repo) + " -> probe-repo" in p.stdout and "(M=1)" in p.stdout and "parent 1" in p.stdout
+        print(("ok  " if ok else "FAIL"), "--repo given as a path names its repo, and a session whose worktree was deleted is placed by the repo it sat in"); fails += not ok
+        if not ok: print(p.stdout[:800], p.stderr[-600:])
+        ok = fired["push-probe"] == 1 and "1 subagent transcripts folded" in p.stdout
+        print(("ok  " if ok else "FAIL"), "a command run inside a subagent counts for its session"); fails += not ok
+        ok = fired["todo-probe"] == 0 and fired["print-probe"] == 1
+        print(("ok  " if ok else "FAIL"), "an edit is read as the hook reads it: a line it kept does not fire, a MultiEdit's edits do"); fails += not ok
+        if not ok: print(fired)
+        ok = "fresh-rule" in p.stdout and "stale-fixture-rule" not in p.stdout
+        print(("ok  " if ok else "FAIL"), "rules already on come from this repo's book, not every book in the cache"); fails += not ok
+        corpus = json.load(open(out / "corpus.json")) if (out / "corpus.json").exists() else [{}]
+        ok = corpus[0].get("users") == ["fix the parser"] and corpus[0].get("stamp") == "1u3c0r" and "main_calls" not in corpus[0]
+        print(("ok  " if ok else "FAIL"), "a subagent's prompt is not the person's turn, and the facet stamp counts the session's own calls"); fails += not ok
+        if not ok: print({k: corpus[0].get(k) for k in ("users", "stamp")})
+
+        # one facet per session: yours wins over an /insights facet for the same session
+        facets = Path(home) / "facets.json"
+        facets.write_text(json.dumps([{"session_id": sid, "outcome": "mostly", "friction": [{"category": "wrong_source", "detail": "mine"}]}]))
+        ins = Path(home) / ".claude" / "usage-data" / "facets"; ins.mkdir(parents=True)
+        (ins / f"{sid}.json").write_text(json.dumps({"session_id": sid, "friction_counts": {"buggy_code": 2}, "friction_detail": "insights"}))
+        p = _run("--out", str(out), "--repo", "probe-repo", "--digest-top", "0", "--facets", str(facets), home=home)
+        ok = p.returncode == 0 and "1 /insights facets left out" in p.stdout and "buggy_code" not in p.stdout and "wrong_source" in p.stdout
+        print(("ok  " if ok else "FAIL"), "an /insights facet for a session your facets already read is left out, not counted twice"); fails += not ok
+        if not ok: print(p.stdout[-800:])
+
+        # Claude Code's own config dir, when set, is where its transcripts are
+        moved = Path(home) / "cfg"; shutil.move(str(Path(home) / ".claude"), str(moved))
+        p = _run("--out", str(out), "--repo", "probe-repo", "--digest-top", "0", home=home, CLAUDE_CONFIG_DIR=str(moved))
+        ok = p.returncode == 0 and "(M=1)" in p.stdout
+        print(("ok  " if ok else "FAIL"), "transcripts are read from CLAUDE_CONFIG_DIR when it is set"); fails += not ok
+        if not ok: print(p.stdout[:400])
+        shutil.move(str(moved), str(Path(home) / ".claude"))
+
+        # the repo is remembered: once even the parent is gone, the cache still places the session
+        shutil.rmtree(repo)
+        p = _run("--out", str(out), "--repo", "probe-repo", "--digest-top", "0", home=home)
+        ok = p.returncode == 0 and "(M=1)" in p.stdout
+        print(("ok  " if ok else "FAIL"), "a repo resolved once is kept, so the session stays placed after its whole checkout is gone"); fails += not ok
+        if not ok: print(p.stdout[:600])
+    return fails
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(1 if (main() + counting()) else 0)

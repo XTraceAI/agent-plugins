@@ -1,6 +1,11 @@
 {
   "version": 1,
   "hooks": {
+    "sessionStart": [
+      {
+        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/cursor_capture.cmd\" sessionStart"
+      }
+    ],
     "beforeShellExecution": [
       {
         "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/cursor_capture.cmd\" beforeShellExecution"
@@ -34,6 +39,23 @@
     "sessionEnd": [
       {
         "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/cursor_capture.cmd\" sessionEnd"
+      }
+    ],
+    "preToolUse": [
+      {
+        "matcher": "Read|Task",
+        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/cursor_capture.cmd\" preToolUse"
+      }
+    ],
+    "postToolUse": [
+      {
+        "matcher": "Task",
+        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/cursor_capture.cmd\" postToolUse"
+      }
+    ],
+    "beforeReadFile": [
+      {
+        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/cursor_capture.cmd\" beforeReadFile"
       }
     ]
   }

@@ -265,7 +265,10 @@ class OAuthFlow:
             raise NonInteractiveAuthRequired(
                 "no cached OAuth token and interactive auth is disabled"
             )
-        print(f"Opening browser to authenticate (same flow as /mcp)...\n  {auth_url}")
+        # flush: when stdout is a file or pipe (a backgrounded /memhub:login),
+        # an unflushed link sits in the buffer until the 5-minute wait ends.
+        print(f"Opening browser to authenticate (same flow as /mcp)...\n  {auth_url}",
+              flush=True)
         webbrowser.open(auth_url)
 
     async def authorize(self, www_authenticate: str | None = None) -> str:
@@ -494,7 +497,8 @@ def _auth_token_endpoint() -> str | None:
         # and its answer decides where a long-lived refresh token gets POSTed.
         if urlparse(meta_url).scheme != "https":
             return None
-        with urllib.request.urlopen(meta_url, timeout=10) as resp:
+        import _tls  # noqa: PLC0415 — stdlib, beside this file
+        with _tls.urlopen(meta_url, timeout=10) as resp:
             endpoint = json.loads(resp.read()).get("token_endpoint")
         if not isinstance(endpoint, str) or not endpoint:
             return None
@@ -598,8 +602,9 @@ def _refresh_cached_token_if_stale(url: str) -> None:
         token_endpoint, data=data,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
+    import _tls  # noqa: PLC0415 — stdlib, beside this file
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with _tls.urlopen(req, timeout=15) as resp:
             if resp.status != 200:
                 return
             fresh = json.loads(resp.read())

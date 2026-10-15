@@ -118,8 +118,13 @@ def test_cursor_manifest_uses_one_portable_launcher_per_event():
         .read_text(encoding="utf-8"))
     assert set(document["hooks"]) == {
         "beforeShellExecution", "afterShellExecution", "afterFileEdit",
-        "afterAgentResponse", "stop", "beforeSubmitPrompt", "sessionEnd"
+        "afterAgentResponse", "stop", "beforeSubmitPrompt", "sessionEnd",
+        # The rulebook lane (cursor_rulebook.py).
+        "sessionStart", "preToolUse", "postToolUse", "beforeReadFile",
     }
+    # Only the Read/Task calls the rulebook lane tracks, not every tool call.
+    assert document["hooks"]["preToolUse"][0]["matcher"] == "Read|Task"
+    assert document["hooks"]["postToolUse"][0]["matcher"] == "Task"
     for event, handlers in document["hooks"].items():
         assert len(handlers) == 1, event
         command = handlers[0]["command"]
@@ -513,6 +518,64 @@ def test_import_verdicts_and_dormancy():
                         1_000.0 + DORMANT_RETRY_S + 1)
     assert should_flush("stop", {}, {"unsupported": False}, {"new-blob"}, 5_000.0)
     print("PASS test_import_verdicts_and_dormancy")
+
+
+def test_live_store_falls_back_to_the_transcript():
+    """A store that exists but cannot be READ must not win the source choice.
+
+    cursor-agent holds its chat store open for the life of the session, so at
+    sessionEnd — the only hook that captures a CLI session — sqlite refuses the
+    read-only open the reader uses. locate() names the file regardless, so the
+    flusher used to pick "store", fail to open it, and skip: no cursor-agent
+    session ever reached MemHub, with a complete transcript sitting beside it.
+    """
+    import sqlite3
+    from readers import cursor as cursor_reader
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        uuid = "019c6e48-b66c-7881-9301-99c87fc66cf6"
+        store = root / "store.db"
+        con = sqlite3.connect(store)
+        con.execute("create table blobs (id text)")
+        con.commit()
+        con.close()
+        assert cursor_reader.readable(store)          # closed: readable
+        transcript = root / uuid / f"{uuid}.jsonl"
+        transcript.parent.mkdir()
+        transcript.write_text("{}\n", encoding="utf-8")
+
+        located, readable = [store, ""], [True]
+        original_locate = cursor_reader.locate
+        original_readable = cursor_reader.readable
+        original_valid = cursor_flush._valid_transcript_path
+        cursor_reader.locate = lambda ref: (located[0], located[1])
+        cursor_reader.readable = lambda path: readable[0]
+        cursor_flush._valid_transcript_path = lambda raw, u, root=None: (
+            (transcript, "") if raw else (None, "no transcript_path"))
+        try:
+            payload = {"transcript_path": str(transcript)}
+            # readable store: unchanged behavior, the richer source still wins
+            kind, path, err = cursor_flush._source_for(uuid, payload, {})
+            assert (kind, path) == ("store", store), (kind, path, err)
+            # live store: the validated transcript is used instead of skipping
+            readable[0] = False
+            kind, path, err = cursor_flush._source_for(uuid, payload, {})
+            assert (kind, path) == ("transcript", transcript), (kind, path, err)
+            # neither readable nor a transcript: still an error, never a guess
+            kind, path, err = cursor_flush._source_for(uuid, {}, {})
+            assert kind is None and path is None and err
+            # a STICKY store stays sticky: switching sources mid-session would
+            # renumber every record uuid, which is why only the first choice
+            # consults readability.
+            kind, path, err = cursor_flush._source_for(
+                uuid, payload, {"source_kind": "store"})
+            assert kind == "store" and path == store
+        finally:
+            cursor_reader.locate = original_locate
+            cursor_reader.readable = original_readable
+            cursor_flush._valid_transcript_path = original_valid
+    print("PASS test_live_store_falls_back_to_the_transcript")
 
 
 if __name__ == "__main__":

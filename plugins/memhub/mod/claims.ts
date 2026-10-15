@@ -221,6 +221,23 @@ export class Claims {
     await this.write()
   }
 
+  /**
+   * Hand ONE call to Python without counting a failure — a call the mod's
+   * book does not cover (another repo's checkout). The lanes leave the
+   * variable, so the Python hooks beneath serve the call, until `recover`
+   * takes each back. Resolves the lanes actually yielded.
+   */
+  async yieldCall(lanes: readonly LaneName[]): Promise<LaneName[]> {
+    const took = lanes.filter(l => this.claimed.has(l))
+    if (!took.length) return took
+    for (const l of took) {
+      this.claimed.delete(l)
+      this.paused.add(l)
+    }
+    await this.write()
+    return took
+  }
+
   /** After the call a first failure handed to Python: take the lane back. */
   async recover(lane: LaneName): Promise<void> {
     if (!this.paused.delete(lane) || this.lost.has(lane)) return

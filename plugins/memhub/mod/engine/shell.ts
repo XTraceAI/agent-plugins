@@ -36,6 +36,7 @@
 //     The caller runs `command_root`/`repo_info` on a non-null answer.
 //   * `redact_identities` reads this machine's home: `redactIdentities(text, home)`.
 
+import { pyExec, pyFinditer, pyMatch } from './py'
 import { pyCompile, pySearch } from './pyre'
 
 // ── Python character classes ────────────────────────────────────────────────
@@ -1081,6 +1082,366 @@ export function judgeMatchedOn(
   return out
 }
 
+// ── where a Bash call works, and what it writes (pure) ──────────────────────
+// Ports of rulebook_hook.expand_path, _call_segments, _walk_call, call_dir,
+// bash_dirs, heredoc_bodies, _code_writes, _s_replacements, _inplace_edit and
+// bash_write_targets. `env` stands in for os.environ (HOME included): the
+// caller builds it from the variables the command names.
+
+/** An environment as `os.environ` answers `.get(name)`. */
+export type Env = Readonly<Record<string, string>>
+const envGet = (env: Env, k: string): string | undefined =>
+  Object.prototype.hasOwnProperty.call(env, k) ? env[k] : undefined
+
+const VAR_RX = String.raw`\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))`
+const INTERP_RX = String.raw`^(?:python[0-9.]*|node)$`
+export const BASH_EDIT_MAX_FILES = 40
+export const BASH_EDIT_MAX_BYTES = 512 * 1024
+
+/** The variable names a command spells (`$X`, `${X}`), for the caller to look up. */
+export function varNames(cmd: string): string[] {
+  const out = new Set<string>()
+  for (const m of pyFinditer(VAR_RX, cmd || '')) out.add((m[1] ?? m[2])!)
+  return [...out]
+}
+
+/** `expand_path(token, here, env)` */
+export function expandPath(token: unknown, here: string, env: Env): string {
+  if (typeof token !== 'string' || !token || token.includes('$(') || [...'`*?[]\n\r\0'].some((c) => token.includes(c))) return ''
+  let missing = false
+  let t = ''
+  let last = 0
+  for (const m of pyFinditer(VAR_RX, token)) {
+    const v = envGet(env, (m[1] ?? m[2])!)
+    if (v === undefined) missing = true
+    t += token.slice(last, m.index) + (v ?? '')
+    last = m.index + m[0].length
+  }
+  t += token.slice(last)
+  if (missing || t.includes('$') || t.includes('{') || t.includes('}')) return ''
+  if (t === '~' || t.startsWith('~/')) {
+    const home = envGet(env, 'HOME') || ''
+    if (!home) return ''
+    t = home + t.slice(1)
+  } else if (t.startsWith('~')) {
+    return ''
+  }
+  if (!isabs(t)) {
+    if (!here) return ''
+    t = join(here, t)
+  }
+  return normpath(t)
+}
+
+/** `_call_segments(cmd)`: [separator before, segment] split outside quotes. */
+function callSegments(cmd: string): [string, string][] {
+  const text = shellOnly(cmd || '')
+  const blank = blankQuoted(text)
+  const map = u2c(blank)
+  const cps = Array.from(text)
+  const out: [string, string][] = []
+  let pos = 0
+  let sep = ''
+  for (const m of blank.matchAll(SEPARATOR_RX)) {
+    out.push([sep, cps.slice(pos, map[m.index!]).join('')])
+    sep = m[0]
+    pos = map[m.index! + m[0].length]!
+  }
+  out.push([sep, cps.slice(pos).join('')])
+  return out
+}
+
+type Seg = { dir: string; toks: string[]; sep: string; text: string }
+
+/** `_walk_call(cwd, cmd, env)` */
+function walkCall(cwd: string, cmd: string, env: Env): [Seg[], string] {
+  let here = cwd ? normpath(cwd) : ''
+  const stack: string[] = []
+  const out: Seg[] = []
+  for (const [sep, seg] of callSegments(cmd)) {
+    const text = pyStrip(stripChars(pyStrip(stripLeadingAssignments(pyStrip(seg))), '({ \t', 'left'))
+    if (!text) continue
+    let toks: string[]
+    try {
+      toks = shlexSplit(text)
+    } catch (e) {
+      if (!(e instanceof ShlexError)) throw e
+      if (pyMatch(String.raw`(?:cd|pushd|popd)\b`, text)) here = ''
+      continue
+    }
+    toks = toks.filter((t) => t !== ')' && t !== '}' && t !== '))')
+    if (!toks.length) continue
+    if (toks[0] === 'cd' || toks[0] === 'pushd') {
+      const args = toks.slice(1).filter((t) => !(t.startsWith('-') && cpLen(t) > 1))
+      if (toks[0] === 'pushd') stack.push(here)
+      if (!args.length) here = toks[0] === 'cd' ? expandPath('~', '', env) : ''
+      else if (args[0] === '-') here = ''
+      else here = expandPath(args[0], here, env)
+      continue
+    }
+    if (toks[0] === 'popd') {
+      here = stack.length ? stack.pop()! : ''
+      continue
+    }
+    let d = here
+    if (basename(toks[0]!) === 'git') {
+      let i = 1
+      while (i < toks.length && toks[i]!.startsWith('-')) {
+        const t = toks[i]!
+        if (t === '-C' && i + 1 < toks.length) {
+          d = expandPath(toks[i + 1], d, env)
+          i += 2
+        } else if (t.startsWith('-C') && cpLen(t) > 2) {
+          d = expandPath(cpSlice(t, 2), d, env)
+          i += 1
+        } else if (t === '-c' && i + 1 < toks.length) {
+          i += 2
+        } else {
+          i += 1
+        }
+      }
+    }
+    out.push({ dir: d, toks, sep, text })
+  }
+  return [out, here]
+}
+
+/** `call_dir(cwd, cmd, env)` */
+export function callDir(cwd: string, cmd: string, env: Env): string {
+  const [segs, final] = walkCall(cwd, cmd, env)
+  return segs.length ? segs[0]!.dir : final
+}
+
+/** `bash_dirs(cwd, cmd, env)` */
+export function bashDirs(cwd: string, cmd: string, env: Env): string[] {
+  const [segs, final] = walkCall(cwd, cmd, env)
+  const out: string[] = []
+  for (const d of [...segs.map((s) => s.dir), final]) if (d && !out.includes(d)) out.push(d)
+  return out
+}
+
+/** `heredoc_bodies(cmd)` */
+export function heredocBodies(cmd: string): string[] {
+  const out: string[] = []
+  let skip: string | null = null
+  let body: string[] = []
+  for (const line of (cmd || '').split('\n')) {
+    if (skip !== null) {
+      if (pyStrip(line) === skip) {
+        out.push(body.join('\n'))
+        skip = null
+      } else {
+        body.push(line)
+      }
+      continue
+    }
+    const m = HD_OPEN.exec(line)
+    if (m) {
+      skip = m[2]!
+      body = []
+    }
+  }
+  if (skip !== null) out.push(body.join('\n'))
+  return out
+}
+
+const REDIR_OUT_RX = String.raw`(?<![0-9<>&])(?:1?>>?|&>>?|>\|)[ \t]*(?:'([^']*)'|"([^"]*)"|([^\s;&|<>()]+))`
+// No backreferences (pyre has none): each quote style is its own alternative.
+const QUOTED_PATH = String.raw`(?:'([^'\n]+)'|"([^"\n]+)")`
+const PY_OPEN_W_RX = String.raw`\bopen\(\s*` + QUOTED_PATH +
+  String.raw`\s*,\s*(?:mode\s*=\s*)?[rRbBuUfF]?(?:'[^'\n]*[wax+][^'\n]*'|"[^"\n]*[wax+][^"\n]*")`
+const PY_PATH_W_RX = String.raw`\bPath\(\s*` + QUOTED_PATH + String.raw`\s*\)\s*\.write_(?:text|bytes)\(`
+const PY_ASSIGN_RX = String.raw`\b([A-Za-z_]\w*)\s*=\s*(?:(?:pathlib\.)?Path\(\s*)?` + QUOTED_PATH
+const JS_WRITE_RX = String.raw`\b(?:writeFileSync|appendFileSync|writeFile|appendFile)\(\s*` + QUOTED_PATH
+const PY_LITERAL_RX = String.raw`"""([\s\S]*?)"""|'''([\s\S]*?)'''|"((?:\\.|[^"\\\n])*)"|'((?:\\.|[^'\\\n])*)'`
+const MODE_LITERAL_RX = String.raw`^(?:[rwabxt+]{1,3}|utf-?8)$`
+// The text being REPLACED is not written (`_OLD_TAIL_RX`, `_OLD_NAME_RX`).
+const REPLACER = String.raw`(?:\.replace|\b_?(?:rep|replace|swap|sub)\w*)\(`
+const OLD_TAIL_RX = String.raw`(?:` + REPLACER + String.raw`|(?:^|[\[,=\s])\()\s*$`
+const OLD_NAME_RX = REPLACER + String.raw`\s*([A-Za-z_]\w*)\s*,`
+
+/** `_code_writes(code)`: [paths opened for writing, the text written]. */
+function codeWrites(code: string): [string[], string] {
+  const paths = [PY_OPEN_W_RX, PY_PATH_W_RX, JS_WRITE_RX].flatMap((rx) => pyFinditer(rx, code).map((m) => (m[1] || m[2])!))
+  for (const m of pyFinditer(PY_ASSIGN_RX, code)) {
+    const name = reEscape(m[1]!)
+    if (pyExec(String.raw`\b` + name + String.raw`\s*\.write_(?:text|bytes)\(`, code) ||
+        pyExec(String.raw`\bopen\(\s*` + name + String.raw`\s*,\s*(?:mode\s*=\s*)?[rRbBuUfF]?['"][^'"\n]*[wax+]`, code)) {
+      paths.push((m[2] || m[3])!)
+    }
+  }
+  if (!paths.length) return [[], '']
+  const lits: string[] = []
+  const olds = [...new Set(pyFinditer(OLD_NAME_RX, code).map((m) => m[1]!))]
+  const oldBound = olds.length ? String.raw`\b(?:` + olds.map(reEscape).join('|') + String.raw`)\s*=\s*$` : null
+  const cps = Array.from(code)
+  const map = u2c(code)
+  for (const m of pyFinditer(PY_LITERAL_RX, code)) {
+    const at = map[m.index]!
+    const before = cps.slice(Math.max(0, at - 80), at).join('')
+    if (pyExec(OLD_TAIL_RX, before) || (oldBound !== null && pyExec(oldBound, before))) continue
+    const lit = m[1] !== undefined || m[2] !== undefined ? (m[1] ?? m[2])! : (m[3] ?? m[4])!.split('\\n').join('\n')
+    if (lit && !paths.includes(lit) && !pyMatch(MODE_LITERAL_RX, lit, 'i')) lits.push(lit)
+  }
+  return [paths, lits.join('\n')]
+}
+
+/** `_s_replacements(expr)` */
+function sReplacements(expr: string): string[] {
+  const out: string[] = []
+  const cs = Array.from(expr || '')
+  const map = u2c(expr || '')
+  for (const m of pyFinditer(String.raw`(?:^|[;\s}0-9$/])s([^\w\s\\])`, expr || '')) {
+    const delim = m[1]!
+    let i = map[m.index + m[0].length]!
+    const parts: string[] = []
+    let cur: string[] = []
+    while (i < cs.length && parts.length < 2) {
+      const c = cs[i]!
+      if (c === '\\' && i + 1 < cs.length) {
+        cur.push(cs[i + 1] === delim ? cs[i + 1]! : c + cs[i + 1]!)
+        i += 2
+        continue
+      }
+      if (c === delim) {
+        parts.push(cur.join(''))
+        cur = []
+      } else {
+        cur.push(c)
+      }
+      i += 1
+    }
+    if (parts.length === 2) out.push(parts[1]!)
+  }
+  return out
+}
+
+/** `_inplace_edit(toks)`: [files, written text] for `sed -i` / `perl -pi`, else null. */
+function inplaceEdit(toks: string[]): [string[], string] | null {
+  const name = basename(toks[0]!)
+  const args = toks.slice(1)
+  const exprs: string[] = []
+  const pos: string[] = []
+  let inplace = false
+  let i = 0
+  while (i < args.length) {
+    const a = args[i]!
+    if ((a === '-e' || a === '--expression') && i + 1 < args.length) {
+      exprs.push(args[i + 1]!)
+      i += 2
+      continue
+    }
+    if (a.startsWith('--expression=')) {
+      exprs.push(a.slice(a.indexOf('=') + 1))
+    } else if (a.startsWith('--in-place')) {
+      inplace = true
+    } else if ((a === '-f' || a === '--file') && i + 1 < args.length) {
+      i += 2
+      continue
+    } else if (a.startsWith('-') && !a.startsWith('--') && cpLen(a) > 1) {
+      const flags = a.slice(1)
+      if (name === 'perl') {
+        inplace = inplace || flags.includes('i')
+        if (flags.endsWith('e') && i + 1 < args.length) {
+          exprs.push(args[i + 1]!)
+          i += 2
+          continue
+        }
+      } else if (flags.includes('i')) {
+        inplace = true
+        if (a === '-i' && i + 1 < args.length && args[i + 1] === '') {
+          i += 2
+          continue
+        }
+      }
+    } else if (!a.startsWith('--')) {
+      pos.push(a)
+    }
+    i += 1
+  }
+  if (!inplace) return null
+  if (!exprs.length && pos.length) exprs.push(pos.shift()!)
+  const text = exprs.flatMap((e) => sReplacements(e)).join('\n')
+  return [pos.filter((p) => !p.includes('>') && !p.includes('<')), text]
+}
+
+/** `bash_write_targets(cwd, cmd, env)`: [path, text] per file the command visibly writes. */
+export function bashWriteTargets(cwd: string, cmd: string, env: Env): [string, string][] {
+  const [segs] = walkCall(cwd, cmd, env)
+  const bodies = heredocBodies(cmd)
+  const found: [string, string, string][] = []
+  let piped = ''
+  for (const s of segs) {
+    const { toks, text, dir: d } = s
+    const body = HD_OPEN.exec(text) && bodies.length ? bodies.shift()! : null
+    const name = basename(toks[0]!)
+    const prev = s.sep === '|' ? piped : ''
+    piped = ''
+    let outText = ''
+    if (name === 'echo' || name === 'printf') {
+      const said: string[] = []
+      for (const t of toks.slice(1)) {
+        if (t.includes('>')) break
+        if (!(name === 'echo' && pyMatch(String.raw`^-[neE]+$`, t))) said.push(t)
+      }
+      outText = said.join(' ')
+    } else if (name === 'cat' && body !== null) {
+      outText = body
+    }
+    piped = outText
+    let code: string | null = null
+    const isInterp = !!pyMatch(INTERP_RX, name) ||
+      (['uv', 'poetry', 'pipenv'].includes(name) && toks.slice(1).some((t) => !!pyMatch(INTERP_RX, basename(t))))
+    if (isInterp) {
+      if (body !== null) code = body
+      else if (toks.includes('-c') && toks.indexOf('-c') + 1 < toks.length) code = toks[toks.indexOf('-c') + 1]!
+      else if (toks.includes('-e') && name === 'node' && toks.indexOf('-e') + 1 < toks.length) code = toks[toks.indexOf('-e') + 1]!
+    }
+    if (code) {
+      const [paths, lits] = codeWrites(code)
+      for (const p of paths) found.push([d, p, lits])
+    }
+    const blank = Array.from(blankQuoted(text))
+    const tcs = Array.from(text)
+    const map = u2c(text)
+    for (const m of pyFinditer(REDIR_OUT_RX, text)) {
+      const at = map[m.index]!
+      if (blank[at] !== tcs[at]) continue
+      const p = [m[1], m[2], m[3]].find((g) => g) ?? ''
+      found.push([d, p, ['echo', 'printf', 'cat'].includes(name) ? outText : ''])
+    }
+    if (name === 'tee') {
+      for (const t of toks.slice(1)) {
+        if (!t.startsWith('-') && !t.includes('>') && !t.includes('<')) found.push([d, t, body !== null ? body : prev])
+      }
+    } else if (name === 'sed' || name === 'perl') {
+      const got = inplaceEdit(toks)
+      if (got) for (const p of got[0]) found.push([d, p, got[1]])
+    } else if ((name === 'cp' || name === 'mv') && !toks.includes('-t') && !toks.includes('--target-directory')) {
+      const pos = toks.slice(1).filter((t) => !t.startsWith('-') && !t.includes('>'))
+      if (pos.length === 2) found.push([d, pos[1]!, ''])
+    }
+  }
+  const out: [string, string][] = []
+  const seen = new Map<string, number>()
+  for (const [d, p, w] of found) {
+    const path = expandPath(p, d, env)
+    if (!path || path.startsWith('/dev/') || (path + '/').includes('/.git/')) continue
+    const written = cpSlice(w || '', 0, BASH_EDIT_MAX_BYTES)
+    const i = seen.get(path)
+    if (i !== undefined) {
+      if (written && !out[i]![1].includes(written)) {
+        out[i] = [path, stripChars(stripChars(out[i]![1] + '\n' + written, '\n', 'left'), '\n', 'right')]
+      }
+      continue
+    }
+    seen.set(path, out.length)
+    out.push([path, written])
+    if (out.length >= BASH_EDIT_MAX_FILES) break
+  }
+  return out
+}
+
 // ── Python → TS name map ────────────────────────────────────────────────────
 //   rulebook_hook.shell_only                 shellOnly
 //   rulebook_hook._HD_OPEN                   HD_OPEN
@@ -1104,7 +1465,11 @@ export function judgeMatchedOn(
 //   rulebook_hook._sed_lines                 sedLines
 //   rulebook_hook._redirect_base             redirectBase (pure core: + facts)
 //   rulebook_hook._under                     under
-//   rulebook_hook.repo_of_call (cd prefix)   cdPrefixTarget
+//   rulebook_hook.command_root (cd prefix)   cdPrefixTarget
+//   rulebook_hook.expand_path                expandPath (+ env)
+//   rulebook_hook.call_dir / bash_dirs       callDir / bashDirs (+ env)
+//   rulebook_hook.heredoc_bodies             heredocBodies
+//   rulebook_hook.bash_write_targets         bashWriteTargets (+ env)
 //   rulebook_hook.anchor_rx                  anchorRx / anchorPattern
 //   rulebook_hook.anchor_hits                anchorHits
 //   rulebook_hook.path_in_scope              pathInScope

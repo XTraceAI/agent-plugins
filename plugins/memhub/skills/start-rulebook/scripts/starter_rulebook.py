@@ -39,6 +39,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -56,15 +57,28 @@ CMD = r"(?:^|[;&]\s*|\|\s+)"
 # Written without a quantified group: the hook's load lint drops those.
 # `/usr/bin/git` is the same program: a path in front of it is not a way round every git rule.
 GIT = CMD + r"(?:sudo\s+)?(?:\S*/)?git\s+(?:-[cC]\s*\S+\s+)?"
-RX_MAX = 400
+# How a Python tool is launched besides by its bare name: through uv or poetry, options and all
+# (`uv run --extra dev pytest`), uvx (`uvx ruff check`), a venv path (`.venv/bin/pytest`)
+# or the interpreter (`uv run python -m pytest`, `.venv/bin/python3.12 -m mypy`). A receipt that knows
+# only the bare name is a gate the team's own green run never clears: on one repo, 2,082 of 2,290
+# pytest runs were `uv run python -m pytest`. PY_RUN alone is the runner, for `python manage.py test`.
+# The option group IS quantified, but holds no quantified group of its own, so the load lint keeps it.
+PY_RUN = r"(?:(?:uv|poetry) run(?: -\S+(?: \w\S*)?)* |uvx )?"
+PY_LAUNCH = PY_RUN + r"(?:\S*/)?(?:(?:python[\d.]*|\$\w+) -m )?"   # `$PY -m pytest` too
+# The longest pattern the hook loads, read from the hook itself: a copy here sat at 400 for a week
+# after the hook (and the server's MAX_REGEX) moved to 2000, and narrowed every receipt for nothing.
+sys.path.insert(0, str(PLUGIN_SCRIPTS))
+from rulebook_hook import _RX_MAX as RX_MAX  # noqa: E402
+_PY_LAUNCHED = ("pytest", "tox", "nox")   # runners whose pattern is the bare tool, launched via a launcher
 # What the server's rule judge reads when a rule's pattern matches (rule-judge-spec §2): the situation
 # the rule is for, the situations it is not for, what it asks, and why. create_rule refuses a field
 # over its cap, it does not truncate — so the caps are held here, before anything is filed.
 WHEN_MAX, DO_MAX, WHY_MAX, WHEN_NOT_MAX, WHEN_NOT_ENTRIES = 300, 400, 400, 200, 8
 # Appended to a command pattern to make it a RECEIPT: the command, but not an invocation that exits 0
 # having done none of the work — `pytest --version`, `eslint --help`, `pytest --collect-only`.
-_RAN_NOTHING = (r"\b(?![^|;&]*\s(?:--version|-V|--help|-h|--collect-only|--co|--fixtures|--markers|--setup-plan"
-                r"|--listenvs|--list|-list|--showconfig|--show-settings|--print-config|--no-run)(?:\s|=|$))")
+# Factored, not shortened: the same flags, written once each.
+_RAN_NOTHING = (r"\b(?![^|;&]*\s(?:--version|-[Vh]|--help|--co(?:llect-only)?|--fixtures|--markers|--setup-plan"
+                r"|--list(?:envs)?|-list|--show(?:config|-settings)|--print-config|--no-run)(?:\s|=|$))")
 
 _SKIP_DIRS = ("node_modules/", "vendor/", "dist/", "build/", ".venv/", "venv/",
               "__pycache__/", ".git/", "target/", ".next/", "site-packages/")
@@ -107,7 +121,7 @@ def _alt(parts) -> str:
 
 def _fit(prefix: str, extras: list[str], suffix: str = "") -> str:
     """Append alternatives while the whole pattern stays loadable. The hook
-    drops a rule whose pattern passes 400 characters, silently, so a long
+    drops a rule whose pattern passes RX_MAX characters, silently, so a long
     repo-derived list is cut here rather than shipped dead."""
     rx = prefix
     for e in extras:
@@ -119,7 +133,41 @@ def _fit(prefix: str, extras: list[str], suffix: str = "") -> str:
 
 # ───────────────────────────── scan ─────────────────────────────
 
-def scan(repo: Path) -> dict:
+_PR_SUBJECT = re.compile(r"^(?:Merge pull request #\d+\b.*|.*\(#\d+\)\s*)$", re.M)
+
+
+def _pr_landing_branches(repo: Path, skip: str) -> list[str]:
+    """Other remote branches pull requests land on, active in the last 14 days: of its last ten
+    first-parent commits that origin/HEAD lacks, at least three, and 60 % of them, are merge-button
+    merges or squashes (`… (#123)`). The tip alone is not evidence — a merge bot that versions the
+    PR branch leaves a `(#123)` commit on every feature branch — but a feature branch's own commits
+    are its author's. A HINT for the person,
+    never a slot: guarding a branch nobody merges to would block every push to it, so the scan names
+    these and the person passes --default-branch to add one."""
+    # Newest first, then capped: an alphabetical cap cut `staging` off a 276-branch remote.
+    rows = _git(repo, "for-each-ref", "--sort=-committerdate", "--count=200",
+                "--format=%(refname:short)\t%(committerdate:unix)\t%(contents:subject)", "refs/remotes/origin")
+    cutoff = time.time() - 14 * 86400
+    out = []
+    for row in rows.splitlines():
+        ref, _, rest = row.partition("\t")
+        when, _, subject = rest.partition("\t")
+        name = ref.split("/", 1)[-1]
+        if "/" not in ref or name in ("HEAD", skip) or not when.isdigit() or int(when) < cutoff:
+            continue
+        if not _PR_SUBJECT.fullmatch(subject.strip()):
+            continue                    # cheap pre-filter: an integration branch's tip is a landing too
+        # Only commits the default branch lacks: a feature branch cut a few commits ago inherits the
+        # default branch's history, which is all landings. Just after a release an integration branch
+        # has none of its own and goes unnamed; the flag still adds it.
+        own = _git(repo, "log", "--first-parent", "-n", "10", "--format=%s", "refs/remotes/origin/HEAD.." + ref)
+        n = len([s for s in own.splitlines() if s.strip()])
+        if n >= 3 and len(_PR_SUBJECT.findall(own)) >= 0.6 * n:
+            out.append(name)
+    return out
+
+
+def scan(repo: Path, default_branches: list[str] | None = None) -> dict:
     files = _tracked(repo)
     fset = set(files)
     live = [f for f in files if not any(("/" + f).find("/" + d) >= 0 for d in _SKIP_DIRS)]
@@ -139,12 +187,23 @@ def scan(repo: Path) -> dict:
     slots["repo"] = re.sub(r"\.git$", "", remote.rstrip("/").rsplit("/", 1)[-1].rsplit(":", 1)[-1]) \
         if remote else repo.resolve().name
     head = _git(repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
-    if head:
-        branch = head.split("/", 1)[-1]
-        found("branch", "origin/HEAD → %s" % branch, value=branch)
-        slots["default_branch_rx"] = "^(%s)$" % re.escape(branch)
-        slots["default_branch"] = branch
-        slots["default_branch_esc"] = re.escape(branch)
+    branches = list(dict.fromkeys(b.strip() for b in default_branches or [] if b.strip()))
+    if branches:
+        found("branch", "--default-branch → %s" % ", ".join(branches), value=branches[0], branches=branches)
+    elif head:
+        branches = [head.split("/", 1)[-1]]
+        also = _pr_landing_branches(repo, branches[0])
+        found("branch", "origin/HEAD → %s" % branches[0] + (
+            "; pull requests also land on %s — to guard it too, scan again with --default-branch %s"
+            % (", ".join(also), " --default-branch ".join(branches + also)) if also else ""),
+            value=branches[0], branches=branches, also_landing=also)
+    if branches:
+        # All three slots come from the one list, so correcting the branch is one value, not three
+        # hand-edits that must agree. `_esc` sits inside a larger pattern, so it is a group.
+        esc = [re.escape(b) for b in branches]
+        slots["default_branch_rx"] = "^(%s)$" % "|".join(esc)
+        slots["default_branch"] = branches[0]
+        slots["default_branch_esc"] = esc[0] if len(esc) == 1 else "(?:%s)" % "|".join(esc)
     else:
         # No guess. `main|master` on a repo whose default is `trunk` yields a verified gate
         # that guards nothing — worse than no rule, because it reads as protection. The two
@@ -202,18 +261,20 @@ def scan(repo: Path) -> dict:
         before = len(runners)
         if names["pytest.ini"] or names["conftest.py"] or re.search(r"\bpytest\b", py_cfg):
             flags = [r"--cov\b"] + ([r"-m\s+[\"']?(?:%s)" % "|".join(map(re.escape, slow))] if slow else [])
-            runner("pytest", r"(?:uv run |poetry run |python3? -m )?pytest", "pytest", py_targeted,
+            runner("pytest", r"pytest", "pytest", py_targeted,
                    "|".join(flags), "pytest --cov=app")          # --cov and -m are pytest's flags, nobody else's
         if names["tox.ini"] or "[tool.tox" in py_cfg:
-            runner("tox", r"(?:uv run |python3? -m )?tox\b", "tox", py_targeted)
+            runner("tox", r"tox\b", "tox", py_targeted)
         if names["noxfile.py"]:
-            runner("nox", r"(?:uv run |python3? -m )?nox\b", "nox", py_targeted)
+            runner("nox", r"nox\b", "nox", py_targeted)
         if names["manage.py"] and len(runners) == before:
-            runner("django", r"python3? manage\.py test", "python manage.py test", py_targeted)
+            runner("django", PY_RUN + r"(?:\S*/)?python[\d.]* manage\.py test",
+                   "python manage.py test", py_targeted)
         if len(runners) == before:
             test_files = [f for f in live if re.search(r"(^|/)test_[^/]+\.py$", f)][:20]
             if any("unittest" in _read(repo / f, 4000) for f in test_files):
-                runner("unittest", r"python3? -m unittest", "python -m unittest", py_targeted)
+                runner("unittest", PY_RUN + r"(?:\S*/)?python[\d.]* -m unittest",
+                       "python -m unittest", py_targeted)
     if "node" in chains:
         deps = {**(pkg.get("dependencies") or {}), **(pkg.get("devDependencies") or {})} if isinstance(pkg, dict) else {}
         node_targeted = r"\s\S*\.(?:test|spec)\.|\s\S*(?:tests?|__tests__)/|\s-t\s|--testPathPattern"
@@ -249,12 +310,16 @@ def scan(repo: Path) -> dict:
     else:
         missing("toolchain", "no pyproject.toml / package.json / go.mod / Cargo.toml")
     if runners:                                     # no evidenced runner → no slot → every rule that needs one is dropped
-        slots["test_cmd_rx"] = _alt(r["rx"] for r in runners)
+        # pytest / tox / nox share ONE launcher group (as the Python linters do), so it is written once.
+        launched = [r["rx"] for r in runners if r["name"] in _PY_LAUNCHED]
+        others = [r["rx"] for r in runners if r["name"] not in _PY_LAUNCHED]
+        slots["test_cmd_rx"] = _alt(([PY_LAUNCH + _alt(launched)] if launched else []) + others)
+        receipt = slots["test_cmd_rx"] + _RAN_NOTHING
         slots["targeted_rx"] = "|".join(r["targeted"] for r in runners if r["targeted"]) or r"\s--this-repo-has-no-targeted-form\b"
         slots["test_cmd_example"] = runners[0]["example"]
         # What CLEARS a "tests ran" obligation. A targeted run does, on purpose; an invocation that runs no
         # test does not — `pytest --version`, `--help`, `--collect-only` all exit 0 having tested nothing.
-        slots["test_receipt_rx"] = slots["test_cmd_rx"] + _RAN_NOTHING
+        slots["test_receipt_rx"] = receipt
     if slow_content:
         slots["test_slow_content_rx"] = "|".join(c for c, _ in slow_content)
         slots["test_slow_example"] = slow_content[0][1]
@@ -271,17 +336,27 @@ def scan(repo: Path) -> dict:
     else:
         missing("markers", "no test runner with a known slow or coverage tier")
 
-    # lint tooling (repo entrypoint first, raw tool names second)
-    dev_text = (cfg + _read(repo / ".pre-commit-config.yaml") + json.dumps(pkg)
-                + "".join(_read(repo / n) for n in fset if re.fullmatch(r"requirements[^/]*\.txt", n)))
+    # lint tooling (repo entrypoint first, raw tool names second). CI workflows and the Makefile count as
+    # evidence too: a linter the CI runs is one the team runs, whether or not it is a dev dependency.
+    ci_files = [f for f in live if re.fullmatch(r"\.github/workflows/[^/]+\.ya?ml", f)
+                or f in (".gitlab-ci.yml", ".circleci/config.yml")][:20]
+    dev_text = (cfg + _read(repo / ".pre-commit-config.yaml") + json.dumps(pkg) + makefile
+                + "".join(_read(repo / n) for n in fset if re.fullmatch(r"requirements[^/]*\.txt", n))
+                + "".join(_read(repo / f, 100_000) for f in ci_files))
     lint, lint_ex = [], []
     if "lint" in make_targets:
         lint.append("make lint"); lint_ex.append("make lint")
     if "lint" in scripts:
         lint.append(r"(?:npm|pnpm|yarn|bun) run lint"); lint_ex.append("%s run lint" % pm)
-    for tool, rx, ex in (("ruff", r"(?:uv run )?ruff (?:check|format)", "ruff check ."), ("black", "black", "black --check ."),
-                         ("flake8", "flake8", "flake8"), ("mypy", "mypy", "mypy ."), ("pylint", "pylint", "pylint src"),
-                         ("eslint", r"(?:npx )?eslint", "npx eslint ."), ("prettier", r"(?:npx )?prettier", "npx prettier --check ."),
+    # The Python tools share ONE launcher group, so it is written once.
+    py_lint = [(rx, ex) for tool, rx, ex in (("ruff", r"ruff (?:check|format)", "ruff check ."),
+                                              ("black", "black", "black --check ."), ("flake8", "flake8", "flake8"),
+                                              ("mypy", "mypy", "mypy ."), ("pylint", "pylint", "pylint src"))
+               if re.search(r"\b%s\b" % re.escape(tool), dev_text)]
+    if py_lint:
+        lint.append(None)              # the launcher goes in once the rest of the alternation is known
+        lint_ex += [ex for _, ex in py_lint]
+    for tool, rx, ex in (("eslint", r"(?:npx )?eslint", "npx eslint ."), ("prettier", r"(?:npx )?prettier", "npx prettier --check ."),
                          ("biome", r"(?:npx )?biome", "npx biome check"), ("typescript", r"(?:npx )?tsc", "npx tsc --noEmit"),
                          ("golangci-lint", "golangci-lint", "golangci-lint run")):
         if re.search(r"\b%s\b" % re.escape(tool), dev_text):
@@ -292,11 +367,13 @@ def scan(repo: Path) -> dict:
         lint.append(r"cargo (?:clippy|fmt)"); lint_ex.append("cargo clippy")
     if lint:
         found("lint", ", ".join(lint_ex), value=lint_ex)
-        slots["lint_cmd_rx"] = _alt(lint)
+        py_rx = r"(?:%s)\b" % "|".join(rx for rx, _ in py_lint) if py_lint else ""
+        slots["lint_cmd_rx"] = _alt([PY_LAUNCH + py_rx if x is None else x for x in lint])
         slots["lint_receipt_rx"] = slots["lint_cmd_rx"] + _RAN_NOTHING     # `eslint --version` checked no code
         slots["lint_cmd_example"] = lint_ex[0]
     else:
-        missing("lint", "no linter or formatter in dev dependencies, pre-commit, Makefile or package scripts")
+        missing("lint", "no linter or formatter in dev dependencies, pre-commit, Makefile, CI workflows "
+                        "or package scripts")
 
     # manifests + lock tool
     manifest_names = ["pyproject.toml", "package.json", "go.mod", "Cargo.toml", "Gemfile"]
@@ -859,6 +936,9 @@ def main() -> int:
     ap.add_argument("--all-repos", action="store_true",
                     help="leave scope_repos empty so the rules bind every repo the rulebook's members work in")
     ap.add_argument("--replay", help="attach-evidence: the proposals.json of the mine_sessions.py run that replayed these candidates")
+    ap.add_argument("--default-branch", action="append", default=[], metavar="NAME",
+                    help="scan/all: a branch the push rules guard, in place of origin/HEAD (repeatable: "
+                         "--default-branch main --default-branch staging guards both)")
     args = ap.parse_args()
     out = Path(args.out)
     if args.step == "attach-evidence":
@@ -879,7 +959,7 @@ def main() -> int:
     catalog = json.loads(Path(args.catalog).read_text(encoding="utf-8"))
 
     if args.step in ("scan", "all"):
-        signals = scan(Path(args.repo))
+        signals = scan(Path(args.repo), args.default_branch)
         (out / "signals.json").write_text(json.dumps(signals, indent=2))
     else:
         signals = json.loads((out / "signals.json").read_text())

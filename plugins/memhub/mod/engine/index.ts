@@ -109,6 +109,12 @@ export interface EngineIO {
   /** $HOME, for `~` and the identity redaction. */
   home: string
   env(): Promise<EngineEnv>
+  /**
+   * One variable of the environment the Python hook would see (`os.environ`),
+   * for a Bash command's `cd "$WT"` / `> $OUT/f`; undefined when unset. Absent:
+   * no variable but HOME expands, and a path naming one is unknown.
+   */
+  getenv?(name: string): Promise<string | undefined>
   /** `rulebook_mod_cli.py paths --cwd <dir>`; undefined when it cannot answer. */
   paths(dir: string): Promise<PathsInfo | undefined>
   /** One write through `rulebook_mod_state.py`; undefined when the helper failed as a whole. */

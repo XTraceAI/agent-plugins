@@ -9,7 +9,9 @@ wrong in ways nobody sees until it is live and nagging the whole team:
   * it still fires after the author fixes the thing it asked for, so complying
     with the rule does not silence it;
   * its pattern is too long or backtracks, so the hook drops the WHOLE rule at
-    load time — silently, on every teammate's machine.
+    load time — silently, on every teammate's machine;
+  * its pattern loads but costs time quadratic in the text (an unanchored
+    leading lookahead), so every matching tool call stalls behind it.
 
 So this runs the candidate through `rulebook_hook.to_hook_rule()`,
 `evaluate()`, `given_ok()` and `OrderingEngine` — the same code the live hook
@@ -66,6 +68,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import tempfile
 
@@ -280,6 +283,72 @@ def _load_failure(rule: dict, out: list[str]) -> None:
         out.append("             no engine block, or two of them, or a missing id")
 
 
+# Measured over every pattern in the starter catalog and seven live books (263):
+# the linear ones took <= 2.3 ms on these texts, the two quadratic ones 849 and
+# 1768 ms. The bound sits between them with a 20x margin either way.
+_SLOW_MS = 50
+_PROBE_CHARS = 16000
+_PROBE_TIMEOUT_S = 10
+# A child times each pattern and prints one JSON line as each finishes: stdlib
+# `re` has no timeout, so a pattern that never returns is the one with no line.
+_PROBE_CHILD = r"""
+import json, re, sys, time
+n = int(sys.argv[1])
+line = "    value = compute(item, index) + offset  # tally\n"
+texts = [(line * (n // len(line) + 1))[:n], ("value compute item index offset tally " * (n // 38 + 1))[:n]]
+for pat in json.loads(sys.stdin.read()):
+    worst = 0.0
+    for flags in (re.I | re.M, re.I):
+        try:
+            rx = re.compile(pat, flags)
+        except re.error:
+            continue
+        for text in texts:
+            t0 = time.perf_counter(); rx.search(text); worst = max(worst, time.perf_counter() - t0)
+    print(json.dumps([pat, worst * 1000]), flush=True)
+"""
+
+
+def _patterns(node, key: str = ""):
+    """Every regex a create_rule body carries, in matcher, given and ordering alike."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            yield from _patterns(v, k)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _patterns(v, key)
+    elif isinstance(node, str) and key.endswith("_rx"):
+        yield key, node
+
+
+def _slow_patterns(rule: dict) -> list:
+    """[(key, pattern, ms, or None if it never finished)] for each pattern over the bound.
+
+    Timed on texts it does not match: a failing search tries every offset,
+    which is where a quadratic pattern pays, and it is the common case live."""
+    pats: dict = {}
+    for key, pat in _patterns({k: rule.get(k) for k in ("matcher", "ordering")}):
+        pats.setdefault(pat, key)
+    if not pats:
+        return []
+    try:
+        p = subprocess.run([sys.executable, "-c", _PROBE_CHILD, str(_PROBE_CHARS)],
+                           input=json.dumps(list(pats)), capture_output=True, text=True,
+                           timeout=_PROBE_TIMEOUT_S)
+        lines = p.stdout
+    except subprocess.TimeoutExpired as exc:
+        lines = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+    timed = {}
+    for line in lines.splitlines():
+        try:
+            pat, ms = json.loads(line)
+        except ValueError:
+            continue
+        timed[pat] = ms
+    return [(key, pat, timed.get(pat)) for pat, key in pats.items()
+            if pat not in timed or timed[pat] > _SLOW_MS]
+
+
 def verify(rule: dict, fires: list, silent: list,
            fixture: dict | None = None) -> tuple[bool, bool, list[str]]:
     """(every case behaved, the rule is fire-testable at all, the report lines).
@@ -337,6 +406,23 @@ def verify(rule: dict, fires: list, silent: list,
         _load_failure(rule, out)
         return False, False, out
     out.append("LOAD   ok    the hook loads it (patterns compile, within bounds)")
+
+    # 2. The speed gate. `rx_ok` is a shape denylist, and it passes a pattern
+    #    whose cost is quadratic in the text: an unanchored leading lookahead,
+    #    retried at every offset. The hook runs it on every matching call
+    #    inside a 5 s timeout, so each call stalls and a large enough write
+    #    times out the whole hook.
+    slow = _slow_patterns(rule)
+    if slow:
+        for key, pat, ms in slow:
+            took = "did not finish in %d s" % _PROBE_TIMEOUT_S if ms is None else "took %d ms" % ms
+            out.append("SPEED  FAIL  %s %s on a %d KB text it does not match (the bound is %d ms); "
+                       "the hook runs it on every matching call: %s"
+                       % (key, took, _PROBE_CHARS // 1000, _SLOW_MS, pat[:80]))
+        out.append("             usual cause: a lookahead at the start, `(?=[\\s\\S]*X)Y`, retried at "
+                   "every offset. Pin it: `\\A(?=[\\s\\S]*X)[\\s\\S]*?Y` (X anywhere, Y anywhere)")
+        return False, False, out
+    out.append("SPEED  ok    every pattern runs in linear time on a %d KB text" % (_PROBE_CHARS // 1000))
 
     if hook_rule.get("on") == "session":
         out.append("NOTE         a session_context rule has no matcher — nothing to fire-test")

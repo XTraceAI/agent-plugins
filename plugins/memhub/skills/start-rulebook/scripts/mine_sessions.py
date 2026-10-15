@@ -14,18 +14,21 @@ Each row also carries `context` — the `when` / `do` / `why` / `when_not` the s
 Friction delta: --baseline-date splits facet friction before/after a rulebook change.
 
 Stdlib + the memhub plugin's readers + the real hook evaluate() (never re-implemented).
+A session is its own transcript plus its subagents' (their calls fire rules too; their prompts are not the person's),
+placed in a repo by its cwd — remembered across runs, so a deleted worktree still counts for its repo.
+Replays run in parallel where the OS can fork; the report is the same either way.
 Window: the last 30 days of sessions by default (--days N), by each transcript's LAST activity. --all reads everything
 and is for when the person asks for it: a rule should answer to how the team works now, and an old corpus is slow to read.
 
-Usage: mine_sessions.py [--out DIR] [--days N | --all] [--baseline-date YYYY-MM-DD] [--skills-file list_skills.json] [--repo NAME]
+Usage: mine_sessions.py [--out DIR] [--days N | --all] [--baseline-date YYYY-MM-DD] [--skills-file list_skills.json] [--repo NAME|PATH]
 """
-import sys, os, json, re, glob, collections, importlib.util, time, argparse, datetime, shlex, functools
+import sys, os, json, re, glob, collections, importlib.util, time, argparse, datetime, shlex, functools, subprocess
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--out", default="mine-out")
 ap.add_argument("--baseline-date", help="friction before vs after this date (rule activation day)")
 ap.add_argument("--skills-file", help="memhub list_skills JSON reply, for skill-lane dedup")
-ap.add_argument("--repo", help="only sessions in this repo (resolved, so a worktree counts)")
+ap.add_argument("--repo", help="only sessions in this repo: its name, or a path inside it (resolved, so a worktree counts)")
 ap.add_argument("--days", type=int, default=None, help="only sessions active in the last N days (default 30; widened automatically so a --baseline-date keeps 30 days of 'before')")
 ap.add_argument("--all", action="store_true", help="every session on this machine, however old — only when the person asks for it")
 ap.add_argument("--claude-md", action="append", default=[], help="CLAUDE.md (repeatable): its imperative sentences become the declared-rule seed")
@@ -106,57 +109,151 @@ def _in_window(p):
     fresh = seen >= _cutoff
     skipped_old += not fresh
     return fresh
+# Claude Code keeps its transcripts under CLAUDE_CONFIG_DIR when that is set, and reads ~/.claude only when it is not.
+CLAUDE_DIR = os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude")
 def sessions():
-    for host, pat in (("claude", "~/.claude/projects/*/*.jsonl"), ("codex", "~/.codex/sessions/*/*/*/rollout-*.jsonl"),
+    for host, pat in (("claude", os.path.join(CLAUDE_DIR, "projects", "*", "*.jsonl")), ("codex", "~/.codex/sessions/*/*/*/rollout-*.jsonl"),
                       ("cursor", "~/.cursor/chats/*/*/store.db"), ("cursor", "~/.cursor/projects/*/agent-transcripts/*/*.jsonl")):
         for p in glob.glob(os.path.expanduser(pat)):
             if _in_window(p): yield host, p
 R = {"claude": claude, "codex": codex, "cursor": cursor}
 corpus, errs = [], collections.Counter()
-def _repo_name(cwd):
-    """The repo a transcript's cwd belongs to. `repo_identity` lives beside the
-    hook, which this script already imports as `rh`. Not kept across runs: its
-    fallback (the directory's basename) cannot be told apart from a resolved
-    name, and a kept wrong name would drop sessions from `--repo` for good."""
+import repo_identity as _rid  # noqa: E402  (beside the hook, on the path set above)
+# cwd -> repo, kept across runs so a session still resolves once its worktree is deleted (most worktrees are, and a
+# deleted one's cwd answers nothing). Only names git itself settled are kept: the basename fallback cannot be told
+# apart from a real name, and a kept wrong name would drop sessions from `--repo` for good.
+_repo_cache = _load_cache("repos.json", {})
+_resolved = {}
+def _resolve(d):
+    if d not in _resolved: _resolved[d] = _rid.resolve(d)
+    return _resolved[d]
+def _repo_of(cwd):
+    """(repo, how) for a transcript's cwd. A live directory asks git. A deleted one is read from the cache, else from
+    its nearest surviving parent when that is inside a repo (`<repo>/.claude/worktrees/<name>`). None when neither
+    answers; the branch test below may still place it."""
+    cwd = cwd.rstrip("/") or "/"
+    if os.path.isdir(cwd):
+        name, settled = _resolve(cwd)
+        if settled: _repo_cache[cwd] = name
+        return name, "live"
+    if cwd in _repo_cache: return _repo_cache[cwd], "cache"
+    home, a = os.path.expanduser("~"), os.path.dirname(cwd)
+    while a not in ("", "/", home):
+        if os.path.isdir(a):
+            name, settled = _resolve(a)
+            if not settled: return None, "gone"
+            _repo_cache[cwd] = name   # git answered for the parent; a branch match (below) is an inference and is not kept
+            return name, "parent"
+        a = os.path.dirname(a)
+    return None, "gone"
+def _sniff(path):
+    """(cwd, branch) off a Claude Code transcript's first records — enough to place it in a repo without parsing it."""
+    cwd = branch = None
     try:
-        from repo_identity import repo_name
-        return repo_name(cwd.rstrip("/"))
-    except Exception:
-        return os.path.basename(cwd.rstrip("/"))
-
-
-for host, path in sessions():
-    try: recs, meta = R[host].to_canonical(path)
-    except Exception: errs[host] += 1; continue
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for i, line in enumerate(f):
+                if i >= 200 or (cwd and branch): break
+                try: r = json.loads(line)
+                except ValueError: continue
+                if not isinstance(r, dict): continue
+                cwd = cwd or (r.get("cwd") if isinstance(r.get("cwd"), str) else None)
+                b = r.get("gitBranch")
+                branch = branch or (b if isinstance(b, str) and b not in ("", "HEAD") else None)
+    except OSError: pass
+    return cwd, branch
+def _walk(recs, keep_users=True):
+    """users, calls, results, result_calls, first timestamp — one transcript, as the hook would see its calls."""
     users, calls, results, result_calls, ts = [], [], [], [], None
     call_by_use = {}
     for r in recs:
         ts = ts or r.get("timestamp")
         m = r.get("message") or {}; c = m.get("content")
-        if r.get("type") == "user" and isinstance(c, str) and not c.startswith("<"): users.append(c)
+        if keep_users and r.get("type") == "user" and isinstance(c, str) and not c.startswith("<"): users.append(c)
         if isinstance(c, list):
             for b in c:
                 if not isinstance(b, dict): continue
-                if r.get("type") == "user" and b.get("type") == "text" and not str(b.get("text", "")).startswith("<"): users.append(b.get("text", ""))
+                if keep_users and r.get("type") == "user" and b.get("type") == "text" and not str(b.get("text", "")).startswith("<"): users.append(b.get("text", ""))
                 if b.get("type") == "tool_use":
-                    i = b.get("input") or {}; n = b.get("name", ""); cmd = ""; fp = str(i.get("file_path", "")); body = str(i.get("new_string", "")) + str(i.get("content", ""))
+                    i = b.get("input") or {}; n = b.get("name", ""); cmd = ""; fp = str(i.get("file_path", "")); added = None
+                    # The edit body and what it ADDED, built the way the live hook's pre lane builds them: a
+                    # MultiEdit's `edits` count, and a content rule reads only the lines an edit added.
+                    body = str(i.get("new_string", "")) + str(i.get("content", "")) + \
+                        "\n".join(str(e.get("new_string", "")) for e in (i.get("edits") or []) if isinstance(e, dict))
+                    if n in rh.EDIT_TOOLS and hasattr(rh, "edit_added_text"): added = rh.edit_added_text(i)
                     if n == "Bash": cmd = str(i.get("command", ""))
                     elif n in ("exec_command", "shell_command"): n = "Bash"; cmd = str(i.get("cmd") or i.get("command") or "")   # Codex, as codex_hook_bridge maps it
                     elif n == "apply_patch":
                         n = "Write"; patch = str(i.get("input", "")); mm = re.search(r"\*\*\* (?:Update|Add) File: (.+)", patch); fp = mm.group(1).strip() if mm else ""; body = patch
-                    calls.append({"tool": n, "cmd": cmd, "path": fp, "body": body, "n": len(calls)})
+                    calls.append({"tool": n, "cmd": cmd, "path": fp, "body": body, "added": added, "ts": r.get("timestamp") or "", "n": len(calls)})
                     if b.get("id"): call_by_use[b["id"]] = (n, cmd)
                 if b.get("type") == "tool_result":
                     cc = b.get("content"); results.append(cc if isinstance(cc, str) else " ".join(str(x.get("text", "")) for x in cc if isinstance(x, dict)))
                     result_calls.append(call_by_use.get(b.get("tool_use_id")) or ("", ""))   # empty where the host does not link them
-    cwd = meta.get("cwd") or (recs[0].get("cwd") if recs else "") or ""
-    # The REPO, not the directory: a session run in a worktree would otherwise
-    # propose rules scoped to the branch name, which bind nobody (the server
-    # matches `scope_repos` by exact string).
-    repo = _repo_name(cwd) if cwd else "?"
+    return users, calls, results, result_calls, ts
+def _subagent_files(host, path):
+    """A Claude Code session's subagents write their own transcripts beside it: <session>/subagents/agent-*.jsonl."""
+    return sorted(glob.glob(os.path.join(os.path.splitext(path)[0], "subagents", "*.jsonl"))) if host == "claude" else []
+
+# Place every transcript in a repo BEFORE parsing it: a --repo run parses only its own repo's sessions.
+placed, parsed, how = [], {}, collections.Counter()
+for host, path in sessions():
+    if host == "claude": cwd, branch = _sniff(path)
+    else:   # Codex / Cursor carry their cwd in a format only the reader knows; they are few, so parse them now
+        try: parsed[path] = R[host].to_canonical(path)
+        except Exception: errs[host] += 1; continue
+        recs, meta = parsed[path]; cwd, branch = meta.get("cwd") or (recs[0].get("cwd") if recs else "") or "", None
+    repo, h = _repo_of(cwd) if cwd else ("?", "no cwd")
+    placed.append([host, path, cwd, branch, repo, h])
+# A deleted cwd no parent answers for: its branch, when exactly one live repo has a branch by that name. `main`
+# is in every repo, so it places nothing — only a branch unique to one repo does.
+_branch_sets = {}
+def _branches(repo_dir):
+    if repo_dir not in _branch_sets:
+        try:
+            out = subprocess.run(["git", "-C", repo_dir, "for-each-ref", "--format=%(refname:lstrip=2)", "refs/heads", "refs/remotes"],
+                                 capture_output=True, text=True, timeout=10).stdout.split()
+        except (OSError, subprocess.SubprocessError): out = []
+        _branch_sets[repo_dir] = {b.split("/", 1)[1] if b.startswith("origin/") else b for b in out}
+    return _branch_sets[repo_dir]
+_live_dir = {}
+for row in placed:
+    if row[5] == "live" and row[4] not in _live_dir: _live_dir[row[4]] = row[2]
+for row in placed:
+    if row[5] != "gone": continue
+    hits = [name for name, d in _live_dir.items() if row[3] and row[3] in _branches(d)] if row[3] else []
+    row[4], row[5] = (hits[0], "branch") if len(hits) == 1 else (os.path.basename(row[2].rstrip("/")), "basename")
+for row in placed: how[row[5]] += 1
+_save_cache("repos.json", _repo_cache)
+if args.repo and (os.sep in args.repo or os.path.isdir(os.path.expanduser(args.repo))):   # a path names its repo, as a session's cwd does
+    _want = _repo_of(os.path.abspath(os.path.expanduser(args.repo)))[0] or os.path.basename(args.repo.rstrip("/"))
+    print(f"--repo {args.repo} -> {_want}")
+    args.repo = _want
+subagent_files = subagent_calls = 0
+for host, path, cwd, branch, repo, h in placed:
     if args.repo and repo != args.repo: continue
+    try: recs, meta = parsed.pop(path, None) or R[host].to_canonical(path)
+    except Exception: errs[host] += 1; continue
+    users, calls, results, result_calls, ts = _walk(recs)
+    stamp = f"{len(users)}u{len(calls)}c{len(results)}r"   # the session's OWN turns: a facet is read off them, so folding subagents in leaves it fresh
+    main_calls, main_results = calls, results
+    # Subagent calls are the session's calls: the live hook fires on them, and an ordering receipt run inside a
+    # subagent discharges the parent's obligation (it is keyed by worktree, not agent). Their "user" turns are the
+    # parent's prompt, not the person, so they are left out.
+    subs = []
+    for sp in _subagent_files(host, path):
+        try: srecs, _ = R[host].to_canonical(sp)
+        except Exception: continue
+        _, sc, sr, src, _ = _walk(srecs, keep_users=False)
+        subs.append((sc, sr, src)); subagent_files += 1; subagent_calls += len(sc)
+    if subs:
+        merged = calls + [c for sc, _, _ in subs for c in sc]
+        if all(c["ts"] for c in merged): merged.sort(key=lambda c: c["ts"])   # ISO stamps sort in time order; the sort is stable
+        calls = [dict(c, n=k) for k, c in enumerate(merged)]
+        results = results + [t for _, sr, _ in subs for t in sr]
+        result_calls = result_calls + [rc for _, _, src in subs for rc in src]
     sid = meta.get("session_id") or os.path.splitext(os.path.basename(path))[0]
-    corpus.append({"id": sid, "host": host, "repo": repo, "start": (ts or "")[:10], "users": users, "calls": calls, "results": results, "result_calls": result_calls})
+    corpus.append({"id": sid, "host": host, "repo": repo, "start": (ts or "")[:10], "users": users, "calls": calls, "results": results,
+                   "result_calls": result_calls, "main_calls": main_calls, "main_results": main_results, "stamp": stamp})
 CORRECTION = re.compile(r"^(no|nope|wrong|wait|stop)\b|\b(not what i|why did (u|you)|did (u|you) (just )?|actually (read|test|run|check|do)|i said|i meant|revert that|undo that|is (all )?stale|u should|you should|read the (actual|real)|check the (live|actual|latest|agent|other)|this is (prod|staging)|not (prod|staging)|don'?t (code|merge|push|delete|guess)|plan first)\b", re.I)
 PASTED = re.compile(r"^(Base directory for this skill|Approach this as|<command-message>|<task-notification>|This session is being continued)", re.I)
 ERROR = re.compile(r"Traceback \(most recent call last\)|^Exit code [1-9]|\bexit code [1-9]\b|ModuleNotFoundError|FAILED \(|\d+ failed\b|Permission denied|command not found|<tool_use_error>", re.M)
@@ -166,19 +263,21 @@ def digest(s):
     """Compact, LLM-readable summary of one session — user turns (corrections marked), errors, reverts. ~1-2k chars."""
     turns = [u.strip().replace("\n", " ") for u in s["users"] if u.strip() and not PASTED.search(u.strip()) and len(u) < 1500]   # skip skill preambles / pasted docs
     corr = [t for t in turns if CORRECTION.search(t[:200])]
-    errs = [t.replace("\n", " ")[:160] for t in s["results"] if ERROR.search(t)]
-    rev = [c["cmd"].replace("\n", " ")[:120] for c in s["calls"] if c["cmd"] and REVERT.search(c["cmd"])]
-    tools = collections.Counter(c["tool"] for c in s["calls"])
+    errs = [t.replace("\n", " ")[:160] for t in s["main_results"] if ERROR.search(t)]
+    rev = [c["cmd"].replace("\n", " ")[:120] for c in s["main_calls"] if c["cmd"] and REVERT.search(c["cmd"])]
+    tools = collections.Counter(c["tool"] for c in s["main_calls"])
     stds = [t for t in turns if STANDARD.search(t[:300])]
     score = 3 * len(corr) + min(len(errs), 10) + 2 * len(rev) + 2 * min(len(stds), 5)
     return {"session_id": s["id"], "stamp": _stamp[s["id"]], "host": s["host"], "repo": s["repo"], "start": s["start"], "score": score,
             "first_prompt": (turns[0] if turns else "")[:300],
             "user_turns": [{"i": i, "correction": bool(CORRECTION.search(t[:200])), "standard": bool(STANDARD.search(t[:300])), "text": t[:220]} for i, t in enumerate(turns[:25])],
             "tool_counts": dict(tools), "errors": errs[:4], "reverts": rev[:4]}
-_stamp = {s["id"]: f"{len(s['users'])}u{len(s['calls'])}c{len(s['results'])}r" for s in corpus}   # grows when a session does — a resumed turn, or a result that landed after its call: a facet read off an older stamp is stale
+_stamp = {s["id"]: s["stamp"] for s in corpus}   # grows when a session does — a resumed turn, or a result that landed after its call: a facet read off an older stamp is stale
 digests = sorted((digest(s) for s in corpus), key=lambda d: -d["score"])
 M = len(corpus); by_host = collections.Counter(s["host"] for s in corpus)
 print(f"sessions read: {dict(by_host)} (M={M})  read errors: {dict(errs)}  ({time.time()-t0:.0f}s)")
+print(f"subagents: {subagent_files} subagent transcripts folded into their sessions ({subagent_calls} tool calls)")
+print("repo placement: " + ", ".join(f"{k} {v}" for k, v in how.most_common()) + "  (live = cwd still on disk; cache / parent / branch = a deleted cwd placed; basename = a deleted cwd nothing placed)")
 print("window: every session on this machine (--all)" if WINDOW_DAYS is None else
       f"window: sessions active in the last {WINDOW_DAYS} days — {skipped_old} older transcripts not read (any repo). --days N widens it; --all reads everything")
 if WINDOW_DAYS is None or not 1 <= WINDOW_DAYS <= 365:   # the server takes window_days 1..365 (ENG-1158); another window is not rounded to fit
@@ -252,12 +351,14 @@ def _facet_in_window(d):
     if WINDOW_DAYS is None and not args.repo: return True   # --all lifts the AGE cutoff only; a --repo run is still about that repo
     sid = str(d.get("session_id") or "")
     return bool(sid) and (sid in _in_corpus or (len(sid) >= 8 and any(full.startswith(sid) for full in _in_corpus)))
-insights_skipped = 0
-for f in glob.glob(os.path.expanduser("~/.claude/usage-data/facets/*.json")):   # optional extra seed if Claude Code /insights was ever run
+insights_skipped = insights_dup = 0
+for f in glob.glob(os.path.join(CLAUDE_DIR, "usage-data", "facets", "*.json")):   # optional extra seed if Claude Code /insights was ever run
     try: d = json.load(open(f)); d.setdefault("source", "insights")
     except Exception: continue
-    if _facet_in_window(d): facets.append(d)
-    else: insights_skipped += 1
+    if not _facet_in_window(d): insights_skipped += 1
+    elif corpus_id(d.get("session_id")) in _fresh: insights_dup += 1   # your facet already reads this session: a second reading would count its friction twice
+    else: facets.append(d)
+if insights_dup: print(f"facets: {insights_dup} /insights facets left out — your own facets already read those sessions")
 if insights_skipped: print(f"window: {insights_skipped} /insights facets left out — their sessions are outside the window (or no longer on disk)")
 _start_full = {s["id"]: s["start"] for s in corpus}
 def start_of_id(sid):
@@ -469,10 +570,10 @@ def replay(rule, requires_prior_rx=None):
                     except Exception: ok = False
                     if ok: break
             else:
-                tool_n = "Bash" if cl["tool"] == "Bash" else ("Write" if cl["tool"] in EDIT else None)
+                tool_n = cl["tool"] if cl["tool"] == "Bash" or cl["tool"] in EDIT else None   # the real tool: a `write_stdlib` rule fires on Write alone
                 if not tool_n: continue
                 if requires_prior_rx and cl["cmd"] and re.search(requires_prior_rx, cl["cmd"]): prior = True
-                try: ok = rh.evaluate(rule, hook_phase="pre", tool=tool_n, cmd=cl["cmd"], file_path=cl["path"], body=cl["body"])
+                try: ok = rh.evaluate(rule, hook_phase="pre", tool=tool_n, cmd=cl["cmd"], file_path=cl["path"], body=cl["body"], added=cl.get("added"))
                 except Exception: ok = False
             if ok:
                 calls[s["host"]] += 1
@@ -669,26 +770,76 @@ def replay_result(rule):
     return {"calls": dict(calls), "fired": dict(sess), "fired_n": sum(sess.values()), "fired_ids": ids, "real_misses": None, "samples": ex}
 
 
+
+# ---- every replay at once. Each is one rule over the whole corpus and shares nothing with the next, so they run in
+# forked workers that inherit the corpus instead of being sent it. The results land in a cache the three functions
+# read first: the pool is only ever a head start, and with no fork (Windows) or any failure each replay simply runs
+# where it is asked for, as before.
+import inspect, multiprocessing  # noqa: E402
+_replayed, _JOBS = {}, []
+def _replay_key(fn, a):
+    bound = inspect.signature(fn).bind(*a); bound.apply_defaults()
+    return fn.__name__, json.dumps(list(bound.arguments.values()), sort_keys=True, default=str)
+def _cached(fn):
+    @functools.wraps(fn)
+    def w(*a):
+        k = _replay_key(fn, a)
+        if k not in _replayed: _replayed[k] = fn(*a)
+        return _replayed[k]
+    w.raw = fn
+    return w
+replay, replay_result, replay_ordering = _cached(replay), _cached(replay_result), _cached(replay_ordering)
+def _run_job(i):
+    fn, a = _JOBS[i]
+    return fn.raw(*a)
+def _prefetch(jobs):
+    jobs = list({_replay_key(fn.raw, a): (fn, a) for fn, a in jobs if _replay_key(fn.raw, a) not in _replayed}.values())
+    workers = min(len(jobs), os.cpu_count() or 1, 6)   # each worker's copy of the corpus grows as it reads it; six keeps that bounded
+    if workers < 2 or "fork" not in multiprocessing.get_all_start_methods(): return
+    _JOBS[:] = jobs
+    try:
+        with multiprocessing.get_context("fork").Pool(workers) as pool:
+            for (fn, a), res in zip(jobs, pool.map(_run_job, range(len(jobs)), chunksize=1)):
+                _replayed[_replay_key(fn.raw, a)] = res
+    except Exception as e:
+        print(f"[warn] parallel replay unavailable ({type(e).__name__}: {e}) — replaying one rule at a time", file=sys.stderr)
+    finally:
+        _JOBS.clear()
+
+
 # ---- rules already on: did they fire in your past sessions?
-# With --repo, THIS repo's cached book alone. The cache also holds books for other
-# repos and for e2e fixtures, and unioning them credits this repo with rules that
-# never reach it — a stale fixture book put "Name variables in camelCase" into a
-# Python repo's panel with 112 calls behind it.
-book_files = ([rh.book_path(args.repo)] if args.repo and hasattr(rh, "book_path")
-              else glob.glob(os.path.join(getattr(rh, "BASE", os.path.expanduser("~/.config/memhub-plugin/rulebook")),
-                                          "book", "*.json")))   # this install's books only (keyed by backend)
-book = []
+# The books of the repos these sessions are in — with --repo, that repo's alone. The cache also holds books for
+# throwaway repos and e2e fixtures, fetched once and never again: unioning them credits these sessions with rules
+# that never reach them (a stale fixture book put "Name variables in camelCase" into a Python repo's panel with 112
+# calls behind it), and keeps replaying a rule long after it was superseded.
+if hasattr(rh, "book_path"):
+    book_files = [f for f in dict.fromkeys(rh.book_path(r) for r in ([args.repo] if args.repo else sorted({s["repo"] for s in corpus})))
+                  if os.path.isfile(f)]
+else:
+    book_files = glob.glob(os.path.join(getattr(rh, "BASE", os.path.expanduser("~/.config/memhub-plugin/rulebook")), "book", "*.json"))
+book_files.sort(key=lambda f: os.path.getmtime(f))   # oldest first, so the latest fetch of a rule is the one kept
+seen = {}
 for f in book_files:
-    try: book += json.load(open(f)).get("rules", [])
-    except Exception: pass
-seen = {}; live = []
-for r in book:   # several cached books (one per repo) can hold different versions of one rule: keep the newest per title
-    title = r.get("title") if isinstance(r, dict) else None
-    if not title or r.get("delivery") != "agent_hook": continue   # a partial/corrupt cache row is skipped, not fatal
-    try: ver = int(r.get("version") or 0)
-    except (TypeError, ValueError): ver = 0
-    if title in seen and seen[title] >= ver: continue
-    seen[title] = ver; live = [x for x in live if x.get("title") != title] + [r]
+    try: rules = json.load(open(f)).get("rules", [])
+    except Exception: continue
+    for r in rules:   # several repos' books can hold one rule at different versions; a superseding rule keeps the title
+        title = r.get("title") if isinstance(r, dict) else None
+        if not title or r.get("delivery") != "agent_hook": continue   # a partial/corrupt cache row is skipped, not fatal
+        seen.pop(title, None); seen[title] = r
+live = list(seen.values())
+_jobs = []   # what the two report sections below will ask for, in the same argument forms
+for r in live:
+    hr = rh.to_hook_rule(r); on = (hr or {}).get("on")
+    if on in ("bash", "edit", "write_stdlib", "result"): _jobs.append((replay_result, (hr,)) if on == "result" else (replay, (hr,)))
+    elif on == "ordering" and isinstance(hr.get("ordering"), dict):
+        o = hr["ordering"]; lane = arming_lane(o.get("armed_by_events") or ["edit"])
+        if lane != "prompt": _jobs.append((replay_ordering, (o.get("required_command_rx") or "", o.get("gated_command_rx") or "", lane, o.get("min_edits", 1))))
+for c in RULE_CANDS:
+    hr = hook_rule(c["title"], c["matcher"])
+    if hr: _jobs.append((replay, (hr, c.get("requires_prior_rx"))))
+for c in ORDERING_CANDS:
+    if c["armed_by"] != "prompt": _jobs.append((replay_ordering, (c["required_rx"], c["gated_rx"], c["armed_by"], c.get("min_edits", 1))))
+_t_replay = time.time(); _prefetch(_jobs)
 print(f"\n=== RULES ALREADY ON — {len(live)} hook rules in your book, replayed over your {M} past sessions (one that never fired is a retire candidate)")
 for r in live:
     hr = rh.to_hook_rule(r); on = (hr or {}).get("on")
@@ -799,7 +950,7 @@ if declared_unbroken:
 
 # ---------------------------------------------------------------- skills your team keeps retyping
 installed = set()
-for pat in ("~/.claude/plugins/cache/*/*/*/skills/*/SKILL.md", "~/.claude/plugins/*/plugins/*/skills/*/SKILL.md", "~/.claude/skills/*/SKILL.md", ".claude/skills/*/SKILL.md", "~/.codex/skills/*/SKILL.md", "~/.cursor/skills/*/SKILL.md"):
+for pat in (os.path.join(CLAUDE_DIR, "plugins/cache/*/*/*/skills/*/SKILL.md"), os.path.join(CLAUDE_DIR, "plugins/*/plugins/*/skills/*/SKILL.md"), os.path.join(CLAUDE_DIR, "skills/*/SKILL.md"), ".claude/skills/*/SKILL.md", "~/.codex/skills/*/SKILL.md", "~/.cursor/skills/*/SKILL.md"):
     installed |= {os.path.basename(os.path.dirname(p)) for p in glob.glob(os.path.expanduser(pat))}
 if args.skills_file:
     try: installed |= {x["name"] for x in json.load(open(args.skills_file)).get("skills", [])}
@@ -904,6 +1055,6 @@ for w in wf_rows:
 open(os.path.join(grabs_dir, "Makefile.suggested"), "w").write("\n".join(mk))
 print(f"\ngrabs written to {grabs_dir}/: claude-md-additions.md, hooks.settings.json, Makefile.suggested — copyable now, filable in the report step")
 
-json.dump([{k: v for k, v in s.items() if k != "results"} for s in corpus], open(os.path.join(args.out, "corpus.json"), "w"))
+json.dump([{k: v for k, v in s.items() if k not in ("results", "main_calls", "main_results")} for s in corpus], open(os.path.join(args.out, "corpus.json"), "w"))   # `calls` already holds the session's own
 json.dump(proposals + proposals_seed, open(os.path.join(args.out, "proposals.json"), "w"), indent=1)
 print(f"\nwrote {args.out}/corpus.json and {args.out}/proposals.json ({len(proposals)} candidates) in {time.time()-t0:.0f}s")

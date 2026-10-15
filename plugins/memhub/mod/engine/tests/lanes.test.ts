@@ -20,7 +20,7 @@
 import { test, expect } from 'claude-code/testing'
 
 import { postResultText } from '../../lanes'
-import { createEngine } from '../engine'
+import { createEngine, ForeignRepoError } from '../engine'
 import type { EngineIO, HookRule, StateOp, TurnMessage, Verdict } from '../index'
 import {
   applyStateOp, eventAsWritten, fireAsWritten, isEvent, modelText, sessionDoc as laneSessionDoc, sortedArgv,
@@ -50,6 +50,8 @@ type Step = {
   prompt?: string
   session?: string
   cwd?: string
+  /** A call into another repo's checkout: the mod hands it to Python (ForeignRepoError). */
+  handoff?: boolean
 }
 type Case = {
   name: string
@@ -59,6 +61,8 @@ type Case = {
   git?: [string[], number, string][]
   judge?: (Dict | 'timeout')[]
   env?: Record<string, string>
+  /** checkout dir name → the repo it is a checkout of (else REPO). */
+  repo_names?: Record<string, string>
   steps: Step[]
 }
 type StepOut = {
@@ -152,7 +156,11 @@ function world(c: Case, o: CaseOut) {
       baseBranch: c.env?.MEMHUB_RULEBOOK_BASE_BRANCH,
       briefBudget: c.env?.MEMHUB_BRIEF_TOKEN_BUDGET,
     }),
-    paths: async (dir) => ({ repo: REPO, root: dir, base: BASE }),
+    paths: async (dir) => ({ repo: c.repo_names?.[dir.slice(dir.lastIndexOf('/') + 1)] ?? REPO, root: dir, base: BASE }),
+    getenv: async (name) => {
+      const v = c.env && Object.prototype.hasOwnProperty.call(c.env, name) ? c.env[name] : undefined
+      return v === undefined ? undefined : deepSub(v, o.root)
+    },
     state: async (ops) => ops.map(applyOp),
     judge: async (body) => {
       s.sent.push(JSON.parse(JSON.stringify(body)) as Dict)
@@ -242,6 +250,14 @@ for (const v of VECTORS) {
     engine.setBook(o.rules, { repo: REPO, fetchedAt: 0 })
     for (const [i, raw] of c.steps.entries()) {
       const want = o.steps[i]!
+      if (raw.handoff) {
+        // Python judged it with the other repo's book (the vector's fires); the mod must not.
+        const where = `${c.name} step ${i}`
+        expect({ where, pythonFired: want.fires.length > 0 }).toEqual({ where, pythonFired: true })
+        const threw = await runStep(engine, w, o, raw, i).then(() => null, (err: unknown) => err)
+        expect({ where, foreign: threw instanceof ForeignRepoError }).toEqual({ where, foreign: true })
+        continue
+      }
       const { step, got, sessionId } = await runStep(engine, w, o, raw, i)
       const where = `${c.name} step ${i} (${step.lane}${step.tool ? ' ' + step.tool : ''})`
       const hso = (want.stdout?.hookSpecificOutput ?? {}) as Dict
@@ -324,7 +340,7 @@ test('a Bash output persisted to a file fires on its stdout, past the preview th
 
 test('lane vectors cover every lane, a gate, a judge hold and an ordering receipt', () => {
   // Recorded count (vector_checks.ts): raise it when cases are added.
-  expect(belowRatchet('lanes', VECTORS.length, 25)).toBeNull()
+  expect(belowRatchet('lanes', VECTORS.length, 29)).toBeNull()
   const steps = VECTORS.flatMap((v) => (v.out as CaseOut).steps)
   const lanes = new Set(VECTORS.flatMap((v) => (v.args[0] as Case).steps.map((s) => s.lane)))
   expect([...lanes].sort()).toEqual(['post', 'pre', 'prompt', 'session'])
@@ -358,6 +374,35 @@ test('a call in a checkout of another repo is not judged against this book', asy
   engine.setBook([{ id: 'g', on: 'bash', mode: 'gate', rx: 'push', text: 'x' }], { repo: REPO, fetchedAt: 0 })
   await expect(engine.pre({ phase: 'pre', tool: 'Bash', input: { command: 'git push' }, sessionId: SESSION, cwd: root }))
     .rejects.toThrow('the loaded book is acme/app')
+})
+
+test('a Bash call that cds into another repo, or edits a file there, is that repo\'s: handed to Python', async () => {
+  const root = '/tmp/memhub-lane-vectors/foreign-cd'
+  const c: Case = { name: 'foreign-cd', rules: [], steps: [], files: { 'other/.git/HEAD': 'ref: refs/heads/main\n', 'a.py': '' } }
+  const io = world(c, { root, rules: [], git_table: [], steps: [] }).io
+  const engine = createEngine({
+    ...io,
+    home: root,
+    getenv: async (name) => (name === 'OTHER' ? `${root}/other` : undefined),
+    paths: async (dir) => ({ repo: dir.endsWith('/other') ? 'acme/other' : REPO, root: dir, base: BASE }),
+  })
+  engine.setBook([{ id: 'g', on: 'bash', mode: 'gate', rx: 'push', text: 'x' }], { repo: REPO, fetchedAt: 0 })
+  const pre = (input: Record<string, unknown>, tool = 'Bash') =>
+    engine.pre({ phase: 'pre', tool, input, sessionId: SESSION, cwd: root, toolUseId: 'tu-f' })
+  for (const command of ['cd other && git push', 'cd $OTHER && git push', `git -C ${root}/other push`, 'cd ~/x && cd ' + root + '/other; git push',
+    'cd ~/other && git push']) {
+    await expect(pre({ command })).rejects.toThrow('call is in acme/other')
+  }
+  await expect(pre({ file_path: `${root}/other/b.py`, content: 'x' }, 'Write')).rejects.toThrow('call is in acme/other')
+  // no cd at all: a file the command WRITES or READS in the other checkout is that repo's to judge
+  for (const command of ['echo a,b > other/live_probe.csv', "tee ~/other/app/services/llm.py >/dev/null <<'PY'\nclient = AsyncOpenAI(api_key=k)\nPY",
+    'tee $HOME/other/x.py <<EOF\nx\nEOF', 'cat ~/other/README.md', `sed -n 1,5p ${root}/other/a.md`]) {
+    await expect(pre({ command })).rejects.toThrow('call is in acme/other')
+  }
+  // the session's own repo, and a cd that names no checkout, stay the mod's
+  expect((await pre({ command: 'git push' })).deny).toBeDefined()
+  expect((await pre({ command: 'cd /nowhere && git push' })).deny).toBeDefined()
+  expect((await pre({ command: 'echo a,b > here.csv && git push' })).deny).toBeDefined()
 })
 
 // The real engine on each tool's d.ts input shape: it reads the path and the

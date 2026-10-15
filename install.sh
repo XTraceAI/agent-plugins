@@ -14,9 +14,25 @@
 #   --no-login       skip the sign-in step
 #   --no-auto-update leave Claude Code's marketplace auto-update as it is
 #                    (default: turned on, so the plugin follows each release)
-#   --no-fork-agent  leave Claude Code's fork agent setting as it is (default:
+#   --no-fork-agent  leave Claude Code's fork agent settings as they are (default:
 #                    CLAUDE_CODE_FORK_SUBAGENT=1 in settings.json, so rule
-#                    drafts run in the desktop app too, not only the terminal)
+#                    drafts run in the desktop app too, not only the terminal,
+#                    and Agent(fork) in permissions.allow, so auto mode does
+#                    not review, and often deny, each draft's launch)
+#   --repos LIST     make MemHub active only in these repositories (org/name, as
+#                    the origin remote spells them, comma-separated); writes
+#                    ~/.config/memhub-plugin/repos.json. Everywhere else the
+#                    plugin is dormant: no team rules, no capture, no animal
+#   --selected-repos make MemHub active in no repository yet; add each one later
+#                    with /memhub:repos add . inside it
+#   --all-repos      make MemHub active in every repository (removes repos.json)
+#   --companion      show the companion animal above the Claude Code prompt
+#   --no-companion   keep the one-line MemHub status in the animal's place
+#
+# A FIRST install asks about those two settings — where MemHub is active, and
+# the animal — when a terminal is attached; a flag answers its question in
+# advance. Unattended, the quiet choice wins: selected repositories (none yet)
+# and no animal. A re-run asks nothing and leaves the repository list alone.
 #
 # Safe to run again: every step checks what is already there. One sign-in
 # covers every agent on the machine, because the capture hooks of all three
@@ -29,6 +45,9 @@ AGENTS=""
 LOGIN=1
 AUTO_UPDATE=1
 FORK_AGENT=1
+REPOS=""          # --repos LIST
+REPOS_MODE=""     # "list" | "all" | "" (not asked for)
+COMPANION=""      # 1 | 0 | "" (not asked for)
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -38,11 +57,18 @@ while [ $# -gt 0 ]; do
     --no-login) LOGIN=0 ;;
     --no-auto-update) AUTO_UPDATE=0 ;;
     --no-fork-agent) FORK_AGENT=0 ;;
-    -h|--help) sed -n '2,25p' "$0" 2>/dev/null || true; exit 0 ;;
+    --repos) [ $# -ge 2 ] || { echo "--repos needs a comma-separated list of org/name" >&2; exit 2; }; REPOS="$2"; REPOS_MODE=list; shift ;;
+    --selected-repos) REPOS_MODE=selected ;;
+    --all-repos) REPOS_MODE=all ;;
+    --companion) COMPANION=1 ;;
+    --no-companion) COMPANION=0 ;;
+    -h|--help) awk 'NR > 1 && /^# Safe to run again/ { exit } NR > 1' "$0" 2>/dev/null || true; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
   shift
 done
+[ "$REPOS_MODE" = list ] && [ -z "$(printf '%s' "$REPOS" | tr -d ' ,')" ] \
+  && { echo "--repos needs at least one org/name (or --selected-repos, or --all-repos)" >&2; exit 2; }
 
 say() { printf '%s\n' "$*"; }
 step() { printf '\n==> %s\n' "$*"; }
@@ -79,6 +105,77 @@ fi
 
 command -v python3 >/dev/null 2>&1 \
   || fail "python3 is required: MemHub's hooks run on it"
+
+# The plugin's per-user state, where the repository list goes. Whether this is
+# a FIRST install is decided here, before any step below creates the directory
+# (the sign-in writes the access key there).
+CONFIG_DIR="${MEMHUB_CONFIG_DIR:-$HOME/.config/memhub-plugin}"
+REPOS_FILE="$CONFIG_DIR/repos.json"
+FRESH=0; [ -e "$CONFIG_DIR" ] || FRESH=1
+
+# Write the repository list: $1 is a comma-separated org/name list ("" for an
+# empty list, which leaves MemHub active nowhere until a repository is added).
+write_repos() {
+  python3 -c '
+import json, os, sys, tempfile
+path, raw = sys.argv[1], sys.argv[2]
+seen, repos = set(), []
+for r in raw.split(","):
+    r = r.strip().strip("/")
+    if r.endswith(".git"):
+        r = r[:-4]
+    if r and r.lower() not in seen:
+        seen.add(r.lower()); repos.append(r)
+os.makedirs(os.path.dirname(path), exist_ok=True)
+fd, tmp = tempfile.mkstemp(prefix="repos.json.memhub-", dir=os.path.dirname(path))  # 0600
+with os.fdopen(fd, "w") as f:
+    f.write(json.dumps({"version": 1, "mode": "allowlist", "repos": sorted(repos, key=str.lower)}, indent=2) + "\n")
+os.replace(tmp, path)
+print("MemHub is active only in: " + (", ".join(repos) if repos else "(no repository yet)"))
+' "$REPOS_FILE" "$1"
+}
+
+# ── Setup: what a first install asks ─────────────────────────────────────────
+# Under `curl | sh` stdin is this script, so questions read /dev/tty. A flag
+# answers its question in advance; unattended, the quiet choice wins: active
+# in no repository until one is added, and no animal.
+TTY=0; ( : < /dev/tty ) 2>/dev/null && TTY=1
+tty_say() { [ "$TTY" = 1 ] && printf '%s\n' "$*" > /dev/tty; return 0; }
+# ask PROMPT DEFAULT: the person's answer in $ANS, spaces dropped; the default
+# on an empty line, on end of input, or with no terminal to ask.
+ask() {
+  ANS="$2"
+  [ "$TTY" = 1 ] || return 0
+  printf '%s' "$1" > /dev/tty
+  read -r ANS < /dev/tty || ANS="$2"
+  ANS=$(printf '%s' "$ANS" | tr -d ' ')
+  [ -n "$ANS" ] || ANS="$2"
+}
+if [ "$FRESH" = 1 ] && { [ -z "$REPOS_MODE" ] || [ -z "$COMPANION" ]; }; then
+  step "Setup"
+  if [ -z "$REPOS_MODE" ]; then
+    tty_say "Where should MemHub be active? Everywhere else it stays dormant: no team"
+    tty_say "rules, no session capture, nothing above the prompt."
+    tty_say "  1) Only repositories I choose: add each later with /$PLUGIN:repos add ."
+    tty_say "  2) Every repository on this machine"
+    tty_say "  3) A list now, as the origin remote spells them (org/name, comma-separated)"
+    ask "Choice [1]: " 1
+    case "$ANS" in
+      1) REPOS_MODE=selected ;;
+      2) REPOS_MODE=all ;;
+      3) ask "  Repositories (org/a,org/b): " ""
+         if [ -n "$(printf '%s' "$ANS" | tr -d ' ,')" ]; then REPOS="$ANS"; REPOS_MODE=list
+         else say "no repository named: MemHub is active in none yet"; REPOS_MODE=selected; fi ;;
+      *) say "'$ANS' is not one of the choices: MemHub is active in no repository yet"; REPOS_MODE=selected ;;
+    esac
+  fi
+  if [ -z "$COMPANION" ]; then
+    tty_say "Show the companion animal above the Claude Code prompt? Without it, a"
+    tty_say "one-line MemHub status stands in its place."
+    ask "Animal [y/N]: " N
+    case "$ANS" in y|Y|yes|Yes|YES) COMPANION=1 ;; *) COMPANION=0 ;; esac
+  fi
+fi
 
 wanted() {
   [ -z "$AGENTS" ] && return 0
@@ -156,7 +253,15 @@ print("1" if isinstance(entry, dict) and entry.get("autoUpdate") is True else "0
   # Two commands, not `install --marketplace` (that flag needs Claude Code
   # 2.1.292+). Both are no-ops when already done.
   "$CLAUDE_BIN" plugin marketplace add "$CLAUDE_SRC"
-  "$CLAUDE_BIN" plugin install "$PLUGIN@$CLAUDE_MKT" --scope user
+  # --companion: the plugin's `companion` option (off by default, a one-line
+  # status in the animal's place). `--config` is honoured by a fresh install
+  # only; on a machine that has the plugin already, set it in /plugin.
+  if [ "${COMPANION:-0}" = 1 ]; then
+    "$CLAUDE_BIN" plugin install "$PLUGIN@$CLAUDE_MKT" --scope user --config companion=true \
+      || "$CLAUDE_BIN" plugin install "$PLUGIN@$CLAUDE_MKT" --scope user
+  else
+    "$CLAUDE_BIN" plugin install "$PLUGIN@$CLAUDE_MKT" --scope user
+  fi
   # A re-run must reach the current release: neither command above refreshes
   # an already-added marketplace or an installed plugin. --scope user, or
   # Claude updates a project/local copy instead of the one installed here.
@@ -216,12 +321,16 @@ else:
   # Every MemHub copy registers the same hooks and an MCP server named
   # `memhub`; two enabled means every session is captured twice and every rule
   # fires twice. Disable (not uninstall) the others, so this is reversible.
+  # `plugin list --json` prints one row per scope a plugin is installed in;
+  # disable each id once, or every row after the first warns that it failed.
   "$CLAUDE_BIN" plugin list --json | python3 -c '
 import json, sys
 target = sys.argv[1]
+seen = set()
 for p in json.load(sys.stdin):
     name = p["id"].split("@", 1)[0]
-    if name in ("memhub", "memhub-staging") and p["id"] != target and p.get("enabled"):
+    if name in ("memhub", "memhub-staging") and p["id"] != target and p.get("enabled") and p["id"] not in seen:
+        seen.add(p["id"])
         print(p["id"])
 ' "$PLUGIN@$CLAUDE_MKT" | while read -r dup; do
     if "$CLAUDE_BIN" plugin disable "$dup" >/dev/null 2>&1 \
@@ -248,8 +357,15 @@ for p in json.load(sys.stdin):
   # doing it here covers a desktop-only person from their first session. The
   # script backs settings.json up, keeps a key set off by hand (exit 1, says
   # so), and writes nothing when rule drafting is off.
+  # --allow-rule adds Agent(fork) to permissions.allow too. Auto mode otherwise
+  # reviews each launch, and denies a fair share, because the request comes
+  # from a hook's output. Only here: onboard runs inside a session, where the
+  # classifier refuses an agent writing its own allow rule. Probed first so an
+  # older released plugin, whose script lacks the flag, still gets the key.
   if [ "$FORK_AGENT" = 1 ] && [ -f "$PLUGIN_ROOT/scripts/setup_claude_fork.py" ]; then
-    rc=0; python3 "$PLUGIN_ROOT/scripts/setup_claude_fork.py" install --claude-home "$CLAUDE_HOME" || rc=$?
+    ALLOW_RULE=""
+    grep -q -- "--allow-rule" "$PLUGIN_ROOT/scripts/setup_claude_fork.py" && ALLOW_RULE="--allow-rule"
+    rc=0; python3 "$PLUGIN_ROOT/scripts/setup_claude_fork.py" install --claude-home "$CLAUDE_HOME" $ALLOW_RULE || rc=$?
     [ "$rc" = 2 ] && say "warning: could not set Claude Code's fork agent; add \"CLAUDE_CODE_FORK_SUBAGENT\": \"1\" under env in $CLAUDE_HOME/settings.json" >&2
   fi
   LOGIN_HOST=${LOGIN_HOST:-claude-code}
@@ -258,7 +374,28 @@ fi
 
 if [ -n "$CODEX_BIN" ]; then
   step "Codex"
-  "$CODEX_BIN" plugin marketplace add "$CODEX_SRC"
+  # Codex keys a marketplace snapshot by its exact source (URL spelling, ref,
+  # sparse paths). A snapshot of this same name recorded from any other source
+  # — an older Codex, a URL typed by hand, a staging install — makes `add`
+  # refuse ("already added from a different source"). `remove` drops only that
+  # snapshot and its config entry; the plugin's own entry survives, and the
+  # `plugin add` below re-installs it from the fresh snapshot.
+  out=""; rc=0; out=$("$CODEX_BIN" plugin marketplace add "$CODEX_SRC" 2>&1) || rc=$?
+  if [ "$rc" != 0 ]; then
+    case $out in
+      *"already added from a different source"*)
+        stale=$(printf '%s' "$out" | sed -n "s/.*marketplace '\([^']*\)' is already added.*/\1/p" | head -n 1)
+        [ -n "$stale" ] || stale=$CODEX_MKT
+        say "Codex marketplace '$stale' was added from another source; replacing it"
+        "$CODEX_BIN" plugin marketplace remove "$stale"
+        "$CODEX_BIN" plugin marketplace add "$CODEX_SRC" ;;
+      *)
+        printf '%s\n' "$out" >&2
+        fail "could not add the Codex marketplace (exit $rc)" ;;
+    esac
+  else
+    [ -z "$out" ] || printf '%s\n' "$out"
+  fi
   # `add` returns early for a known source without fetching; only `upgrade`
   # refreshes a Git snapshot. A local-directory source is always current.
   if [ "$MODE" != staging ] && ! "$CODEX_BIN" plugin marketplace upgrade "$CODEX_MKT"; then
@@ -305,10 +442,38 @@ if [ -n "$CURSOR_BIN" ]; then
   note "Cursor: open Customize, find MemHub and select Add — or, if it is already installed, Update (or remove and Add again) to get the new version. Cursor has no command for this step"
 fi
 
+step "Repositories"
+# Which repositories MemHub is active in (the plugin's scripts/repo_allow.py
+# reads this file on every hook). No file: every repository. A file: only the
+# ones it lists; everywhere else the plugin is dormant — no team rules, no
+# capture, no companion — so a client's repository is never touched.
+if [ "$REPOS_MODE" = list ]; then
+  write_repos "$REPOS"
+elif [ "$REPOS_MODE" = all ]; then
+  if [ -e "$REPOS_FILE" ]; then rm -f "$REPOS_FILE"; say "removed $REPOS_FILE: MemHub is active in every repository"
+  else say "MemHub is active in every repository (no $REPOS_FILE)"; fi
+elif [ "$REPOS_MODE" = selected ]; then
+  # Chosen, or nobody to ask: active nowhere until a repository is added,
+  # never in a repository nobody chose.
+  write_repos ""
+  note "Repositories: MemHub is active in none yet. In each repository you want it in, run /$PLUGIN:repos add . (or re-run this installer with --repos org/a,org/b, or --all-repos)"
+elif [ -e "$REPOS_FILE" ]; then
+  say "kept $REPOS_FILE (--repos, --selected-repos or --all-repos changes it; /$PLUGIN:repos list shows it)"
+else
+  say "MemHub is active in every repository (no $REPOS_FILE; --repos org/a,org/b limits it)"
+fi
+
 if [ "$LOGIN" = 1 ]; then
   step "Sign in (once for this machine)"
+  # With $MEMHUB_TOKEN set (a cloud or CI machine) --status passes on the
+  # variable alone, yet the MCP tools never see it: Claude Code strips it from
+  # the plugin's headersHelper. A full login with it set opens no browser and
+  # stores the key where the tools read it.
   if [ -z "$PLUGIN_ROOT" ]; then
     say "skipped: no installed copy to sign in from yet; after adding it in Cursor, ask the agent to log in to MemHub"
+  elif [ -n "${MEMHUB_TOKEN:-}" ]; then
+    python3 "$PLUGIN_ROOT/scripts/login.py" --host "$LOGIN_HOST" \
+      || fail "\$MEMHUB_TOKEN was refused; check the key and run this installer again"
   elif python3 "$PLUGIN_ROOT/scripts/login.py" --status; then
     say "already signed in"
   else

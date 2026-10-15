@@ -1,5 +1,5 @@
 ---
-description: Use when the user asks to import, upload, or save a Claude Code, Codex, or Cursor session/conversation/transcript into MemHub or team memory (e.g. "import this session into memhub", "save session abc123 to memhub", "put that conversation in an agent brain"). Ships the transcript via a terminal upload script — any size, no token-by-token re-emit.
+description: Use when the user wants a past Claude Code, Codex or Cursor session saved into their memory because automatic capture missed it — a session from before the plugin was installed, one whose upload failed, or one from a host without capture hooks (e.g. "import this session into memhub", "save session abc123 to my memory", "upload yesterday's conversation"). Saves it to the user's own memory, not a team brain, at any size.
 argument-hint: "<session-id-or-path> [title...]"
 allowed-tools: 'Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/capture.py" import *), Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/capture.py" list *), mcp__plugin_memhub_memhub__list_orgs, mcp__plugin_memhub-staging_memhub__list_orgs'
 ---
@@ -12,8 +12,10 @@ there; use it only when it resolves to that same ancestor. Substitute the
 resulting absolute path as `<plugin-root>` below; do not infer it from the
 workspace cwd. Commands show `python3`; on native Windows use `py -3`.
 
-Import a past Claude Code, Codex, or Cursor session into MemHub team memory on
-demand. The unified capture script locates the host session, normalizes it when
+Import a past Claude Code, Codex, or Cursor session into the user's own MemHub
+memory on demand — for a session automatic capture missed (it predates the
+install, its upload failed, or its host ran without capture hooks). The unified
+capture script locates the host session, normalizes it when
 needed, and ships it to the `import_conversation` MCP tool — **do NOT call the
 MCP tool yourself and do NOT read or paste transcript content**; sessions can
 exceed a million tokens and the script handles any size without putting the

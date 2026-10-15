@@ -64,6 +64,8 @@ stdin, one JSON object. Top-level keys are the call's context (the hook's
          "rulebook_id": "b-1",              optional, local only
          "rule_version": "7",               optional
          "excerpt": "git push -f",          optional, local only, cut to 160
+         "tool_use_id": "tu-0",             optional, local only: the call this fire
+                                            is anchored on (fire_effect.py's window)
          "dedup_key": "...", "raw_matches_before_fire": 0,
          "override_reason": null, "fired_at": "<iso, µs>",
          "judge_verdict": "fit", "judge_score": 0.91}      optional
@@ -98,7 +100,35 @@ stdout, one JSON line, so the mod never re-derives keying in TypeScript:
     {"env": "staging", "plugin_root": "...", "base": "...",
      "repo": "MemHub-Backend", "root": "/path", "branch": "main",
      "worktree": "<16 hex>", "book": "<base>/book/MemHub-Backend-1a2b3c4d.json",
-     "ledger": "<base>/ledger", "state": "<base>/state"}
+     "ledger": "<base>/ledger", "state": "<base>/state",
+     "enabled": true, "restricted": false, "declined": false,
+     "identity": "XTraceAI/MemHub-Backend"}
+
+``enabled`` is the repository allowlist's answer for that checkout
+(``repo_allow.enabled``; with ``--repo`` and no checkout, null: unknown),
+and ``restricted`` whether a ``repos.json`` exists at all. The mod claims no
+lane and shows no companion where ``enabled`` is false; the Python lanes
+read the same file. ``declined`` (ENG-1253) is whether the person answered
+No to enabling MemHub in that checkout (repos.json ``declined``), so the
+status strip never re-derives the file: it asks only where ``restricted``
+is true and ``enabled`` and ``declined`` both false. ``identity`` is the
+checkout's name as repos.json lists it (``org/name`` from ``origin``, or the
+bare directory name; "" outside a checkout) — the ``repo`` field is the
+hook's own shorter name, which a rule's scope is matched against.
+
+answer
+------
+    python3 scripts/rulebook_mod_cli.py answer --env staging --cwd /path --say yes|no
+
+The strip's **1 Yes** / **2 No** (ENG-1253): ``yes`` lists the checkout
+holding ``--cwd`` (``repo_allow.allow``, what ``/memhub:repos add .``
+does, a decline cleared), ``no`` records it as declined
+(``repo_allow.decline``: dormant, and never asked again). stdout, one JSON
+line: ``{"identity": "org/name", "enabled": bool, "declined": bool,
+"path": "<repos.json>"}``. Exit 2 when ``--cwd`` is outside any checkout
+(nothing to list), 1 when the file cannot be written. The Python hooks read
+the file per call, so they follow at the next call; the mod flips its own
+state from the answer.
 
 ``repo``/``root``/``branch``/``worktree`` are ``repo_of_call({"cwd": cwd})``
 — what the hook lanes resolve for a call made there — and ``book`` is
@@ -124,7 +154,7 @@ import mod_lanes  # noqa: E402
 HOST = "claude"
 EVENT_KINDS = ("receipt", "converted", "dismissed", "turn_end", "session_end")
 _CTX_KEYS = ("repo", "branch", "worktree", "tool", "agent_id", "source_message_id",
-             "rule_version")
+             "tool_use_id", "rule_version")
 
 
 def _out(obj) -> None:
@@ -287,10 +317,59 @@ def cmd_paths(args) -> int:
             worktree = rh.worktree_key(root)
             root, branch = root or None, branch or None
         book = rh.book_path(repo) if repo else None
+        enabled, restricted, declined, identity = _allowed(root, args.cwd)
+    # `base` is the ACTIVE base: a §4b forward-test claim covering `cwd`
+    # redirects it to the test's private copy. `real_base` is the install's
+    # own, where that claim file lives (the mod reads it per call, lanes.ts).
     _out({"env": args.env, "plugin_root": mod_lanes.plugin_root(), "base": base,
+          "real_base": rh.BASE,
           "repo": repo or "", "root": root, "branch": branch, "worktree": worktree,
           "book": book, "ledger": os.path.join(base, "ledger"),
-          "state": os.path.join(base, "state")})
+          "state": os.path.join(base, "state"),
+          "enabled": enabled, "restricted": restricted,
+          "declined": declined, "identity": identity})
+    return 0
+
+
+def _allowed(root, cwd):
+    """(enabled, restricted, declined, identity) from repo_allow for the
+    checkout `root`, or for `cwd` when the call named no checkout (then a cwd
+    outside any checkout is dormant, as hook_entry treats a session there).
+    (None, False, False, "") when neither is known or the module is
+    unavailable."""
+    try:
+        import repo_allow  # noqa: PLC0415
+        restricted = repo_allow.restricted()
+        where = root or cwd
+        identity = repo_allow.identity(*repo_allow.checkout(where)) if where else ""
+        declined = bool(identity) and repo_allow.is_declined(identity)
+        if root:
+            return bool(repo_allow.enabled(root)), restricted, declined, identity
+        if cwd:
+            return bool(repo_allow.session_enabled(cwd)), restricted, declined, identity
+        return None, restricted, declined, identity
+    except Exception:  # noqa: BLE001 — unknown is an answer the mod treats as enabled
+        return None, False, False, ""
+
+
+# ── answer ──────────────────────────────────────────────────────────────────
+
+def cmd_answer(args) -> int:
+    import repo_allow  # noqa: PLC0415
+    root, gitdir = repo_allow.checkout(args.cwd)
+    identity = repo_allow.identity(root, gitdir) if root else ""
+    if not identity:
+        print("rulebook_mod_cli answer: %s is not inside a Git checkout; nothing to list"
+              % args.cwd, file=sys.stderr)
+        return 2
+    try:
+        path = repo_allow.allow(identity) if args.say == "yes" else repo_allow.decline(identity)
+    except OSError as exc:
+        print("rulebook_mod_cli answer: could not write %s: %s"
+              % (repo_allow.allowlist_path(), exc), file=sys.stderr)
+        return 1
+    _out({"identity": identity, "enabled": repo_allow.allows(identity),
+          "declined": repo_allow.is_declined(identity), "path": path})
     return 0
 
 
@@ -299,12 +378,15 @@ def cmd_paths(args) -> int:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="rulebook_mod_cli.py")
     sub = ap.add_subparsers(dest="cmd")
-    for name in ("api-info", "log", "paths"):
+    for name in ("api-info", "log", "paths", "answer"):
         p = sub.add_parser(name)
         p.add_argument("--env", required=True, choices=sorted(mod_lanes.ENV_VARS))
         if name == "paths":
             p.add_argument("--cwd", default="")
             p.add_argument("--repo", default="")
+        if name == "answer":
+            p.add_argument("--cwd", required=True)
+            p.add_argument("--say", required=True, choices=("yes", "no"))
     try:
         args = ap.parse_args(argv)
     except SystemExit as exc:
@@ -317,7 +399,8 @@ def main(argv=None) -> int:
         print(f"rulebook_mod_cli: --env {args.env} but this install is "
               f"{mine or 'unidentifiable'}", file=sys.stderr)
         return 2
-    return {"api-info": cmd_api_info, "log": cmd_log, "paths": cmd_paths}[args.cmd](args)
+    return {"api-info": cmd_api_info, "log": cmd_log, "paths": cmd_paths,
+            "answer": cmd_answer}[args.cmd](args)
 
 
 if __name__ == "__main__":

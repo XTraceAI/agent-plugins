@@ -40,6 +40,7 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
+import _tls
 import atomic_write
 import mcp_http
 
@@ -205,7 +206,7 @@ def _call(base: str, bearer: str, method: str, path: str,
         headers={"Authorization": f"Bearer {bearer}",
                  "Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:
+        with _tls.urlopen(req, timeout=_TIMEOUT_S) as resp:
             payload = json.loads(resp.read() or b"{}")
     except urllib.error.HTTPError as e:
         body = (e.read() or b"").decode(errors="replace")

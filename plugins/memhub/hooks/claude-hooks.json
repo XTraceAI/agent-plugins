@@ -13,16 +13,6 @@
         ]
       },
       {
-        "matcher": "^mcp__.+__add_memory$",
-        "hooks": [
-          {
-            "type": "command",
-            "timeout": 5,
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/hook_entry.py\" PreToolUse add_memory_gate"
-          }
-        ]
-      },
-      {
         "matcher": "^mcp__.+__create_rule$",
         "hooks": [
           {
@@ -63,7 +53,7 @@
           {
             "type": "command",
             "timeout": 30,
-            "statusMessage": "MemHub: PR created — arming babysit loop",
+            "statusMessage": "MemHub: PR created \u2014 arming babysit loop",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/hook_entry.py\" PostToolUse pr_babysit_trigger"
           }
         ]
@@ -101,6 +91,19 @@
         ]
       }
     ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "^(Bash|Edit|MultiEdit|Write|NotebookEdit|Read)$",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 5,
+            "statusMessage": "MemHub: checking team rules",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/hook_entry.py\" PostToolUseFailure rulebook_hook"
+          }
+        ]
+      }
+    ],
     "SessionStart": [
       {
         "hooks": [
@@ -132,6 +135,17 @@
             "type": "command",
             "timeout": 5,
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/hook_entry.py\" SessionStart harness_stop"
+          }
+        ]
+      }
+    ],
+    "UserPromptExpansion": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 5,
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/hook_entry.py\" UserPromptExpansion rulebook_hook"
           }
         ]
       }

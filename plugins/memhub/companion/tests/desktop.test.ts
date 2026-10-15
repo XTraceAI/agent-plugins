@@ -31,7 +31,8 @@ const BAND = {
  */
 async function started($: Engine, on: On, list = listed(), onRegister?: (name: string) => void) {
   const clock = mock.clock(on)
-  const store: Record<string, unknown> = { 'companion.pin': 'goose' }
+  // `companion.enabled` true: the person ran `/goose` once (the `companion` option is off by default)
+  const store: Record<string, unknown> = { 'companion.pin': 'goose', 'companion.enabled': true }
   on('store.get', async (_, e) => ({ value: store[e.key] }))
   on('store.set', async (_, e) => {
     store[e.key] = JSON.parse(JSON.stringify(e.value))

@@ -34,7 +34,7 @@ export type Rest = {
   decide?: (Answer | 'throw')[]
   /** Held until the test resolves it: a PATCH still in flight. */
   gate?: Promise<void>
-  /** The bearers api-info hands out, one per resolution (the last repeats); '' is no key. */
+  /** The bearers api-info hands out, one per resolution (the last repeats); '' is no key, '!' a lookup that fails. */
   bearers?: string[]
   /** The Studio origin api-info hands out; STUDIO unless given ('' pairs none). */
   studio?: string
@@ -87,6 +87,7 @@ export function restBeneath(on: On, rest: Rest = {}) {
     const bearers = rest.bearers ?? [BEARER]
     const bearer = bearers[Math.min(resolutions, bearers.length - 1)] ?? ''
     resolutions += 1
+    if (bearer === '!') return ran(1, `${JSON.stringify({ error: 'ModuleNotFoundError: no module' })}\n`)
     const answer = bearer ? { base: BASE, bearer, studio: rest.studio ?? STUDIO } : {}
     return ran(0, `${JSON.stringify(answer)}\n`)
   }

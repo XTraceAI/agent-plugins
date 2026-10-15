@@ -1,5 +1,5 @@
 ---
-description: Use when the user asks to save, store, or upload a file/document/spec to MemHub or team memory as an artifact (e.g. "save this spec to memhub", "store this doc as an artifact", "version this design doc in memhub"). Uploads the file's bytes via a terminal script — never call save_artifact directly or re-emit file contents.
+description: Use when the user wants a file kept in team memory where teammates and their agents can find it (e.g. "save this spec to memhub", "store this doc for the team", "upload this design doc", "save a new version of this runbook"). Uploads the file as is — to the repo's shared brain when there is one, otherwise to the user's own memory — and versions it when a document of the same name already exists.
 argument-hint: "<file-path> [artifact name]"
 allowed-tools: 'Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/save_artifact.py" *), mcp__plugin_memhub_memhub__search_memory, mcp__plugin_memhub-staging_memhub__search_memory, mcp__plugin_memhub_memhub__list_tags, mcp__plugin_memhub-staging_memhub__list_tags'
 ---
@@ -14,7 +14,7 @@ helper script — **for content that already exists on disk, do NOT call the
 `save_artifact` MCP tool yourself and do NOT paste/retype the file contents**;
 that would regenerate the whole document token by token. This is a terminal
 operation, like `cat`-ing a file. Content you compose in-session and that
-lives nowhere on disk (a handoff brief, a PR review record) is the other case:
+lives nowhere on disk (a handoff brief) is the other case:
 there, calling `save_artifact` directly is fine — nothing is being re-emitted.
 
 Arguments: `$ARGUMENTS`

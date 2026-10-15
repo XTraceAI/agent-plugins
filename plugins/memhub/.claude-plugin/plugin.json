@@ -2,7 +2,7 @@
   "name": "memhub",
   "displayName": "XTrace MemHub",
   "description": "Team memory for Claude Code. Your sessions are saved automatically, so past work is searchable later. Your team's rules show up while you work, at the moment they apply. Skills let you search what the team knows, save a document, import a session, hand work to a teammate, link sessions to pull requests, write rules, work from specs, and watch a pull request through review.",
-  "version": "0.124.0",
+  "version": "0.133.0",
   "license": "Apache-2.0",
   "hooks": ["./hooks/claude-hooks.json"],
   "types": "./types/index.d.ts",
@@ -31,6 +31,13 @@
       "title": "Draft team rules from corrections",
       "description": "When a turn looks like a correction worth keeping, the Stop hook asks Claude to start a background fork of the session, which drafts a team rule and files it as proposed (nothing is active until a reviewer activates it). The fork runs on your own model usage. Turn this off to draft nothing: the Stop hook then judges no turn.",
       "default": true,
+      "required": false
+    },
+    "companion": {
+      "type": "boolean",
+      "title": "Show the companion animal above the prompt",
+      "description": "The small pixel animal above the Claude Code prompt that shows what MemHub is doing: asleep while idle, up when a team rule fires, asking when a new rule is proposed. Off by default: a plain one-line MemHub status stands in its place (the last rule that fired, a proposed rule with its Activate / Reject / Later buttons, else what MemHub is doing here). Turn this on, or run any animal's command (/goose, /hippo, /penguin, /shiba) in a session, to see the animal instead; /<animal> off returns to the status line.",
+      "default": false,
       "required": false
     }
   }

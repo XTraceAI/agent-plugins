@@ -5,6 +5,7 @@
 
 import { describe, expect, test } from 'claude-code/testing'
 
+import { ForeignRepoError } from '../engine/engine'
 import { boot } from '../register'
 import { BOOK, EMPTY, fakeCtx, fakeEngine, fakeIo, fire, toHook } from './fakes'
 
@@ -124,7 +125,24 @@ describe('tool.call', () => {
     for (const [tool, answered] of calls) {
       await shell.lanes.toolCall({ tool, command: 'x', file_path: '/w/x' }, async () => answered as { text: string })
     }
-    expect(engine.calls.post.map(c => c.result!.text)).toEqual(['Error: Exit code 1\nboom', '(No output)', 'odd record', 'edited'])
+    expect(engine.calls.post.map(c => c.result!.text)).toEqual(['boom\nExit code 1', '(No output)', 'odd record', 'edited'])
+  })
+
+  test('a failed Bash call: the error string is the text, exit line last, as the Python failure lane shapes it (ENG-1236)', async () => {
+    const { engine, shell } = await ready()
+    // What Claude Code answers for a command that exited non-zero: the record
+    // is the error string; there may be no `text` at all.
+    const answered = { result: "Error: Exit code 1\nTypeError: greet() got an unexpected keyword argument 'name'", isError: true as const }
+    await shell.lanes.toolCall({ tool: 'Bash', command: 'sh probe.sh' }, async () => answered)
+    expect(engine.calls.post[0]!.result).toEqual({
+      text: "TypeError: greet() got an unexpected keyword argument 'name'\nExit code 1", isError: true,
+    })
+    // A successful string record is the text as it came; a `text` beside the
+    // record still wins, shaped the same way.
+    await shell.lanes.toolCall({ tool: 'Bash', command: 'true' }, async () => ({ result: 'done' }))
+    expect(engine.calls.post[1]!.result).toEqual({ text: 'done', isError: undefined })
+    await shell.lanes.toolCall({ tool: 'Bash', command: 'x' }, async () => ({ result: 'boom', text: 'Exit code 2\n1 failed', isError: true as const }))
+    expect(engine.calls.post[2]!.result).toEqual({ text: '1 failed\nExit code 2', isError: true })
   })
 
   test('nothing fired: the result comes back as next answered it', async () => {
@@ -282,6 +300,33 @@ describe('a pre hand-off', () => {
     expect(engine.calls.post[0]!.result).toEqual({ text: 'out', isError: undefined })
     expect(r).toEqual({ result: 'out', text: 'out', context: [`post advice`] })
     expect(io.logs).toEqual([advice.line])
+  })
+
+  test('a call in ANOTHER repo goes to Python whole — pre and post out of the claim during next — and is no failure', async () => {
+    const { engine, shell, io } = await ready()
+    engine.verdicts.pre = new ForeignRepoError('acme/other', 'acme/app')
+    engine.verdicts.post = { context: ['post advice'], fires: [fire('x')], ledger: [] }
+    const during: (string | undefined)[] = []
+    for (let i = 0; i < 3; i++) {
+      const r = await shell.lanes.toolCall({ tool: 'Bash', command: 'cd ~/other && git push' }, async () => {
+        during.push(io.envVars.staging)
+        return { result: 'ok', text: 'ok' }
+      })
+      // the mod's post lane stays out: Python's PostToolUse served it with the other repo's book
+      expect(r).toEqual({ result: 'ok', text: 'ok' })
+    }
+    expect(engine.calls.post).toHaveLength(0)
+    // while next ran, the variable listed neither pre nor post, so the Python hooks served the call
+    expect(during).toHaveLength(3)
+    for (const v of during) {
+      const lanes = ((v ?? '').split(':')[3] ?? '').split(',')
+      expect(lanes.includes('pre') || lanes.includes('post')).toBe(false)
+    }
+    // three foreign calls in a row cost nothing: both lanes are still the mod's (a failure would release them at 2)
+    expect(shell.claims.has('pre') && shell.claims.has('post')).toBe(true)
+    engine.verdicts.pre = { context: [], fires: [], ledger: [] }
+    await shell.lanes.toolCall({ tool: 'Bash', command: 'ls' }, async () => ({ result: 'ok', text: 'ok' }))
+    expect(engine.calls.post).toHaveLength(1)
   })
 
   test('a hand-off whose claims write fails still reaches next exactly once', async () => {

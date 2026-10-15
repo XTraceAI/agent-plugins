@@ -1,8 +1,21 @@
 // One entry point: mod/register.ts, the plugin's hooks module (hooks.json),
-// calls `register(on, ctx)` with the mod's Ctx (mod/ctx.ts), last of its
-// parts, so the companion's hooks sit innermost. MemHub calls use
-// `ctx.api()`: the REST base, the bearer, and the Studio web app paired with
-// the base; `ctx.env` says which MemHub it is.
+// calls `register(on, ctx, options)` with the mod's Ctx (mod/ctx.ts) and the
+// plugin's userConfig values, last of its parts, so the companion's hooks sit
+// innermost. MemHub calls use `ctx.api()`: the REST base, the bearer, and the
+// Studio web app paired with the base; `ctx.env` says which MemHub it is.
+//
+// Whether the ANIMAL shows: the `companion` option (plugin.json userConfig,
+// off by default) shows it in every session unless `/<animal> off` hid it;
+// with the option off it shows only where the person ran `/<animal>` (which
+// stores `companion.enabled`). And never in a repository MemHub is inactive
+// in — `ctx.active()`, the machine's repository allowlist (repos.json) as the
+// shell read it at boot — where the Python lanes are silent too. With the
+// animal off the band is not empty: one plain status line (the "strip",
+// ui.render below) stands in its place, so MemHub's presence stays visible
+// and a proposed rule can still be answered on its buttons. In a repository
+// the list leaves out — not listed, not declined — the strip asks once, at
+// session start, whether to enable MemHub there (ENG-1253): `1 Yes` lists
+// it, `2 No` declines it for good, `3 Later` hides the ask for the session.
 //
 // It reads what the mod writes to `$.state` (fires, proposals,
 // lanes) and never needs the classic.* events, which the built-in
@@ -10,10 +23,10 @@
 // Mods Migration Spec §1.4, D3). The classic PreToolUse / PostToolUse hooks
 // stay only as the fallback for lanes the mod has not claimed.
 
-import type { EngineInterface, On, Timer } from 'claude-code'
+import type { EngineInterface, On, PluginOptions, Timer } from 'claude-code'
 import { read, update } from 'claude-code'
 
-import type { Api, Ctx } from '../mod/ctx'
+import { type Active, type Api, type Ctx, lastJson, MOD_CLI, type SignIn } from '../mod/ctx'
 import type { FireNote, ProposalNote } from '../types'
 import type { Animal, Build, Painted, Tone } from './animal'
 import { ANIMALS, DEFAULT_ANIMAL } from './animals'
@@ -38,6 +51,14 @@ const PROPOSALS = { plugin: 'memhub', key: 'proposals' } as const
 const LANES = { plugin: 'memhub', key: 'lanes' } as const
 /** How often the server is asked for proposed rules, besides session start and each turn's end. */
 const POLL_MS = 300_000
+/** What the animal says, once a session, when the poll finds no one signed in. */
+const SIGNED_OUT_SAID = "Not signed in to MemHub: sessions aren't saved and team rules can't sync. Run /memhub:login"
+/** What it says when a later poll finds the sign-in it had asked for. */
+const SIGNED_IN_SAID = 'Signed in to MemHub: sessions are saved and team rules sync again.'
+/** The row under the animal while no one is signed in. */
+const SIGNED_OUT_ROW = 'not signed in · /memhub:login'
+/** The strip's enable ask (ENG-1253): the keyed Box a test (and a surface) finds. */
+const ENABLE_KEY = 'memhub-enable-ask'
 
 /**
  * The companion in the band above the prompt: MemHub's face in the session,
@@ -47,6 +68,8 @@ const POLL_MS = 300_000
  * crossly for a call the rule stopped — and when the harness has proposed a
  * new rule, presenting it and asking: Activate, Reject or Later, as buttons
  * inside its bubble (1, 2, 3 from an empty prompt) until it is answered.
+ * When no one is signed in to MemHub it says so, once a session, and keeps a
+ * `not signed in · /memhub:login` row under it until a sign-in is found.
  *
  * This is the whole of what watches the session. Which animal does the
  * sleeping and speaking is the Animal contract's business (see animal.ts):
@@ -78,6 +101,16 @@ const FPS = 20
 const DESKTOP_STRIDE = 1
 const RASTER_KEY = 'companion'
 const STORE_ENABLED = 'companion.enabled'
+/** The userConfig option that shows the companion without a `/<animal>` (off by default). */
+const OPTION_COMPANION = 'companion'
+/** How long setUp waits for the shell's allowlist answer before showing the animal anyway. */
+const ACTIVE_WAIT_MS = 5_000
+const REPOS_FILE = '~/.config/memhub-plugin/repos.json'
+/** How many turn ends a fire stands on the status strip: the turn it fired in, and the next. */
+const STRIP_FIRE_TURNS = 2
+const STRIP_KEY = 'memhub-strip'
+/** The strip's colour for a fire that blocked the call (the Python disclosure's ⛔️ line). */
+const BLOCKED_HEX = '#e06c75'
 // `companion.animal`, the old global pick, is neither read nor written: most
 // of it was `/goose` run to turn the band on, not a choice. Older versions
 // still read it, so it is left where it is.
@@ -141,7 +174,20 @@ type Band = {
   wordKey: string
   /** The tone of what the animal is saying now, while a `speak` plays. */
   speakingTone: Tone | null
+  /**
+   * The ANIMAL is drawn: decided by setUp from the option, the store and the
+   * allowlist; false until then. False draws the status strip instead (one
+   * dim line: the latest fire, a waiting proposal with its buttons, else what
+   * MemHub is doing), never nothing — so the mod's presence stays visible.
+   */
   isEnabled: boolean
+  /** The plugin's `companion` option: the animal without a `/<animal>` first. */
+  optionOn: boolean
+  /** The repository allowlist's answer for this session (ctx.active()); null until setUp asked. */
+  active: Active | null
+  /** The fire the strip shows (no bubble to say it in), for `stripFireTurns` more turn ends. */
+  stripFire: Said | null
+  stripFireTurns: number
   /** A forced pixel size, or null to let the room pick as hippo_half.py does. */
   scale: number | null
   /** Rows the band really gave the drawing, once it has said; see ui.render. */
@@ -205,9 +251,21 @@ type Band = {
   isPolling: boolean
   /** The MemHub the poll reached ('staging' | 'production'); '' until it has. */
   env: string
+  /** The sign-in the last poll found: 'out' keeps a row under the animal; 'unknown' changes nothing. */
+  signIn: SignIn
+  /** The session the animal last said it is not signed in, so it says so once a session. */
+  saidSignedOutIn: string | null
+  /** The session's working directory (session.start): what the enable ask's Yes and No name to the CLI. */
+  cwd: string
+  /**
+   * The strip's enable ask (ENG-1253): 'open' shows it where `enableAskOf`
+   * says to; 'answering' while Yes or No is being written (its buttons
+   * wait); 'later' hides it for the rest of this session, in memory only.
+   */
+  enableAsk: 'open' | 'answering' | 'later'
 }
 
-export function register(on: On, ctx: Ctx) {
+export function register(on: On, ctx: Ctx, options: PluginOptions = {}) {
   const band: Band = {
     animal: DEFAULT_ANIMAL,
     build: DEFAULT_ANIMAL.builds[0]!,
@@ -222,7 +280,11 @@ export function register(on: On, ctx: Ctx) {
     buttonsKey: '',
     wordKey: '',
     speakingTone: null,
-    isEnabled: true,
+    isEnabled: false,
+    optionOn: options[OPTION_COMPANION] === true,
+    active: null,
+    stripFire: null,
+    stripFireTurns: 0,
     scale: null,
     roomRows: null,
     roomAt: null,
@@ -257,10 +319,15 @@ export function register(on: On, ctx: Ctx) {
     pollTimer: null,
     isPolling: false,
     env: '',
+    signIn: 'unknown',
+    saidSignedOutIn: null,
+    cwd: '',
+    enableAsk: 'open',
   }
 
   on('session.start', async ($, e, next) => {
     const result = await next(e)
+    if (typeof e.cwd === 'string') band.cwd = e.cwd
     // `claude -p` is a terminal that is not interactive, with no band to draw
     // in. The desktop reports no surface here and `isInteractive: false` (a
     // live 2.1.287 session), so it sets up from its first draw instead.
@@ -281,7 +348,10 @@ export function register(on: On, ctx: Ctx) {
         band.petUntil = 0
         await $.store.set(STORE_ENABLED, false).catch(() => undefined)
         $.ui.invalidate('ui.render')
-        return { text: `The ${animal.name.toLowerCase()} goes away. /${commandOf(animal)} brings it back.` }
+        return {
+          text: `The ${animal.name.toLowerCase()} goes away; a plain MemHub status line stays above the prompt. ` +
+            `/${commandOf(animal)} brings it back.`,
+        }
       }
       const scaleAsked = /^scale +([1-4])$/.exec(arg)
       if (scaleAsked || arg === 'scale auto') {
@@ -315,6 +385,19 @@ export function register(on: On, ctx: Ctx) {
       if (isDemo && !(demoBuild.demo && (arg === 'demo' || (demoBuild.demoPoses ?? []).includes(arg)))) {
         return { text: `usage: /${commandOf(animal)} ${usageOf(animal)}` }
       }
+      // A repository MemHub is inactive in (the allowlist) has no companion
+      // to show, whatever the person asks of it: say so, and store nothing.
+      const active = await activeOf($, band)
+      if (!active.enabled) {
+        return {
+          text: active.repo
+            ? `MemHub is inactive in this repository (${REPOS_FILE} leaves it out), so the ` +
+              `${animal.name.toLowerCase()} stays away. /${$.plugin.name}:repos add . enables MemHub here.`
+            : `MemHub is inactive here: this folder is not inside a repository, and ${REPOS_FILE} limits ` +
+              `MemHub to the repositories it lists, so the ${animal.name.toLowerCase()} stays away. ` +
+              `Run /${$.plugin.name}:repos add . inside a repository to enable MemHub there.`,
+        }
+      }
       // this command decides the session's animal: a pick still in flight for
       // it yields, and one the engine's new session id (after a /clear or a
       // /resume) was waiting for is this one
@@ -331,7 +414,8 @@ export function register(on: On, ctx: Ctx) {
         band.pendingPick = key
         isPending = true
       }
-      const isSwitch = band.animal !== animal || !band.isEnabled
+      const wasOff = !band.isEnabled
+      const isSwitch = band.animal !== animal || wasOff
       band.isEnabled = true
       band.animal = animal
       await $.store.set(STORE_ENABLED, true).catch(() => undefined)
@@ -354,6 +438,8 @@ export function register(on: On, ctx: Ctx) {
         play(band, 'auto')
       }
       start($, band)
+      // polls stopped while it was off: look again now, sign-in included
+      if (wasOff && band.isSetUp) void pollProposals($, band)
       $.ui.invalidate('ui.render')
       if (isAlways) {
         return { text: `${key}: every new session starts with ${titleOf(animal).toLowerCase()} (\`/${key} random\` undoes it)` }
@@ -405,6 +491,11 @@ export function register(on: On, ctx: Ctx) {
       band.isWorking = false
       band.activeUntil = band.frame + LINGER_FRAMES
       if (band.isSetUp) void pollProposals($, band)
+      // the strip's fire line stands through the turn it fired in and the next
+      if (band.stripFire && --band.stripFireTurns <= 0) {
+        band.stripFire = null
+        $.ui.invalidate('ui.render')
+      }
     }
     return result
   })
@@ -419,6 +510,7 @@ export function register(on: On, ctx: Ctx) {
     const result = await next(e)
     if (isClassicLane(await lanesNow($), 'pre')) {
       announce(band, firedOf(result.additionalContext ?? [], result.deny ?? result.ask).map(saidOfFire))
+      if (!band.isEnabled) $.ui.invalidate('ui.render')   // the strip has no frame clock to redraw it
     }
     return result
   })
@@ -427,6 +519,7 @@ export function register(on: On, ctx: Ctx) {
     const result = await next(e)
     if (isClassicLane(await lanesNow($), 'post')) {
       announce(band, firedOf(result.additionalContext ?? [], result.block).map(saidOfFire))
+      if (!band.isEnabled) $.ui.invalidate('ui.render')
     }
     return result
   })
@@ -434,59 +527,22 @@ export function register(on: On, ctx: Ctx) {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     // Read while drawing, so a write to either redraws the band and lands here.
     await feedFromState($, band)
-    if (!band.isEnabled || e.props.hasSurvey || (e.surface !== 'terminal' && e.surface !== 'desktop')) {
+    // The desktop sets up from its first draw (session.start named no
+    // surface there), and that draw happens while the band is still hidden:
+    // setUp is what decides whether it shows, so it runs before that test.
+    if (e.surface === 'desktop') void setUp($, band)
+    if (e.props.hasSurvey || (e.surface !== 'terminal' && e.surface !== 'desktop')) {
       band.requestId = null
       return next(e)
     }
     const { Box, Text, Button } = $.ui.resolve(e)
     band.requestId = e.requestId
     band.surface = e.surface
-    if (e.surface === 'desktop') void setUp($, band)
-    // hippo_half.py picks its pixel size from the terminal's height; the band
-    // gets less than that, and only says how much by how much it scrolled. So
-    // pick from the allowance, and where the drawing did not fit, remember the
-    // rows it actually got and pick again — shrinking until it sits whole.
-    if (band.roomAt !== e.props.bodyColumns || band.roomMax !== e.props.maxRows) {
-      band.roomAt = e.props.bodyColumns
-      band.roomMax = e.props.maxRows
-      band.roomRows = null
-    }
-    const ask = askOf(band)
-    // A waiting proposal's buttons sit inside its bubble, where Got it goes.
-    // Once the animal has said it and gone, they wait on a row of their own
-    // under it; that row is kept while one waits, so the drawing never jumps.
-    // On the desktop they always have that row (see the header).
-    const isRowed = e.surface === 'desktop' ? ask !== undefined : band.mode === 'auto' && band.asks.length > 0
-    const extra = isRowed ? 1 : 0
-    const room = Math.max(1, Math.min(e.props.maxRows, band.roomRows ?? e.props.maxRows) - extra)
-    const build = buildFor(band.animal, band.scale)
-    if (build !== band.build) {
-      // different art, different frames: it starts over rather than cutting
-      // from one drawing's pose into another's
-      band.build = build
-      band.seg = segment(band, 'offscreen')
-      band.current = { canvas: [] }
-    }
-    band.layout = layoutOf(build, e.props.bodyColumns, room, band.scale ?? undefined, linesOf(band), e.surface === 'desktop' ? 0 : 1)
-    if (!band.layout) {
-      const name = band.animal.name.toLowerCase()
-      const where = e.surface === 'desktop' ? 'window' : 'terminal'
-      return Text({ dimColor: true, children: `make the ${where} a little bigger for the ${name}` })
-    }
-    const { bodyRows } = e.props.scroll
-    if (bodyRows > 0 && bodyRows < band.layout.rows + extra && band.roomRows !== bodyRows) {
-      band.roomRows = bodyRows
-      $.ui.invalidate('ui.render')
-    }
     // opens a rule's page in MemHub Studio. A pressable word rather than a
     // link: a terminal without hyperlinks draws a Link or a Markdown link as
     // its text and then its URL, which ran down the bubble past its bottom.
     const opens = (url: string) => () => void openUrl($, band, url)
-    const petButton = () =>
-      Button({ key: PET_KEY, plain: true, dimColor: true, label: '♥', onPress: () => onClick(band) })
-    const at = buttonsAt(band, build, band.layout)
-    band.buttonsKey = keyOfButtons(at)
-    // under the animal, the rule's name opens it (#67's link), as `rule` does
+    // under the animal (or on the strip), the rule's name opens it (#67's link), as `rule` does
     const name = (ask: Proposed, width: number) =>
       ask.url
         ? Button({ key: 'rule-name', plain: true, label: nameOf(ask, width), hover: { underline: true }, onPress: opens(ask.url) })
@@ -511,6 +567,93 @@ export function register(on: On, ctx: Ctx) {
     }
     const waiting = (ask: Proposed) =>
       Box({ key: 'rule-waiting', gap: 2, children: [Text({ dimColor: true, children: 'new rule waiting:' }), name(ask, 40), ...controlsFor(ask)] })
+    // The enable ask (ENG-1253): the same three-button row as a proposal's,
+    // with its own three answers. The digits are the keys to press.
+    const asking = (identity: string) =>
+      Box({
+        key: ENABLE_KEY, gap: 2, children: [
+          Text({ wrap: 'truncate-end', children: `MemHub · enable in ${identity}?` }),
+          ...(band.enableAsk === 'answering'
+            ? [Text({ color: '#968ca5', children: 'writing…' })]
+            : [
+                Button({ key: 'enable-yes', hotkey: '1', plain: true, label: 'Yes', onPress: () => void answerEnable($, band, 'yes') }),
+                Button({ key: 'enable-no', hotkey: '2', plain: true, label: 'No', onPress: () => void answerEnable($, band, 'no') }),
+                Button({ key: 'enable-later', hotkey: '3', plain: true, dimColor: true, label: 'Later', onPress: () => enableLater($, band) }),
+              ]),
+        ],
+      })
+
+    // The status strip: the animal is off (the `companion` option, `/<animal>
+    // off`, or a repository MemHub is inactive in), and one plain line stands
+    // in its place so the mod's presence stays visible. Its text, in this
+    // order: the latest fire, as the animal would say it; a waiting proposal
+    // with its 1 Activate / 2 Reject / 3 Later buttons and the rule's name as
+    // the link to Studio — the proposal flow needs no animal; the enable ask,
+    // where this repository is unlisted and undeclined (enableAskOf); else,
+    // dim, what MemHub is doing here. Nothing on it moves: no frame clock runs.
+    if (!band.isEnabled) {
+      const fire = band.stripFire
+      const ask = band.asks[0]
+      const enable = enableAskOf(band)
+      // a Text takes no key, so the keyed Box is what a test (and a surface) finds
+      const line = fire
+        ? Box({
+            key: STRIP_KEY,
+            children: Text({
+              wrap: 'truncate-end', ...(fire.tone === 'blocked' ? { color: BLOCKED_HEX } : {}),
+              children: `${fire.tone === 'blocked' ? '⛔️' : '📏'} ${fire.text}`,
+            }),
+          })
+        : ask
+          ? waiting(ask)
+          : enable
+            ? asking(enable)
+            : Box({ key: STRIP_KEY, children: Text({ dimColor: true, wrap: 'truncate-end', children: quietOf($, band) }) })
+      return Box({ key: 'memhub-strip-row', justifyContent: 'flex-end', children: line })
+    }
+    // hippo_half.py picks its pixel size from the terminal's height; the band
+    // gets less than that, and only says how much by how much it scrolled. So
+    // pick from the allowance, and where the drawing did not fit, remember the
+    // rows it actually got and pick again — shrinking until it sits whole.
+    if (band.roomAt !== e.props.bodyColumns || band.roomMax !== e.props.maxRows) {
+      band.roomAt = e.props.bodyColumns
+      band.roomMax = e.props.maxRows
+      band.roomRows = null
+    }
+    const ask = askOf(band)
+    // A waiting proposal's buttons sit inside its bubble, where Got it goes.
+    // Once the animal has said it and gone, they wait on a row of their own
+    // under it; that row is kept while one waits, so the drawing never jumps.
+    // On the desktop they always have that row (see the header).
+    const isRowed = e.surface === 'desktop' ? ask !== undefined : band.mode === 'auto' && band.asks.length > 0
+    // no one signed in: a row of its own under the animal, kept until a poll finds a sign-in
+    const isSignedOut = band.mode === 'auto' && band.signIn === 'out'
+    const extra = (isRowed ? 1 : 0) + (isSignedOut ? 1 : 0)
+    const room = Math.max(1, Math.min(e.props.maxRows, band.roomRows ?? e.props.maxRows) - extra)
+    const build = buildFor(band.animal, band.scale)
+    if (build !== band.build) {
+      // different art, different frames: it starts over rather than cutting
+      // from one drawing's pose into another's
+      band.build = build
+      band.seg = segment(band, 'offscreen')
+      band.current = { canvas: [] }
+    }
+    band.layout = layoutOf(build, e.props.bodyColumns, room, band.scale ?? undefined, linesOf(band), e.surface === 'desktop' ? 0 : 1)
+    if (!band.layout) {
+      const name = band.animal.name.toLowerCase()
+      const where = e.surface === 'desktop' ? 'window' : 'terminal'
+      return Text({ dimColor: true, children: `make the ${where} a little bigger for the ${name}` })
+    }
+    const { bodyRows } = e.props.scroll
+    if (bodyRows > 0 && bodyRows < band.layout.rows + extra && band.roomRows !== bodyRows) {
+      band.roomRows = bodyRows
+      $.ui.invalidate('ui.render')
+    }
+    const petButton = () =>
+      Button({ key: PET_KEY, plain: true, dimColor: true, label: '♥', onPress: () => onClick(band) })
+    const at = buttonsAt(band, build, band.layout)
+    band.buttonsKey = keyOfButtons(at)
+    const signedOut = isSignedOut ? [Box({ key: 'signed-out', children: Text({ dimColor: true, children: SIGNED_OUT_ROW }) })] : []
 
     if (e.surface === 'desktop') {
       const buf = compose(band.current, build, titleOf(band.animal), band.layout)
@@ -530,8 +673,9 @@ export function register(on: On, ctx: Ctx) {
           }),
         ],
       })
-      if (!ask || at === null) return Box({ justifyContent: 'flex-end', children: art })
-      return Box({ flexDirection: 'column', alignItems: 'flex-end', children: [art, waiting(ask)] })
+      const under = [...(ask && at !== null ? [waiting(ask)] : []), ...signedOut]
+      if (under.length === 0) return Box({ justifyContent: 'flex-end', children: art })
+      return Box({ flexDirection: 'column', alignItems: 'flex-end', children: [art, ...under] })
     }
 
     band.lastCells = cellsOf(band) ?? ''
@@ -559,30 +703,17 @@ export function register(on: On, ctx: Ctx) {
           }),
         })]
       : []
-    if (!ask || !at) {
-      return Box({ justifyContent: 'flex-end', children: Box({ children: [raster, clicks, ...linked] }) })
-    }
-    if (at !== 'below') {
-      return Box({
-        justifyContent: 'flex-end',
-        children: Box({
-          children: [
-            raster,
-            clicks,
-            ...linked,
-            Box({
-              position: 'absolute', top: at.row, left: at.col, width: at.width,
-              backgroundColor: BUB_BG_HEX, gap: 2, children: controlsFor(ask),
-            }),
-          ],
-        }),
-      })
-    }
-    return Box({
-      flexDirection: 'column',
-      alignItems: 'flex-end',
-      children: [Box({ children: [raster, clicks, ...linked] }), waiting(ask)],
-    })
+    // the buttons inside the bubble, once its text is typed out (see buttonsAt)
+    const inBubble = ask && at && at !== 'below'
+      ? [Box({
+          position: 'absolute', top: at.row, left: at.col, width: at.width,
+          backgroundColor: BUB_BG_HEX, gap: 2, children: controlsFor(ask),
+        })]
+      : []
+    const drawn = Box({ children: [raster, clicks, ...linked, ...inBubble] })
+    const under = [...(ask && at === 'below' ? [waiting(ask)] : []), ...signedOut]
+    if (under.length === 0) return Box({ justifyContent: 'flex-end', children: drawn })
+    return Box({ flexDirection: 'column', alignItems: 'flex-end', children: [drawn, ...under] })
   })
 }
 
@@ -599,7 +730,7 @@ async function feedFromState($: EngineInterface, band: Band) {
   const isFirstLook = band.seenFires === null
   band.seenFires = seen
   // the first look of this load takes what is there as already said
-  if (!isFirstLook && band.isEnabled) announce(band, fresh.map(saidOfNote))
+  if (!isFirstLook) announce(band, fresh.map(saidOfNote))
   const notes = proposalsOf(await readSafe(() => read($, PROPOSALS)))
   if (notes !== null && proposalsKey(notes) !== band.proposalsKey) {
     band.proposalsKey = proposalsKey(notes)
@@ -627,14 +758,18 @@ async function lanesNow($: EngineInterface) {
  * that could not ask changes nothing.
  */
 async function pollProposals($: EngineInterface, band: Band) {
-  if (band.isPolling || !band.isEnabled) return
+  if (band.isPolling) return   // with the animal off the strip asks and answers, so the poll runs either way
   band.isPolling = true
   try {
     const session = await sessionIdOf($)
-    if (!session) return
     const since = await $.clock.now().catch(() => 0)
+    if (!session) return
     const listed = await listProposed($, band, session, since)
-    if (!listed) return
+    // a key the server refuses twice is no sign-in, whatever api-info says; no
+    // key is what the lookup the list just made said; a list that failed any
+    // other way says nothing of the sign-in
+    noteSignIn($, band, session, listed === 'refused' ? 'out' : listed === 'no_key' ? signInOf(band) : listed ? 'in' : 'unknown')
+    if (!listed || listed === 'refused' || listed === 'no_key') return
     band.env = envName(band.ctx.env)
     const merged = await update($, PROPOSALS, current => mergedProposals(proposalsOf(current) ?? [], listed.notes, since))
       .then(proposalsOf, () => null)
@@ -647,6 +782,29 @@ async function pollProposals($: EngineInterface, band: Band) {
   } finally {
     band.isPolling = false
   }
+}
+
+/**
+ * What the poll found of the sign-in: no one signed in is said once a
+ * session and keeps its row under the animal; a sign-in after that is said
+ * too and takes the row away. 'unknown' (api-info could not answer) is
+ * neither, so a broken lookup never tells a signed-in person to log in.
+ */
+function noteSignIn($: EngineInterface, band: Band, session: string, now: SignIn) {
+  if (now === 'unknown') return
+  const was = band.signIn
+  // the strip keeps the answer too (its not-signed-in line, and the enable
+  // ask, which waits for a sign-in) but has no bubble to say it in
+  band.signIn = now
+  if (band.isEnabled) {
+    if (now === 'out' && band.saidSignedOutIn !== session) {
+      band.saidSignedOutIn = session
+      announce(band, [{ text: SIGNED_OUT_SAID, tone: 'advice' }])
+    } else if (now === 'in' && was === 'out') {
+      announce(band, [{ text: SIGNED_IN_SAID, tone: 'advice' }])
+    }
+  }
+  if (now !== was) $.ui.invalidate('ui.render')
 }
 
 /** Hand `notes` to the band after any update still running. */
@@ -671,7 +829,6 @@ async function applyProposals($: EngineInterface, band: Band, notes: readonly Pr
     band.queue = band.queue.filter(q => !(q.tone === 'proposed' && unsaid.has(q.text)))
     $.ui.invalidate('ui.render')
   }
-  if (!band.isEnabled) return
   const session = await sessionIdOf($)
   const stored = announcedOf(await $.store.get(STORE_ANNOUNCED).catch(() => undefined))
   if (session) for (const id of announcedIn(stored, session)) band.announced.add(id)
@@ -702,6 +859,15 @@ async function applyProposals($: EngineInterface, band: Band, notes: readonly Pr
  */
 async function apiFor(band: Band): Promise<Api | undefined> {
   return band.ctx.api().then(a => (isApi(a) ? a : undefined), () => undefined)
+}
+
+/** What the last credential lookup said of the sign-in; 'unknown' for a ctx that cannot say. */
+function signInOf(band: Band): SignIn {
+  try {
+    return band.ctx.signIn()
+  } catch {
+    return 'unknown'
+  }
 }
 
 /** Drop the cached credential (after a 401) so the next apiFor() resolves it again. */
@@ -751,11 +917,15 @@ async function send($: EngineInterface, band: Band, path: string, body?: { metho
 
 /**
  * This session's rules still `proposed` as the server lists them, and the
- * base that answered; null when it could not be asked or answered oddly —
- * then nothing may be taken off the band.
+ * base that answered; 'no_key' when there was no key to send; 'refused'
+ * when the key was refused even freshly resolved (a second 401); null when it could not be asked or answered oddly
+ * — then nothing may be taken off the band.
  */
-async function listProposed($: EngineInterface, band: Band, session: string, at: number): Promise<{ notes: ProposalNote[]; base: string } | null> {
+async function listProposed($: EngineInterface, band: Band, session: string, at: number): Promise<{ notes: ProposalNote[]; base: string } | 'refused' | 'no_key' | null> {
   const sent = await send($, band, PROPOSED_PATH)
+  if (sent === 'no_key') return 'no_key'
+  // a second 401, with a freshly resolved key: the key itself is refused
+  if (sent && sent !== 'no_key' && sent.status === 401) return 'refused'
   if (!sent || sent === 'no_key' || sent.status < 200 || sent.status >= 300) return null
   const notes = listedRules(sent.text, session, at)
   return notes ? { notes, base: sent.base } : null
@@ -794,14 +964,15 @@ async function forget($: EngineInterface, band: Band, ruleId: string) {
 async function setUp($: EngineInterface, band: Band) {
   if (band.isSetUp) return
   band.isSetUp = true
-  band.isEnabled = (await $.store.get(STORE_ENABLED).catch(() => undefined)) !== false
+  band.isEnabled = await wantedOf($, band)
   const savedScale = await $.store.get(STORE_SCALE).catch(() => undefined)
   band.scale = SCALES.includes(savedScale as never) ? (savedScale as number) : null
   band.sessionId = await sessionIdOf($)
-  // The engine has already drawn the band by now — for the fallback animal,
-  // at no saved scale, enabled — and nothing redraws it on its own: switch
-  // the art as well as the name, or the fallback walks in and stays until
-  // the terminal is next resized (a tmux split was how it showed).
+  // The engine has already drawn the band by now — hidden, since nothing is
+  // shown before this decides — and nothing redraws it on its own: switch
+  // the art as well as the name, then invalidate below, or the fallback
+  // walks in and stays until the terminal is next resized (a tmux split was
+  // how it showed).
   const animal = await pickFor($, band.sessionId)
   if (animal !== band.animal || buildFor(animal, band.scale) !== band.build) {
     switchTo(band, animal)
@@ -825,6 +996,128 @@ async function setUp($: EngineInterface, band: Band) {
   // proposed rules: once now, then on the clock (and at each turn's end)
   band.pollTimer ??= $.clock.every(POLL_MS, () => void pollProposals($, band))
   void pollProposals($, band)
+}
+
+/**
+ * Whether the companion shows in this session: the person turned it on
+ * (`/<animal>`, stored true), or the plugin's `companion` option is on and
+ * nobody turned it off (`/<animal> off`, stored false) — and MemHub is
+ * active in the session's repository (`activeOf`). With the option off and
+ * nothing stored, which is how the plugin installs, it stays away.
+ */
+async function wantedOf($: EngineInterface, band: Band): Promise<boolean> {
+  const stored = await $.store.get(STORE_ENABLED).catch(() => undefined)
+  const wanted = stored === true || (band.optionOn && stored !== false)
+  band.active = await activeOf($, band)
+  return wanted && band.active.enabled
+}
+
+/**
+ * The strip's quiet line, when nothing fired and nothing waits: where MemHub
+ * is inactive (the allowlist) — this repository not listed, or no repository
+ * here at all — how to enable it; else the book the mod holds for this
+ * repository, or that the session is being captured.
+ */
+function quietOf($: EngineInterface, band: Band): string {
+  if (stripSignIn(band) === 'out') return `MemHub · ${SIGNED_OUT_ROW}`
+  if (band.active && !band.active.enabled) {
+    return band.active.repo
+      ? `MemHub · inactive in this repo (/${$.plugin.name}:repos add .)`
+      : `MemHub · inactive here: not in a repository (/${$.plugin.name}:repos add . inside one)`
+  }
+  const book = band.ctx.book()
+  if (!book) return 'MemHub · capturing'
+  if (!book.rules) return `MemHub · capturing · no rules for ${book.repo}`
+  return `MemHub · ${book.rules} rule${book.rules === 1 ? '' : 's'} armed for ${book.repo}`
+}
+
+/**
+ * The sign-in as the strip knows it: what the poll last found, else what the
+ * credential lookup itself said (ctx.signIn: 'in' with a key, even when the
+ * poll's request then failed). 'unknown' before either.
+ */
+function stripSignIn(band: Band): SignIn {
+  return band.signIn !== 'unknown' ? band.signIn : signInOf(band)
+}
+
+/**
+ * The repository the strip asks to enable MemHub in (ENG-1253), or undefined
+ * for no ask. Every condition must hold, all from `paths` at boot: a
+ * repos.json exists (`restricted`), the session is inside a checkout (`repo`
+ * and `identity` known), the person is signed in, and the repository is
+ * neither listed (`enabled`) nor declined — and the person has not said
+ * Later this session. Not signed in: the quiet line's own row wins, and the
+ * ask waits for a sign-in. Nothing here reads repos.json.
+ */
+function enableAskOf(band: Band): string | undefined {
+  const a = band.active
+  if (!a || a.enabled || !a.restricted || a.declined || !a.repo || !a.identity) return undefined
+  if (band.enableAsk === 'later') return undefined
+  if (stripSignIn(band) !== 'in') return undefined
+  return a.identity
+}
+
+/**
+ * The ask's Yes or No: `rulebook_mod_cli.py answer`, which lists (Yes:
+ * `repo_allow.allow`, what `/memhub:repos add .` writes) or declines (No:
+ * `repo_allow.decline`) the session's checkout. The buttons wait while it
+ * writes, so a second press cannot answer twice. The Python hooks read the
+ * file per call and follow at the next one; the mod flips its own state here:
+ * ctx.active() (so `/goose` and the shell see it) and the strip's line — after
+ * Yes the animal, where the option or the store asks for it, as in any listed
+ * repository; else the quiet line. A write that failed leaves the ask up.
+ */
+async function answerEnable($: EngineInterface, band: Band, say: 'yes' | 'no') {
+  const was = band.active
+  if (band.enableAsk !== 'open' || !was?.identity) return
+  band.enableAsk = 'answering'
+  $.ui.invalidate('ui.render')
+  let got: Record<string, unknown> | undefined
+  try {
+    const cwd = band.cwd || (await $.session.cwd().catch(() => '')) || '.'
+    const argv = ['python3', `${rootOf($)}/${MOD_CLI}`, 'answer', '--env', band.ctx.env, '--cwd', cwd, '--say', say]
+    const run = await $.process.run(argv, { timeoutMs: 10_000 }).catch(() => null)
+    const out = run && run.exitCode === 0 ? lastJson(run.stdout) : undefined
+    got = out && typeof out === 'object' ? (out as Record<string, unknown>) : undefined
+  } finally {
+    band.enableAsk = 'open'
+  }
+  if (!got || typeof got.enabled !== 'boolean') {
+    $.ui.invalidate('ui.render')
+    return
+  }
+  const next: Active = { ...was, enabled: got.enabled, declined: got.declined === true }
+  band.active = next
+  band.ctx.setActive(next)
+  if (next.enabled && !band.isEnabled) {
+    const stored = await $.store.get(STORE_ENABLED).catch(() => undefined)
+    if (stored === true || (band.optionOn && stored !== false)) {
+      band.isEnabled = true
+      start($, band)
+      if (band.isSetUp) void pollProposals($, band)
+    }
+  }
+  $.ui.invalidate('ui.render')
+}
+
+/** The ask's Later: hidden for the rest of this session, and nothing written. */
+function enableLater($: EngineInterface, band: Band) {
+  band.enableAsk = 'later'
+  $.ui.invalidate('ui.render')
+}
+
+/**
+ * The repository allowlist's answer for the session, as the shell read it
+ * (mod/ctx.ts `active`). The shell asks Python once at boot; should that
+ * take longer than ACTIVE_WAIT_MS, the animal shows rather than waits.
+ */
+async function activeOf($: EngineInterface, band: Band): Promise<Active> {
+  const asIs: Active = { enabled: true, repo: '' }
+  try {
+    return await Promise.race([band.ctx.active(), $.clock.sleep(ACTIVE_WAIT_MS).then(() => asIs)])
+  } catch {
+    return asIs
+  }
 }
 
 /** The most lines a bubble says where the band is drawn; the terminal's default when undefined. */
@@ -1095,6 +1388,16 @@ function later($: EngineInterface, band: Band) {
 
 function announce(band: Band, said: readonly Said[]) {
   if (said.length === 0) return
+  if (!band.isEnabled) {
+    // The strip: no bubble to say it in. The latest fire stands on the line
+    // (a proposal is shown from `asks`, with its buttons, not said).
+    const fire = [...said].reverse().find(s => s.tone !== 'proposed')
+    if (fire) {
+      band.stripFire = fire
+      band.stripFireTurns = STRIP_FIRE_TURNS
+    }
+    return
+  }
   band.queue.push(...said)
   band.queue.splice(0, Math.max(0, band.queue.length - MAX_QUEUED))
   nudge(band)

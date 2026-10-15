@@ -91,6 +91,7 @@ import tempfile
 import time
 import urllib.parse
 import uuid
+
 from datetime import datetime, timedelta, timezone
 
 def _load_shim(name):
@@ -108,6 +109,7 @@ def _load_shim(name):
 
 portable_lock = _load_shim("portable_lock")
 repo_identity = _load_shim("repo_identity")
+repo_allow = _load_shim("repo_allow")         # the per-machine repository allowlist
 rulebook_ledger = _load_shim("rulebook_ledger")   # ledger rotation, append lock
 
 try:  # one dir per backend, so staging and prod never share one (rulebook_paths.py)
@@ -133,13 +135,37 @@ LOCK_WAIT_S = 0.05      # ordering state lock: fail open past this
 LEDGER_SCHEMA = 2       # ledger/fires.jsonl row shape (spec §3.2)
 BOOK_DIR = os.path.join(BASE, "book")
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from rulebook_shell import (  # noqa: E402,F401 — split out for size (rulebook_shell.py); tests read expand_path, heredoc_bodies, _HD_OPEN here
+    BASH_READ_MAX_FILES,
+    _head_tail_lines,
+    _sed_lines,
+    bash_reads,
+    BASH_EDIT_MAX_BYTES,
+    BASH_EDIT_MAX_FILES,
+    _COMMENT_RX,
+    _HD_OPEN,
+    _SEPARATOR_RX,
+    _segment_op,
+    bash_dirs,
+    bash_write_targets,
+    blank_quoted,
+    blank_syntax,
+    call_dir,
+    read_cd,
+    expand_path,
+    heredoc_bodies,
+    shell_only,
+    strip_leading_assignments,
+)
+
 # ── forward-test redirect (spec §4.3.3) ─────────────────────────────────────
 #
 # /memhub:create-rule's §4b test arms its candidate in a PRIVATE base instead
 # of the shared book every session reads. The redirect is keyed on the session
 # cwd (the test sub-agent's scratch worktree), so only its own calls read the
 # doctored book. The cwd is the host's, not the model's, so it is the trust
-# boundary (see `_acted_on_dir`); a redirect file not owned by the user, or
+# boundary for the redirect; a redirect file not owned by the user, or
 # group-/world-writable, is ignored.
 REDIRECT_NAME = "pretest-redirect.json"
 REDIRECT_MAX_AGE_S = 3600    # a forgotten redirect stops steering anything after an hour
@@ -174,11 +200,7 @@ FLUSH_EVERY_S = 300          # …or this long has passed since the last flush
 FLUSH_BATCH = 200
 EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
 READ_TOOLS = ("Read",)
-BASH_READ_MAX_FILES = 8            # read segments named per Bash call; past that it is a script, not a read
 READ_COUNT_MAX_BYTES = 64 << 20    # lines are counted this far; a file past it is over any threshold anyone sets
-# A Bash call that wrote files is an edit too (see `bash_written_files`).
-BASH_EDIT_MAX_FILES = 40            # more than this in one call is a generator, not an edit
-BASH_EDIT_MAX_BYTES = 512 * 1024    # per file; bigger is data, not source
 BASH_EDIT_MAX_STATUS = 4000         # `git status` entries; past that the tree is too noisy to read
 BASH_EDIT_MARKS_KEPT = 8            # pre-call timestamps kept per session (parallel calls)
 # Tree rewrites: every touched file has a new mtime but nobody EDITED it, and an
@@ -195,27 +217,6 @@ STDLIB = set(getattr(sys, "stdlib_module_names", ())) or {
     "typing", "unittest", "urllib", "uuid", "warnings",
 }
 LOCAL_PKGS = {"xmem", "evaluation", "tests", "app", "scripts"}
-
-
-# ── shell-only segment ──────────────────────────────────────────────────────
-_HD_OPEN = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_]\w*)\1")   # delimiter must be a word, so `x << 2` is a shift
-
-
-def shell_only(cmd):
-    """Drop heredoc BODY lines; keep every shell line, including commands
-    after a terminator (`commit -F - <<'MSG' … && git push`).
-    Known edge: a bit-shift in a multi-line command can arm a bogus skip."""
-    out, skip_until = [], None
-    for line in cmd.split("\n"):
-        if skip_until is not None:
-            if line.strip() == skip_until:
-                skip_until = None
-            continue
-        out.append(line)
-        m = _HD_OPEN.search(line)
-        if m:
-            skip_until = m.group(2)
-    return "\n".join(out)
 
 
 # Everything `_SEPARATOR_RX` knows EXCEPT the single pipe, which is left in
@@ -261,26 +262,7 @@ def and_only_segments(shell):
     return [x.strip() for x in out if x.strip()]
 
 
-# Quoted spans, blanked to spaces IN PLACE. `shlex` would tokenise properly
-# but throws on the half-quoted strings real commands contain, and this only
-# needs the contents neutralised, not the tokens. Length-preserving on
-# purpose: the separator scans below find operators in the blanked copy and
-# slice the ORIGINAL at those offsets, so quoted text survives intact.
-# A double-quoted span honours backslash escapes; a single-quoted span has
-# none in POSIX shell.
-_QUOTED_SINGLE = r"'[^']*'"
-_QUOTED_DOUBLE = r'"(?:\\.|[^"\\])*"'
-_QUOTED_RX = re.compile(_QUOTED_SINGLE + "|" + _QUOTED_DOUBLE)
-# `&&` and `||` first, so the lone-operator alternatives only see what is
-# left. A standalone `&` backgrounds the command to its left and the next one
-# runs anyway — `gh pr view -R other & git push` is TWO commands. The
-# lookarounds keep redirection out: `2>&1`, `cmd >&2`, `cmd &> log`.
-_SEPARATOR_RX = re.compile(r"&&|\|\||;|\n|\||(?<![>&])&(?![>&])")
 _AND_RX = re.compile(r"&&")
-_ESCAPE_RX = re.compile(r"\\.", re.S)   # a backslash escape, outside quotes
-# A `#` starts a comment at the start of a word: after whitespace, an
-# operator, or a grouping paren/brace. NOT after `{` — `${#files}` is a length.
-_COMMENT_RX = re.compile(r"(?<![^\s;&|()}])#[^\n]*")
 # A trailing `;` or newline ends the last command; it does not start an empty
 # one (`pytest;` is a run of pytest). A trailing `&` is NOT a terminator.
 _TRAILING_TERMINATOR_RX = re.compile(r"[\s;\n]+$")
@@ -288,25 +270,6 @@ _TRAILING_TERMINATOR_RX = re.compile(r"[\s;\n]+$")
 
 def trim_terminators(shell):
     return _TRAILING_TERMINATOR_RX.sub("", shell or "")
-
-
-def blank_quoted(text):
-    """`text` with the contents of quoted spans — and every backslash escape
-    outside them — replaced by spaces, character for character, so every
-    offset still points at the same place.
-
-    A `\\|` is not a pipe: an escape is data, just as quoting is."""
-    return _COMMENT_RX.sub(lambda m: " " * len(m.group(0)), blank_syntax(text))
-
-
-def blank_syntax(text):
-    """Quotes and escapes blanked, comments LEFT IN PLACE, length preserved.
-
-    Exposed for `strip_comments`. Escapes become a NON-space placeholder,
-    because `\\ ` joins two words in bash (`.title\\ #literal` is no comment)."""
-    blanked = _QUOTED_RX.sub(lambda m: m.group(0)[0] + " " * (len(m.group(0)) - 2)
-                             + m.group(0)[-1], text or "")
-    return _ESCAPE_RX.sub("\x01\x01", blanked)
 
 
 def unquoted(text):
@@ -380,51 +343,6 @@ def receipt_segments(shell, whole_chain=False):
     return []
 
 
-# ── a leading assignment is not part of the command ─────────────────────────
-#
-# `FOO=1 git push` execs `git push`, and a rule has to read it the same way,
-# or an ANCHORED rule (`^git\s+push`) is silently bypassed by any prefix —
-# including a refused `RULEBOOK_OVERRIDE=` that `strip_override` leaves in.
-_ASSIGN_TOKEN_RX = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=(?:'[^']*'|\"[^\"]*\"|\S*)\s*")
-_ASSIGN_NAME_RX = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
-
-
-def strip_leading_assignments(shell):
-    """`shell` with the env assignments that BEGIN a segment removed, byte for
-    byte identical everywhere else.
-
-    Tokenised per line by `find_override`'s shlex walk, so a quoted
-    assignment is data and an unparseable line is handed back untouched. A
-    run is stripped whole (`FOO=1 BAR=2 git push` -> `git push`)."""
-    out = []
-    for line in shell.split("\n"):
-        try:
-            lex = shlex.shlex(line, posix=True, punctuation_chars=True)
-            lex.whitespace_split = True
-            toks = list(lex)
-        except ValueError:                  # unbalanced quoting: not ours to rewrite
-            out.append(line)
-            continue
-        targets, at_start = [], True
-        for tok in toks:
-            if at_start and _ASSIGN_NAME_RX.match(tok):
-                targets.append(tok)         # stay at_start: assignments come in runs
-                continue
-            at_start = _segment_op(tok)
-        stripped = line
-        for val in targets:
-            for m in _ASSIGN_TOKEN_RX.finditer(stripped):
-                try:
-                    if shlex.split(m.group(0))[0] != val:
-                        continue
-                except (ValueError, IndexError):
-                    continue
-                stripped = stripped[:m.start()] + stripped[m.end():]
-                break
-        out.append(stripped)
-    return "\n".join(out)
-
-
 def strip_comments(text):
     """`text` with `#` comments blanked and quotes left INTACT, length
     preserved.
@@ -464,10 +382,11 @@ def command_fires(rx, text, not_rx=None, flags=re.I | re.M):
 # ── files a Bash call wrote ─────────────────────────────────────────────────
 #
 # A model writes files through Bash too (`cat > f <<EOF`, `sed -i`, a Python
-# heredoc). The command line cannot recover the path, so this reads the DISK:
-# the pre lane stamps the call, the post lane asks git what changed since and
-# feeds each file through the same matcher a Write goes through. It lands
-# AFTER the write, so it advises only.
+# heredoc). The writes the command line shows are judged BEFORE it runs
+# (`bash_write_targets`, below) and can gate. This is the backstop for the
+# rest, read from the DISK: the pre lane stamps the call, the post lane asks
+# git what changed since and feeds each file through the same matcher a Write
+# goes through. It lands AFTER the write, so it advises only.
 
 def _worktrees(root):
     """Every worktree of `root`'s repository, `root` first. Empty on any failure."""
@@ -527,19 +446,26 @@ def apply_patch_files(inp, cwd):
             for path, is_new, added in files[:BASH_EDIT_MAX_FILES]]
 
 
-def bash_written_files(root, cmd, since):
-    """(path, is_new) for each regular file a Bash call left modified or new.
+def bash_written_files(root, cmd, since, also=()):
+    """(path, is_new, worktree) for each regular file a Bash call left
+    modified or new.
 
-    Scanned: the session's worktree, plus any sibling worktree the command
-    names (not all of them — one `git status` each per call is too costly).
-    `git status` decides candidates (so .gitignore excludes), the mtime what
-    THIS call touched. Past BASH_EDIT_MAX_FILES it returns [] — a generator
-    or tree rewrite, not an edit.
+    Scanned: the call's worktree; every worktree in `also` — the checkouts
+    the command was resolved to run in (`bash_dirs`: `cd ~/wt`, `cd ../wt`,
+    `git -C "$WT"`, however it is spelled) and the session's own; and any
+    sibling worktree whose path the command spells out literally (not all of
+    them — one `git status` each per call is too costly). `git status`
+    decides candidates (so .gitignore excludes), the mtime what THIS call
+    touched. Past BASH_EDIT_MAX_FILES it returns [] — a generator or tree
+    rewrite, not an edit.
     """
     if not root or since is None or _TREE_REWRITE_RX.search(shell_only(cmd or "")):
         return []
     roots = [w for w in _worktrees(root)
              if w == root or any(n in (cmd or "") for n in _names_of(w))]
+    for w in also:
+        if w and not any(_same_dir(w, r) for r in roots):
+            roots.append(w)
     out = []
     for wt in roots:
         try:
@@ -573,138 +499,9 @@ def bash_written_files(root, cmd, since):
             # a coarse filesystem can under-count, the safe direction.
             if not stat.S_ISREG(st.st_mode) or st.st_mtime < since:
                 continue
-            out.append((path, is_new))
+            out.append((path, is_new, wt))
             if len(out) > BASH_EDIT_MAX_FILES:
                 return []
-    return out
-
-
-# ── files a Bash call READS into context ────────────────────────────────────
-#
-# A read rule (`event: read`) is about what enters the model's context: the
-# Read tool, and `cat`/`head`/`tail`/`less`/`more`/`sed` on a path (most of
-# the largest tool results are whole-file shell dumps).
-#
-# Read from the COMMAND, not the disk, because this lane must gate. A pipe or
-# redirect is not a read into context, and every doubt resolves to "no read
-# here" — under-count, never false-fire. `cd` is tracked segment by segment
-# (`cd <repo> && cat spec.md`).
-
-_READ_CMDS = ("cat", "head", "tail", "less", "more", "sed")
-# stdout going somewhere other than the context: `> f`, `>> f`, `&> f`, and a
-# heredoc opener (its stdin is data). `2>/dev/null` and `2>&1` are not that.
-_REDIRECT_RX = re.compile(r"(?<![0-9&<])>(?!&)|&>|<<")
-_SED_RANGE_RX = re.compile(r"^(\d+)(?:,(\+)?(\d+|\$))?p$")
-_LINES_FLAG_RX = re.compile(r"^(?:-n|--lines=)(\d+)$|^-(\d+)$")
-
-
-def _head_tail_lines(args):
-    """(lines printed, indices of the flag VALUES) for `head`/`tail`: 10 by
-    default, `-N`, `-n N`, `-nN`, `--lines=N`. (None, None) for a form this
-    does not name (`-c` bytes, `-n +N`) — not a read this can measure."""
-    n, i, used = 10, 0, set()
-    while i < len(args):
-        a = args[i]
-        if a in ("-c", "--bytes") or a.startswith("--bytes=") or a.startswith("-c"):
-            return None, None
-        if a in ("-n", "--lines"):
-            if i + 1 >= len(args) or not args[i + 1].isdigit():
-                return None, None
-            n, used, i = int(args[i + 1]), used | {i + 1}, i + 2
-            continue
-        m = _LINES_FLAG_RX.match(a)
-        if m:
-            n = int(m.group(1) or m.group(2))
-        i += 1
-    return n, used
-
-
-def _sed_lines(args):
-    """(lines printed, indices that are not files) for a `sed` that prints
-    to stdout. `-n 'A,Bp'` is a range, `-n 'Ap'` one line, `-n '1,$p'` the
-    whole file; `sed s/a/b/ f` with no -n prints every line. `-i` writes in
-    place and prints nothing, and a script this cannot read is not a read —
-    both answer (None, None)."""
-    if any(a == "-i" or a.startswith("-i") or a == "--in-place" for a in args):
-        return None, None
-    quiet, script, used, i = False, None, set(), 0
-    while i < len(args):
-        a = args[i]
-        if a in ("-n", "--quiet", "--silent"):
-            quiet = True
-        elif a in ("-e", "--expression", "-f", "--file"):
-            if i + 1 < len(args):
-                used.add(i + 1)
-                if a in ("-e", "--expression"):
-                    script = args[i + 1]
-            i += 2
-            continue
-        elif a.startswith("-"):
-            pass
-        elif script is None:
-            script, used = a, used | {i}
-        i += 1
-    if script is None:
-        return None, None
-    if not quiet:
-        return None, used               # prints the whole file, transformed
-    m = _SED_RANGE_RX.match(script.replace(" ", ""))
-    if not m:
-        return None, None               # `/x/,/y/p` and friends: not a read we can measure
-    a, plus, b = int(m.group(1)), m.group(2), m.group(3)
-    if b is None:
-        return 1, used
-    if b == "$":
-        return None, used
-    return (int(b) + 1 if plus else max(int(b) - a + 1, 0)), used
-
-
-def bash_reads(cwd, cmd):
-    """(path, pulled) for each file a Bash call would print into the context;
-    `pulled` is the line count the form asks for, None meaning every line.
-    Relative paths resolve where the command runs, `cd` included. Anything
-    this cannot name is not a read — the list is empty on every doubt."""
-    out = []
-    here = os.path.expanduser(cwd or "") or os.getcwd()
-    for seg in re.split(r"&&|\|\||;|\n", shell_only(cmd or "")):
-        seg = strip_leading_assignments(seg.strip()).strip()
-        if not seg:
-            continue
-        try:
-            toks = shlex.split(seg)
-        except ValueError:
-            continue
-        if not toks:
-            continue
-        if toks[0] == "cd":
-            target = os.path.expanduser(toks[1]) if len(toks) > 1 else os.path.expanduser("~")
-            here = target if os.path.isabs(target) else os.path.normpath(os.path.join(here, target))
-            continue
-        if "|" in seg or _REDIRECT_RX.search(seg):
-            continue
-        name = os.path.basename(toks[0])
-        if name not in _READ_CMDS:
-            continue
-        args, pulled, used = toks[1:], None, set()
-        if name in ("head", "tail"):
-            pulled, used = _head_tail_lines(args)
-            if used is None:
-                continue
-        elif name == "sed":
-            pulled, used = _sed_lines(args)
-            if used is None:
-                continue
-        # a token with `<` or `>` in it is a redirection operand (`2>/dev/null`),
-        # never a file to read
-        files = [a for i, a in enumerate(args)
-                 if i not in used and a != "-" and not a.startswith("-") and "<" not in a and ">" not in a]
-        for f in files:
-            path = os.path.expanduser(f)
-            if not os.path.isabs(path):
-                path = os.path.normpath(os.path.join(here, path))
-            out.append((path, pulled))
-            if len(out) >= BASH_READ_MAX_FILES:
-                return out
     return out
 
 
@@ -1014,29 +811,22 @@ class OrderingEngine:
 
 
 def bash_ok(resp, *, strict=False):
-    """Did the Bash call succeed? Uses exit_code when the harness supplies it.
-    Without one, the text proxy (same as the transcript replayer) is a guess a
-    command's own output could forge — so `strict=True` (used for GATE-mode
-    receipts) returns False unless an explicit exit_code says 0."""
-    if resp is None:                      # no result at all is never a receipt
+    """Did the Bash call succeed? (rulebook_moments.bash_ok: exit_code wins,
+    is_error is red, `strict` wants an explicit 0, else a text proxy.) A lone
+    copy of this file answers False: no receipt without the sibling."""
+    try:
+        return _rm().bash_ok(resp, strict=strict)
+    except ImportError:
         return False
-    if isinstance(resp, dict):
-        if isinstance(resp.get("exit_code"), int):
-            return resp["exit_code"] == 0
-        if resp.get("is_error") or resp.get("isError"):
-            return False
-    if strict:
-        return False
-    txt = result_text(resp)
-    # text proxy, anchored to pytest/traceback vocabulary — a green run whose
-    # output merely mentions "error:" must not be mistaken for red
-    return not re.search(
-        r"(^|\n)(FAILED|ERROR)\b|\b\d+ (failed|errors?)\b|\nTraceback \(most recent call last\)"
-        r"|(^|\n)npm ERR!|(^|\n)error(\[E\d+\])?:", txt)
 
 
 # ── given: predicates a matched rule must also satisfy ──────────────────────
 PROBE_TIMEOUT_S = 1.0        # per git call; a probe past it answers None, never blocks the call
+PROBE_CACHE_TTL_S = 600      # a cached base answer is trusted this long at most (ENG-1235)
+
+
+def _probe_cache_path(root):
+    return os.path.join(_base(), "state", f"probes-{worktree_key(root)}.json")
 _TURNS_MAX_BYTES = 16 * 1024 * 1024   # transcript larger than this: only its tail is read
 _TURNS_KEEP = 200            # most recent user turns kept
 _TURN_CHARS = 2000           # per turn
@@ -1205,46 +995,12 @@ def given_norm(g):
 
 
 def user_turns_of(tp):
-    """What the person typed this session, oldest first. A transcript `user`
-    record is also how tool results and injected context arrive, so this keeps
-    only real prompts: no `toolUseResult`, no `tool_result` block, no `isMeta`
-    row, no compaction summary. A substring pre-filter keeps it to one
-    json.loads per candidate line. None when there is no transcript — and
-    None never satisfies a `user` predicate."""
-    if not tp:
-        return None
+    """What the person typed this session, oldest first: real prompts only
+    (rulebook_moments.user_turns_of). None with no transcript or no sibling,
+    and None never satisfies a `user` predicate."""
     try:
-        size = os.path.getsize(tp)
-        turns = []
-        with open(tp, "rb") as f:
-            if size > _TURNS_MAX_BYTES:
-                f.seek(size - _TURNS_MAX_BYTES)
-                f.readline()                       # the cut line
-            for raw in f:
-                if b'"user"' not in raw or b'"type"' not in raw:
-                    continue
-                try:
-                    rec = json.loads(raw)
-                except Exception:
-                    continue
-                if rec.get("type") != "user" or rec.get("isMeta") \
-                        or rec.get("isCompactSummary") or "toolUseResult" in rec:
-                    continue
-                c = (rec.get("message") or {}).get("content")
-                if isinstance(c, str):
-                    text = c
-                elif isinstance(c, list):
-                    if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in c):
-                        continue
-                    text = "\n".join((b.get("text") or "") for b in c
-                                     if isinstance(b, dict) and b.get("type") == "text")
-                else:
-                    continue
-                text = text.strip()
-                if text:
-                    turns.append(text[:_TURN_CHARS])
-        return turns[-_TURNS_KEEP:]
-    except Exception:
+        return _rm().user_turns_of(tp, _TURNS_MAX_BYTES, _TURN_CHARS, _TURNS_KEEP) if tp else None
+    except ImportError:
         return None
 
 
@@ -1316,6 +1072,15 @@ def command_root(cwd, command):
     if not os.path.isdir(path):
         return ""
     return repo_info(path)[1]
+
+
+# ── where a Bash call works, and what it writes ─────────────────────────────
+#
+# A session runs in one directory and acts in many: `cd ~/xtrace/xmem && git
+# push`, `git -C ../wt status`, `cd "$WT" && python3 - <<'EOF' … open(…, 'w')`.
+# Read from the COMMAND (pure: no file system), so the pre lane can act before
+# the command runs. Every doubt resolves to "" (unknown), and the caller falls
+# back to the session's own directory — never a guess at a sibling.
 
 
 class Probes:
@@ -1439,7 +1204,34 @@ class Probes:
                 if best is None or n < best:
                     nearest, best = mb, n
             return nearest
-        return self._get("base", compute)
+        return self._get("base", lambda: self._cached("base", compute))
+
+    def _cache_key(self):
+        """HEAD, the refs' fingerprint, the base the command names and the
+        env override: everything `base()` reads. None → not cacheable."""
+        head = (self._git("rev-parse", "HEAD") or "").strip()
+        try:
+            fp = _rm().refs_fingerprint(repo_info(self.root)[2])
+        except Exception:
+            fp = None
+        if not head or fp is None:
+            return None
+        named = sorted({next((g for g in m.groups() if g), "")
+                        for m in _BASE_ARG.finditer(self._cmd)} - {""})
+        env = os.environ.get("MEMHUB_RULEBOOK_BASE_BRANCH", "").strip()
+        return f"{head}|{fp}|{','.join(named)}|{env}"
+
+    def _cached(self, name, compute):
+        """`compute()` memoised ACROSS hook calls in a per-checkout file keyed
+        on everything the answer reads (rulebook_moments.cached): base
+        discovery was a dozen git subprocesses on every call that matched a
+        `given` rule. A fixture (the verifier, tests) and a rootless probe
+        bypass it."""
+        if self._fix or not self.root:
+            return compute()
+        return _rm().cached(_probe_cache_path(self.root), name, self._cache_key(), compute,
+                                       now=_now, age_s=_age_s, atomic_json=_atomic_json,
+                                       ttl=PROBE_CACHE_TTL_S)
 
     def _merge_base(self, cand):
         """`merge-base(cand, HEAD)` when `cand` resolves to a commit, else None."""
@@ -1616,8 +1408,8 @@ def _redirect_base(cwd):
         if not base or not prefix or not os.path.isdir(base):
             return ""
         here = os.path.normpath(os.path.abspath(cwd))
-        # Both spellings must hold, as in `_acted_on_dir`: a symlink must not
-        # be able to pull a session into the test's book or out of it.
+        # Both spellings must hold: a symlink must not be able to pull a
+        # session into the test's book or out of it.
         if not (_under(here, os.path.normpath(os.path.abspath(prefix)))
                 and _under(os.path.realpath(here), os.path.realpath(prefix))):
             return ""
@@ -2141,22 +1933,51 @@ def maybe_refresh(repo, fetched_at):
         return
     if _age_s(fetched_at) < REFRESH_AFTER_S:
         return
+    if _refresh_due(repo):
+        try:
+            spawn_fetch(repo)
+        except Exception:
+            pass
+
+
+def _refresh_due(repo):
+    """True once per REFRESH_RETRY_S per repo. The `.refresh` stamp records the
+    ATTEMPT, so it is written BEFORE any fetch: a fork that fails under
+    resource pressure must not be retried on every tool call, and a minute
+    before the next try costs at most one override on a rule the server has
+    since retired. The other order was tried and reverted."""
     stamp = book_path(repo) + ".refresh"
     try:
         with open(stamp, encoding="utf-8") as f:
             if _age_s(json.load(f).get("at")) < REFRESH_RETRY_S:
-                return
+                return False
     except Exception:
         pass
     try:
-        # The stamp records the ATTEMPT, so it goes first: a fork that fails
-        # under resource pressure must not be retried on every tool call, and
-        # a minute before the next try costs at most one override on a rule
-        # the server has since retired. The other order was tried and reverted.
         _atomic_json(stamp, {"at": _now()})
-        spawn_fetch(repo)
+    except Exception:
+        return False
+    return True
+
+
+def first_fetch(repo, rules, fetched_at, sources):
+    """(rules, fetched_at, sources): a repo with NO cached book gets the
+    session lane's one bounded fetch before this call is judged. A session
+    started outside any checkout — a folder holding an app's bare `.git` and
+    its worktrees (ENG-1249) — had no SessionStart fetch, and the detached
+    refresh lands AFTER the first call that names the repo: the edit the rule
+    was for fired nothing, 3 of 7 PR-tier runs. Once a minute per repo
+    (`_refresh_due`), so a dead server costs one timeout a minute, not one a
+    call. A cached book, however stale, is `maybe_refresh`'s."""
+    if (fetched_at is not None or upgrade_status(repo)
+            or os.environ.get("MEMHUB_RULEBOOK_FETCH", "1") == "0" or not _refresh_due(repo)):
+        return rules, fetched_at, sources
+    try:
+        fetch_book(repo, timeout=SESSION_FETCH_TIMEOUT_S)
+        rules, _, fetched_at, sources = load_rules(repo)
     except Exception:
         pass
+    return rules, fetched_at, sources
 
 
 def path_in_scope(rule, path, root=""):
@@ -2808,86 +2629,45 @@ def spawn_fetch(repo):
 # GATE row it is the excuse given on the blocked call, the row's own record.
 # `judge_score` / `judge_verdict` (rule-judge-spec §4) are on a row only when
 # the judge answered for that fire; see `wire_row`.
+def _rm():
+    """`rulebook_moments`, imported beside this file on first use: what the
+    hook's size limit moved out (ENG-1235). Imported lazily, like every
+    sibling, so a lone copy of this file (the portability tests' incomplete
+    install) still loads and still gates."""
+    import rulebook_moments  # noqa: PLC0415 — beside this file
+    return rulebook_moments
+
+
+# The wire keys stay here, the source of truth the server's ingest mirrors;
+# the projections and the checkout key are rulebook_moments'.
 WIRE_KEYS = ("fire_id", "rule_id", "rule_version", "session_id", "agent_id", "worktree",
              "repo", "branch", "tool", "hook_phase", "mode", "dedup_key",
              "raw_matches_before_fire", "fired_at", "source_message_id", "override_reason",
              "judge_score", "judge_verdict")
 _JUDGE_WIRE_KEYS = ("judge_score", "judge_verdict")
-
-# What the hook observed AFTER a fire (rule-fire-events-spec §2). Facts, never
-# verdicts: `receipt` (an ordering rule's green run in this checkout),
-# `converted` (a rule's converted_rx matched a command in this session),
-# `dismissed` (the person set a rule aside, with the reason), `turn_end` (the
-# session finished a turn), `session_end`. The server folds these into each
-# fire's outcome; nothing here decides one.
 EVENT_WIRE_KEYS = ("event_id", "kind", "rule_id", "session_id", "agent_id", "worktree",
                    "repo", "branch", "reason", "at")
 
 
-# Capture namespaces a conversation id per host: Claude sends the session uuid
-# bare (flush_turn.py), Codex sends `codex-<uuid>` (codex_flush.py) and Cursor
-# `cursor-<uuid>` (cursor_flush.py). A fire carries the raw hook-payload
-# session id, so on Claude it matches the captured conversation by accident and
-# on the others it cannot match at all — every Codex fire shows "Not linked
-# yet" (ENG-1075). Namespace it HERE, at the wire, and nowhere else: ordering
-# state, obligations, dedup keys and state_path all key off the raw id, and
-# renaming that mid-session would strand an in-flight session's own state.
 def wire_session_id(session_id, host):
-    """The session id as CAPTURE wrote it, so the server can join the two.
-
-    Delegates to `pr_link.conversation_id_for`, which already owns this exact
-    projection for the PR-link lane — a second copy is how the two lanes come
-    to disagree about what a Codex session is called, and it already handles
-    the cases a fresh one forgets (surrounding whitespace, a host spelled
-    `Codex`, an id that already carries its prefix).
-
-    Imported lazily and on a fail-open path: only the flush lane projects rows,
-    so the per-call pre/post lanes never pay for the import, and a fire that
-    cannot be namespaced still ships (unlinked) rather than taking the hook
-    down.
-    """
-    try:
-        import pr_link
-        return pr_link.conversation_id_for(host, session_id) or session_id
-    except Exception:
-        return session_id
+    return _rm().wire_session_id(session_id, host)
 
 
 def wire_row(row):
-    """The v2 ledger row minus `excerpt` (Phase 1: always stripped — the org
-    opt-in for excerpts is a server setting the hook does not consult).
-
-    `host` is local-only, like `rulebook_id`: it is not a wire field, it is
-    how this projection knows which namespace the session id belongs in.
-
-    The two judge keys are sent only on a row whose fire was judged (it has a
-    `judge_verdict`). A fire nobody judged posts the row shape it always did,
-    which a server older than the judge columns also accepts.
-    """
-    out = {k: row.get(k) for k in WIRE_KEYS}
-    if row.get("judge_verdict") is None:
-        for k in _JUDGE_WIRE_KEYS:
-            out.pop(k, None)
-    out["session_id"] = wire_session_id(out.get("session_id"), row.get("host"))
-    return out
+    return _rm().wire_row(row)
 
 
 def event_wire_row(row):
-    """Same projection as `wire_row`, and the same namespacing.
+    return _rm().event_wire_row(row)
 
-    The server folds these into each fire's outcome BY SESSION, so an event
-    that names the session differently from the fire it answers folds into
-    nothing. `host` is local-only here too.
-    """
-    out = {k: row.get(k) for k in EVENT_WIRE_KEYS}
-    out["session_id"] = wire_session_id(out.get("session_id"), row.get("host"))
-    return out
+
+def effect_wire_row(row):
+    return _rm().effect_wire_row(row)
 
 
 def worktree_key(root):
-    """The 16-hex checkout id every fire and receipt carries — the same key
-    the ordering engine files its state under, so a receipt run by another
-    session of this checkout can answer this session's fire on the server."""
+    """The 16-hex checkout id every fire and receipt carries — the key the
+    ordering engine files its state under."""
     return hashlib.sha1(root.encode("utf-8")).hexdigest()[:16] if root else None
 
 
@@ -2919,32 +2699,17 @@ def _read_rows(path, start=0, offsets=None):
 def _breadcrumb(what, exc):
     """ledger/.last_error — the one place a silent backstop failure is visible."""
     try:
-        _atomic_json(os.path.join(_ledger_dir(), ".last_error"),
-                     {"at": _now(), "what": what, "error": str(exc)[:300]})
+        _rm().breadcrumb(os.path.join(_ledger_dir(), ".last_error"), what, exc,
+                         now=_now, atomic_json=_atomic_json)
     except Exception:
         pass
 
 
 def _breadcrumb_clear(what):
-    """Retract the breadcrumb once ``what``'s own lane has worked again.
-
-    Without this a lane that records no success of its own — the judge — leaves
-    a single blip standing until some OTHER lane happens to succeed. The judge
-    runs on PreToolUse and the book is only refetched at SessionStart, so one
-    1.5 s timeout mid-session would produce a health banner at the next session
-    start, long after the lane had recovered. A warning that outlives its cause
-    is the failure mode this file exists to avoid.
-
-    Only clears a crumb this lane wrote: another lane's failure is still real.
-    """
-    path = os.path.join(_ledger_dir(), ".last_error")
+    """Retract the crumb once `what`'s own lane worked again (rulebook_moments)."""
     try:
-        with open(path, encoding="utf-8") as f:
-            crumb = json.load(f)
-        if not isinstance(crumb, dict) or crumb.get("what") != what:
-            return
-        os.unlink(path)
-    except Exception:      # no crumb, unreadable, or already gone — all fine
+        _rm().breadcrumb_clear(os.path.join(_ledger_dir(), ".last_error"), what)
+    except Exception:
         pass
 
 
@@ -2970,6 +2735,10 @@ def load_sent():
 LEDGERS = (
     ("fires.jsonl", "fires_offset", "/fires", "fires", "fire_id", wire_row),
     ("events.jsonl", "events_offset", "/fire-events", "events", "event_id", event_wire_row),
+    # The effect judge's windows (fire_effect.py). Last: a 404 — a server
+    # without the route, or an org whose `rule_fire_effect` flag is off —
+    # keeps this watermark and holds the other two back never.
+    ("effects.jsonl", "effects_offset", "/fire-effects", "effects", "fire_id", effect_wire_row),
 )
 
 
@@ -3114,7 +2883,8 @@ def flush_fires(final=False):
         L = rulebook_ledger   # drop confirmed rows from a ledger past 1 MB
         L and L.rotate(ldir, [x[:2] for x in LEDGERS], _LEDGER_TAIL_BYTES)
         sent = load_sent()
-        plan = [(ledger, pending_batches(sent, ledger)[0]) for ledger in LEDGERS]
+        plan = [(ledger, pending_batches(sent, ledger)[0]) for ledger in LEDGERS
+                if not (ledger[0] == EFFECTS_LEDGER and _effects_unsupported(sent))]
         legacy, legacy_sent = legacy_verdict_batches(sent)
         if legacy and not any(b for b, _ in legacy):
             # only orphans past the old watermark: retire them without a POST
@@ -3147,6 +2917,25 @@ def flush_fires(final=False):
         lock.close()
 
 
+EFFECTS_LEDGER = "effects.jsonl"
+EFFECTS_RETRY_S = 3600        # after a 404 on /fire-effects, leave the ledger alone this long
+
+
+def _effects_unsupported(sent):
+    """True while a recent flush learned the server does not take windows
+    here — no /fire-effects route (older than ENG-1231), or the org's
+    `rule_fire_effect` flag is off (the server answers 404 `effect_judging_off`
+    rather than counting every row rejected, which the ledger would log as a
+    loss): the effects ledger is left out of the plan rather than POSTed
+    (and 404ed) on every Stop. The rows wait behind their watermark, so an
+    org that turns the flag on gets its recent windows judged."""
+    try:
+        at = datetime.fromisoformat(str(sent.get("effects_unsupported_at") or ""))
+        return (datetime.now(timezone.utc) - at).total_seconds() < EFFECTS_RETRY_S
+    except Exception:
+        return False
+
+
 def _post_batches(ledger, batches, base, bearer, http):
     """Ship one ledger's batches; True when every batch was accepted. The
     per-batch `.sent` write is re-read from disk first so progress another
@@ -3158,6 +2947,16 @@ def _post_batches(ledger, batches, base, bearer, http):
             reply = http.rest(f"{base}{API_PATH}{path}", bearer, "POST",
                               body={body_key: batch}, timeout=FLUSH_TIMEOUT_S)
         except Exception as exc:      # transport/envelope error: retry next flush,
+            if _fname == EFFECTS_LEDGER and getattr(exc, "status", None) == 404:
+                # A server without the route (older than ENG-1231), or an
+                # org with the flag off (404 `effect_judging_off`): not a
+                # failure of this install, so no breadcrumb for the health
+                # banner. The rows wait behind their watermark and the ledger
+                # is skipped for EFFECTS_RETRY_S before it is tried again.
+                cur = load_sent()
+                cur["effects_unsupported_at"] = _now()
+                _atomic_json(_sent_path(), cur)
+                return True
             _breadcrumb("flush", exc)  # but say so where an operator can look
             return False
         if reply.status not in (200, 201, 202):
@@ -3185,11 +2984,19 @@ def _post_batches(ledger, batches, base, bearer, http):
                            for r in batch], batch, idkey)
         else:
             _log_rejected(rej, batch, idkey)
+        if _fname == EFFECTS_LEDGER and isinstance(data.get("verdicts"), list):
+            try:                      # live repair reads these at the next Stop
+                import fire_effect  # noqa: PLC0415 — beside this file
+                fire_effect.record_verdicts(_ledger_dir(), data["verdicts"])
+            except Exception:
+                pass
         accepted += data["accepted"]
         # only THIS ledger's watermark moves; the other's is whatever is on disk
         cur[okey] = after[okey]
         if stall.get("key") == key:
             cur.pop("stall", None)    # an accepted batch clears only ITS OWN marker
+        if _fname == EFFECTS_LEDGER:
+            cur.pop("effects_unsupported_at", None)   # the route exists after all
         cur["last_flush_at"] = _now()
         cur["last_accepted"] = accepted
         _atomic_json(_sent_path(), cur)   # per batch: a later failure keeps this progress
@@ -3240,9 +3047,6 @@ def _repo_name(root, gitdir):
         return os.path.basename(root)
 
 
-_SEED_MAX_HOPS = 64   # a Write names a new dir a few levels deep, never thousands
-
-
 def _under(path, base):
     """True when `path` is `base` or sits beneath it. `join(base, "")` is the
     only spelling of the prefix that is right at a POSIX root ("/"), a Windows
@@ -3251,103 +3055,167 @@ def _under(path, base):
     return path == base or path.startswith(os.path.join(base, ""))
 
 
-def _acted_on_dir(cwd, inp):
-    """The directory of the file this call acts on, in the SESSION's own path
-    space, or "" when the payload names none this session may reach.
+def _same_dir(a, b):
+    """True when two spellings name one directory (/tmp vs /private/tmp, a
+    symlinked home)."""
+    try:
+        return os.path.realpath(a) == os.path.realpath(b)
+    except (OSError, ValueError):
+        return False
 
-    Payload data must not steer where the hook looks, so the session cwd is
-    the trust boundary. Containment is checked TWICE, and both must hold:
 
-    * lexically, on the unresolved path — because that is the path
-      `repo_info` actually walks up from. A symlink OUTSIDE cwd whose target
-      is inside it passes a resolved-only check while its lexical parents
-      still lead somewhere else entirely, which would hand `root` (and so
-      `git -C root`, which honors a repo's local config) to a checkout the
-      session never opened;
-    * and again once symlinks are resolved — so a link UNDER cwd cannot
-      smuggle the lookup out of it.
-
-    Requiring both also pins the value to ONE path space per session: an
-    absolute path spelled differently from cwd (/var vs /private/var, an
-    automounted home) fails the lexical test and falls back to the cwd
-    answer. That matters because `root` keys OrderingEngine state
-    (`{rid}@{root}:{branch}`), and one worktree reached two ways would split
-    into two keys and silently re-arm its ordering rules."""
-    if not (isinstance(inp, dict) and cwd):
+def _call_seed(cwd, data):
+    """The directory this call ACTS in, as the payload names it, or "": the
+    edited or read file's own directory (anywhere — a session edits across
+    checkouts), the first file a Codex patch names, or where a Bash command
+    runs (`call_dir`: its `cd` chain, `git -C`, `~` and `$VAR` expanded)."""
+    inp = data.get("tool_input") or {}
+    if not isinstance(inp, dict):
         return ""
-    base = os.path.normpath(cwd)
     for key in ("file_path", "notebook_path"):      # each judged on its own:
         fp = inp.get(key)                           # a junk file_path must not
-        if not (isinstance(fp, str) and fp):        # hide a good notebook_path
+        if not (isinstance(fp, str) and fp.strip()) or "\0" in fp:   # hide a good notebook_path
             continue
+        d = os.path.dirname(fp.replace("\\", "/"))
+        if not os.path.isabs(d):    # relative to the SESSION's cwd, never ours
+            d = os.path.join(cwd, d)
+        return os.path.normpath(d)
+    if data.get("tool_name") == "apply_patch":
+        # Codex edits name their files inside the patch text, not in file_path.
         try:
-            d = os.path.dirname(fp.replace("\\", "/"))
-            if not os.path.isabs(d):    # relative to the SESSION's cwd, never ours
-                d = os.path.join(cwd, d)
-            d = os.path.normpath(d)
-            if not _under(d, base):
-                continue
-            probe, hops = d, 0          # a Write may name a directory not created yet
-            while not os.path.exists(probe) and os.path.dirname(probe) != probe \
-                    and hops < _SEED_MAX_HOPS:
-                probe, hops = os.path.dirname(probe), hops + 1
-            if _under(os.path.realpath(probe), os.path.realpath(cwd)):
-                return d
-        except (OSError, ValueError):   # payload strings are untrusted (NUL -> ValueError)
-            continue
+            dirs = [os.path.dirname(path) for path, _new, _added in apply_patch_files(inp, cwd)]
+        except (OSError, ValueError):   # payload strings are untrusted
+            return ""
+        # The first patched file that sits in a checkout decides.
+        return next((d for d in dirs if repo_info(d)[0]), dirs[0] if dirs else "")
+    command = inp.get("command")
+    if data.get("tool_name") == "Bash" and isinstance(command, str):
+        try:
+            return read_cd(cwd, command, repo_info)
+        except Exception:
+            return ""
     return ""
+
+
+def _write_root(path, repo, root):
+    """(worktree, path) for a file a Bash command writes, when the file is in
+    a checkout of `repo` — the call's book judges only its own repo's files —
+    re-spelled under `root` when that is the same directory; else ("", path)."""
+    info = repo_info(os.path.dirname(path))
+    if not info[0] or info[0] != repo:
+        return "", path
+    if root and info[1] != root and _same_dir(info[1], root):
+        return root, os.path.join(root, os.path.relpath(path, info[1]))
+    return info[1], path
+
+
+_BOOKS = {}
+
+
+def _file_book(path, repo, root, rules, refresh):
+    """(rules, worktree, path, at) judging a file a Bash call writes or reads:
+    the call's book when the file is in a checkout of the call's repo, else
+    the book of the repo whose checkout holds it (`echo > ../other/x.csv`,
+    `tee ~/other/app/x.py`), refreshed as for a `cd` there, with `at` = that
+    checkout's ledger fields. None outside any checkout."""
+    info = repo_info(os.path.dirname(path))
+    if not info[0]:
+        return None
+    if info[0] == repo:
+        if root and info[1] != root and _same_dir(info[1], root):
+            return rules, root, os.path.join(root, os.path.relpath(path, info[1])), None
+        return rules, info[1], path, None
+    if info[0] not in _BOOKS:
+        got = load_rules(info[0])
+        if refresh:
+            got = first_fetch(info[0], got[0], got[2], got[3])   # (rules, fetched_at, sources)
+            maybe_refresh(info[0], got[1])
+        _BOOKS[info[0]] = got[0]
+    return _BOOKS[info[0]], info[1], path, {"repo": info[0], "gitdir": info[2], "branch": info[3],
+                                            "worktree": worktree_key(info[1])}
+
+
+def _armed(rules, on):
+    return any(r.get("on") == on and r.get("status", "active") == "active" for r in rules)
 
 
 def repo_of_call(data):
     """(repo, root, gitdir, branch) for the checkout this CALL works in: the
-    acted-on file's first, the session cwd's second, else all empty.
+    one it acts in (`_call_seed`) when that is a checkout, else the session
+    cwd's, else all empty.
 
-    The acted-on path outranks cwd because of the worktree-parent workflow —
-    an agent running from a directory that CONTAINS many checkouts and editing
-    files inside them. cwd resolves nothing there, and gating the rulebook on
-    it alone left every rule silently inert for the whole session while the
-    edited file sat in a real worktree the entire time. Worktrees themselves
-    were never the problem: `repo_info` reads the `.git` FILE and `scope_ok`
+    What the call touches outranks cwd. A session in MemHub-Backend that runs
+    `cd ~/xtrace/agent-plugins-internal && git push`, `git -C ../xmem …`, or
+    edits a file in another repo is judged by THAT repo's book, scope and
+    worktree key: judged by the session's, the target's scoped rules never
+    fired (28 of 56 misses in the 2026-10 audit) and the session's misfired
+    on foreign work. Worktrees resolve through the `.git` FILE and `scope_ok`
     maps the gitdir back to the main checkout, so a rule scoped to the repo
-    matches from any of its worktrees once the walk starts in the right place.
+    matches from any of its worktrees.
 
-    A Bash call carries no path and keeps the cwd answer, so a non-git cwd
-    with nothing acted on stays silent exactly as before."""
+    `root` keys ordering state (`{rid}@{root}:{branch}`), so a target that is
+    the cwd's own checkout spelled another way (/tmp vs /private/tmp) answers
+    with the cwd's spelling: one worktree, one key. A target that is no
+    checkout (`cd /tmp && …`, a file outside any repo) keeps the cwd answer.
+
+    A Bash call with neither in a checkout takes the first file it writes or
+    reads that is (`cat ~/repos/app/x.py` acts on `app`); else it is
+    projectless (`main`)."""
     cwd = data.get("cwd") or os.getcwd()
-    seed = _acted_on_dir(cwd, data.get("tool_input") or {})
-    if not seed and data.get("tool_name") == "apply_patch":
-        # Codex edits name their files inside the patch text, not in file_path,
-        # so the parent-folder workflow above resolved nothing on Codex and its
-        # edit rules stayed inert. The first patched file that passes the same
-        # containment checks decides the checkout.
-        try:
-            for path, _new, _added in apply_patch_files(data.get("tool_input") or {}, cwd):
-                seed = _acted_on_dir(cwd, {"file_path": path})
-                if seed:
-                    break
-        except (OSError, ValueError):   # payload strings are untrusted
-            seed = ""
+    here = repo_info(cwd)
+    seed = _call_seed(cwd, data)
     if seed:
         info = repo_info(seed)
         if info[0]:
+            if here[0] and info[1] != here[1] and _same_dir(info[1], here[1]):
+                return here
             return info
-    info = repo_info(cwd)
-    if info[0]:
-        return info
-    # Desktop may normalize exec_command to Bash and omit workdir. A leading
-    # literal `cd ... &&` is explicit context; never guess from sibling repos,
-    # mid-command changes, or shell expansions. Keep repository-rooted behavior.
-    inp = data.get("tool_input") or {}
-    command = inp.get("command") if isinstance(inp, dict) else None
-    if data.get("tool_name") == "Bash" and isinstance(command, str):
-        match = _CD_PREFIX.match(command)
-        if match and match.group(0).rstrip().endswith("&&"):
-            target = next((g for g in match.groups() if g), "")
-            if target and not any(c in target for c in "$`*?[]{}~\\\n\r"):
-                root = command_root(cwd, command)
-                if root:
-                    return repo_info(root)
-    return info
+    if not here[0]:
+        for path in _bash_targets(cwd, data):
+            info = repo_info(os.path.dirname(path))
+            if info[0]:
+                return info
+    return here
+
+
+def _bash_targets(cwd, data):
+    """Files a Bash call writes, then reads (override stripped); [] otherwise."""
+    if data.get("tool_name") != "Bash":
+        return []
+    cmd = (data.get("tool_input") or {}).get("command")
+    if not isinstance(cmd, str) or not cmd:
+        return []
+    try:
+        found = find_override(cmd)
+        if found:
+            cmd = strip_override(cmd, found)
+        return ([p for p, _ in bash_write_targets(cwd, cmd)]
+                + [p for p, _ in bash_reads(cwd, cmd)])
+    except Exception:
+        return []
+
+
+def projectless_enabled():
+    """A call in no checkout is judged on every host, but not under a
+    repos.json (repo_allow.session_enabled)."""
+    if repo_allow is None:
+        return True
+    try:
+        return not repo_allow.restricted()
+    except Exception:
+        return True
+
+
+def call_enabled(root):
+    """repo_allow's verdict for the checkout at `root`: True with no
+    allowlist, with no shim, or on any failure — a broken list must not
+    silence every rule."""
+    if repo_allow is None or not root:
+        return True
+    try:
+        return bool(repo_allow.enabled(root))
+    except Exception:
+        return True
 
 
 _HEAD_REF = re.compile(r"^ref:\s*refs/heads/(.+)$")
@@ -3551,40 +3419,45 @@ _HARNESS_PROMPT_RX = re.compile(
     r"|Caveat: The messages below"
     r"|Base directory for this skill:"
     r"|Another Claude session sent a message:)")
-
-# Another agent's message: a subagent's hand-back, or another session's
-# SendMessage, delivered as a user-role prompt. The same sentence
-# `harness_extract` already treats as harness. Nobody typed it, so unlike a
-# wake-up (`<task-notification>`, which `prompt` rules exist to speak at) it
-# is no moment for a prompt rule either: a rule written for "the person asked
-# X" fired on a subagent's report that merely mentioned X.
 _AGENT_MESSAGE_RX = re.compile(r"\s*Another Claude session sent a message:")
 
 
+def harness_prompt(text):
+    """True when this UserPromptSubmit carries something the HARNESS wrote:
+    only what a PERSON typed may arm an obligation. Every marker is
+    STRUCTURED (a wrapper tag, a sentence the client emits verbatim); an
+    English prefix is never one — `Approach this as` silenced a real
+    question once. Suppressing a genuine prompt is the worse error."""
+    return bool(_HARNESS_PROMPT_RX.match(text or ""))
+
+
 def agent_message(text):
-    """True when this UserPromptSubmit is another agent's message — see
-    `_AGENT_MESSAGE_RX`. It neither arms an obligation (it is harness text)
-    nor fires a `prompt` rule."""
+    """Another agent's message (a subagent's hand-back, another session's
+    SendMessage) delivered as a user-role prompt: nobody typed it, so it
+    neither arms an obligation nor fires a `prompt` rule."""
     return bool(_AGENT_MESSAGE_RX.match(text or ""))
 
 
-def harness_prompt(text):
-    """True when this UserPromptSubmit carries something the HARNESS wrote.
+EXPANSION_WINDOW_S = 5.0     # a command expanded this recently is what the next prompt submit carries
 
-    Only what a PERSON typed may arm an obligation: a rule armed by the word
-    "staging" in a prompt exists because someone said they were asking about
-    staging, and a skill body or a loop wake-up that happens to contain the
-    word said nothing of the kind. It would arm the rule for the rest of the
-    session with nobody having asked for it.
 
-    Every marker here is STRUCTURED — a wrapper tag, or a sentence the client
-    emits verbatim. An ordinary English prefix is not a marker however
-    harness-like it reads: `Approach this as` was one, and it silenced
-    "Approach this as a staging incident", a real person asking exactly the
-    question a staging rule exists for. Suppressing a genuine prompt is the
-    worse error of the two, because the rule then never arms and nothing
-    anywhere says why."""
-    return bool(_HARNESS_PROMPT_RX.match(text or ""))
+def _expansion_path(session):
+    return state_path(session)[:-len(".json")] + ".expansion.json"
+
+
+def note_expansion(session, data):
+    """UserPromptExpansion (ENG-1235): the command the person typed, recorded
+    so the submit that carries its body is not taken for their words."""
+    if session:
+        _rm().note_expansion(_expansion_path(session), data, now=_now, atomic_json=_atomic_json)
+
+
+def recent_expansion(session):
+    """True when a command expanded within EXPANSION_WINDOW_S."""
+    return bool(session) and _rm().recent_expansion(
+        _expansion_path(session), age_s=_age_s, window=EXPANSION_WINDOW_S)
+
+
 
 
 def session_scoped(rule):
@@ -3668,16 +3541,18 @@ def arm_obligations(rules, repo, gitdir, session, event, prompt=""):
     return armed
 
 
+def failure_result(data):
+    """PostToolUseFailure's `error` as the post lane's (result text, response)
+    (ENG-1236, _rm().failure_result)."""
+    return _rm().failure_result(data)
+
+
 def result_text(resp):
-    if resp is None:
-        return ""
-    if isinstance(resp, str):
-        return resp
-    if isinstance(resp, dict):
-        parts = [v for k in ("stderr", "stdout", "output", "error", "text")
-                 if isinstance((v := resp.get(k)), str) and v]
-        return "\n".join(parts) if parts else json.dumps(resp, ensure_ascii=False)
-    return str(resp)
+    """A tool response as text (rulebook_moments.result_text)."""
+    try:
+        return _rm().result_text(resp)
+    except ImportError:
+        return "" if resp is None else str(resp)
 
 
 BRAND = "XTrace"
@@ -3703,10 +3578,6 @@ _OVERRIDE_PREFIX = "RULEBOOK_OVERRIDE="
 # the raw assignment token (quotes intact), used to strip exactly the one
 # token find_override validated — never every look-alike in the command
 _OVERRIDE_TOKEN_RX = re.compile(r"RULEBOOK_OVERRIDE=(?:'[^']*'|\"[^\"]*\"|\S*)\s*")
-
-
-def _segment_op(tok):
-    return bool(tok) and all(ch in ";&|(" for ch in tok)
 
 
 def _raw_token(line, reason):
@@ -4009,50 +3880,11 @@ def turn_end_at(session, started, transcript_path=None):
 
 
 def _turn_end_from_transcript(tp, before):
-    """The timestamp (local ISO, microseconds) of the latest assistant
-    `end_turn` record in the transcript's tail written no later than
-    `before`, or None. Reads the tail the way `message_id_of` does."""
+    """The latest assistant `end_turn` record no later than `before`, read
+    from the transcript's tail (rulebook_moments.turn_end_from_transcript)."""
     if not tp:
         return None
-    try:
-        limit = datetime.fromisoformat(before)
-    except Exception:
-        return None
-    try:
-        with open(tp, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            end = f.tell()
-            window = _TAIL_START
-            while True:
-                start = max(0, end - window)
-                f.seek(start)
-                lines = f.read(end - start).splitlines()
-                if start:
-                    lines = lines[1:]
-                for raw in reversed(lines):
-                    if not raw.strip():
-                        continue
-                    try:
-                        rec = json.loads(raw)
-                    except Exception:
-                        continue
-                    if rec.get("type") != "assistant":
-                        continue
-                    msg = rec.get("message")
-                    if not isinstance(msg, dict) or msg.get("stop_reason") != "end_turn":
-                        continue
-                    try:
-                        ts = datetime.fromisoformat(str(rec.get("timestamp")).replace("Z", "+00:00"))
-                    except Exception:
-                        continue
-                    if ts.tzinfo is None or ts > limit:
-                        continue
-                    return ts.astimezone().isoformat(timespec="microseconds")
-                if start == 0 or window >= _TAIL_MAX:
-                    return None
-                window *= 4
-    except Exception:
-        return None
+    return _rm().turn_end_from_transcript(tp, before, _TAIL_START, _TAIL_MAX)
 
 
 def _just_before(iso):
@@ -4089,39 +3921,13 @@ _TAIL_MAX = 1024 * 1024
 
 def message_id_of(data):
     """The transcript record the tool call belongs to — the server resolves it
-    to the stored message. Reads the tail of the JSONL rather than the whole
-    file: these grow to megabytes and this runs on a 5 s hook budget. Any
-    problem returns None; the link is optional and never blocks a fire."""
+    to the stored message (rulebook_moments.message_id_of). None on any
+    problem; the link is optional and never blocks a fire."""
     tp = str(data.get("transcript_path") or "")
     if not tp:
         return None
     try:
-        with open(tp, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            end = f.tell()
-            window = _TAIL_START
-            while True:
-                start = max(0, end - window)
-                f.seek(start)
-                lines = f.read(end - start).splitlines()
-                # A non-zero start almost certainly cut the first line in half.
-                if start:
-                    lines = lines[1:]
-                for raw in reversed(lines):
-                    if not raw.strip():
-                        continue
-                    try:
-                        rec = json.loads(raw)
-                    except Exception:
-                        continue
-                    if rec.get("type") not in _MESSAGE_TYPES:
-                        continue
-                    uid = rec.get("uuid")
-                    if isinstance(uid, str) and uid:
-                        return uid
-                if start == 0 or window >= _TAIL_MAX:
-                    return None
-                window *= 4
+        return _rm().message_id_of(tp, _MESSAGE_TYPES, _TAIL_START, _TAIL_MAX)
     except Exception:
         return None
 
@@ -4170,6 +3976,8 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
             for r in rules:
                 fid = str(uuid.uuid4())
                 ids[r["id"]] = fid
+                c = dict(ctx, **{k: r["_at"][k] for k in ("repo", "branch", "worktree")}) \
+                    if r.get("_at") else ctx
                 verdict = (judge or {}).get(r["id"])
                 judged = {"judge_score": verdict.get("p_fit"),
                           "judge_verdict": verdict.get("verdict")} if verdict else {}
@@ -4178,13 +3986,15 @@ def log_fires(ctx, rules, *, hook_phase, mode, excerpt, raw_counts=None, dedup_k
                     "rulebook_id": r.get("_rulebook_id"),
                     "rule_version": ctx["rule_version"] if r.get("_version") is None else r["_version"],
                     "session_id": ctx["session"], "agent_id": ctx["agent_id"],
-                    "worktree": ctx.get("worktree"),
+                    "worktree": c.get("worktree"),
                     # Local-only (see wire_row): which host's namespace this
                     # session id belongs to, recorded at fire time because the
                     # flush that ships it may be a different invocation.
                     "host": ctx.get("host"),
                     "source_message_id": ctx.get("source_message_id"),
-                    "repo": ctx["repo"], "branch": ctx["branch"], "tool": ctx["tool"],
+                    "tool_use_id": ctx.get("tool_use_id"),   # local-only; see wire_row
+                    "title": str(r.get("_label") or r.get("title") or "")[:120],   # local-only
+                    "repo": c["repo"], "branch": c["branch"], "tool": ctx["tool"],
                     "hook_phase": hook_phase, "mode": mode,
                     "dedup_key": (dedup_keys or {}).get(r["id"]),
                     "raw_matches_before_fire": (raw_counts or {}).get(r["id"]),
@@ -4318,6 +4128,16 @@ def _dismissal_lines(set_aside, ambiguous):
 # deliberately NOT counted against POSTURE_BUDGET_CHARS — that budget bounds
 # rule CONTENT, and this framing is what makes the content usable. Do not let
 # it past ~500 chars without deciding that trade again.
+# A Codex session outside every checkout: its unscoped rules still apply, but a
+# repo's own rules need the call to name that repo.
+CODEX_NO_REPO = (
+    "MemHub Rulebook: this task starts outside a Git repository. "
+    "Codex may omit exec_command.workdir from hook payloads, so "
+    "formal rules cannot identify that checkout. For repository "
+    "shell commands, use an explicit, shell-quoted absolute "
+    "`cd <repo> && ...` prefix (including when workdir is set), "
+    "or start the task in the repository.")
+
 SESSION_PREAMBLE = (
     "These are your team's engineering rules — standing instructions from your teammates, "
     "carrying the same weight as this repo's CLAUDE.md. Follow them as you would CLAUDE.md: "
@@ -4378,9 +4198,11 @@ def books_line(carried):
     return ("- _From " + " · ".join(shown))[:ROSTER_MAX_CHARS] + "._"
 
 
-def session_digest(rules, repo, gitdir, ctx):
+def session_digest(rules, repo, gitdir, ctx, note=None):
     in_scope = [r for r in rules if scope_ok(r, repo, gitdir) and r.get("status", "active") == "active"]
     if not in_scope:
+        if note:
+            emit("SessionStart", note)
         return
     # Spec §2: at most MAX_POSTURE session rules and ~2k tokens per scope.
     # ONE budget across every book the caller is in (container spec §13.1) —
@@ -4430,6 +4252,8 @@ def session_digest(rules, repo, gitdir, ctx):
     roster = books_line(posture + active)
     if roster:
         lines.append(roster)
+    if note:
+        lines.append(note)
     emit("SessionStart", "\n".join(lines))
     if posture:
         log_fires(ctx, posture, hook_phase="session", mode="advise", excerpt="")
@@ -4437,6 +4261,21 @@ def session_digest(rules, repo, gitdir, ctx):
         log_fires(ctx, cut, hook_phase="session", mode="suppressed", excerpt="",
                   dedup_keys={r["id"]: f"{r['id']}@session" for r in cut},
                   raw_counts={r["id"]: 0 for r in cut})
+
+
+PROMPT_BLOCK_AFTER_S = 600   # prompt lane: block on a fetch only past this; younger books refresh detached
+
+
+def refresh_for_prompt(repo, rules, fetched_at, sources):
+    """The prompt lane's refresh (ENG-1235, _rm().refresh_for_prompt):
+    detached and served as cached under PROMPT_BLOCK_AFTER_S, waited for past it."""
+    if os.environ.get("MEMHUB_RULEBOOK_FETCH", "1") == "0":
+        return rules, fetched_at, sources
+    out = _rm().refresh_for_prompt(
+        _age_s(fetched_at), blocking=lambda: refresh_if_stale(repo, rules, fetched_at, sources),
+        detached=lambda: maybe_refresh(repo, fetched_at),
+        block_after=PROMPT_BLOCK_AFTER_S, refresh_after=REFRESH_AFTER_S)
+    return out if out is not None else (rules, fetched_at, sources)
 
 
 def refresh_if_stale(repo, rules, fetched_at, sources):
@@ -4505,6 +4344,8 @@ def prompt_lane(rules, repo, root, gitdir, branch, session, ctx, data, text):
     probes = Probes(root, branch, transcript_path=data.get("transcript_path"),
                     agent_id=ctx["agent_id"])
     fired, dedup_keys = [], {}
+    marks = {"fired": list(st["fired"]), "counts": dict(st["counts"]),
+             "spec_pending": dict(st["spec_pending"])}
     for r in live:
         rid = r["id"]
         scope = r.get("fire_scope", "session")
@@ -4557,6 +4398,7 @@ def prompt_lane(rules, repo, root, gitdir, branch, session, ctx, data, text):
     for r in cut:
         log_fires(ctx, [r], hook_phase="prompt", mode="suppressed", excerpt="",
                   raw_counts=raw, dedup_keys=dedup_keys, fired_at=fired_at)
+        unfire(st, r, dedup_keys.get(r["id"]), marks, reset_raw=True)   # cut, not spent
     for r in shown:
         st["raw"][r["id"]] = 0
     save_state(sp, st, before=before)
@@ -4577,14 +4419,24 @@ def main():
         # book_path in a skill would drift from the one the hook reads, and the
         # test would then doctor a file nothing loads.
         repo = sys.argv[2] if len(sys.argv) > 2 else ""
-        if not repo.strip():
-            print("usage: rulebook_hook.py book-path <repo> [cwd]", file=sys.stderr)
+        if repo == "--projectless":     # the book a call in no checkout reads (repo="")
+            repo = ""
+        elif not repo.strip():
+            print("usage: rulebook_hook.py book-path <repo>|--projectless [cwd]", file=sys.stderr)
             return 2
         # The optional cwd answers "where does a call made THERE read its book
         # from" — which is what a forward test needs, and what tells it whether
         # its redirect took effect before it writes a candidate anywhere.
         set_active_base(sys.argv[3] if len(sys.argv) > 3 else "")
         print(book_path(repo))
+        return 0
+    if mode == "expansion":               # UserPromptExpansion: record the command (ENG-1235)
+        try:
+            data = json.loads(sys.stdin.read() or "{}")
+        except Exception:
+            data = {}
+        if isinstance(data, dict):
+            note_expansion(str(data.get("session_id") or ""), data)
         return 0
     if mode == "flush":
         started = _now()          # before anything else: the Stop happened no later than this
@@ -4635,10 +4487,22 @@ def main():
             # `codex-<uuid>` while its own turn_end event said `<uuid>`, and the
             # server folds events into fires by (org, session_id), so every
             # turn_end folded into nothing.
+            ended_at = turn_end_at(session, started, data.get("transcript_path"))
             log_event({"session": session, "agent_id": None, "repo": repo or None,
                        "branch": branch or None, "worktree": worktree_key(root),
-                       "host": _host_arg()}, kind,
-                      at=turn_end_at(session, started, data.get("transcript_path")))
+                       "host": _host_arg()}, kind, at=ended_at)
+            # The effect judge's windows (fire_effect.py) for the turn that ended.
+            try:
+                import fire_effect  # noqa: PLC0415 — beside this file
+                sdir = os.path.dirname(state_path(session))
+                if kind == "session_end":
+                    fire_effect.on_session_end(_ledger_dir(), sdir, session,
+                                               data.get("transcript_path"), judge_redact)
+                else:
+                    fire_effect.on_turn_end(_ledger_dir(), sdir, session,
+                                            data.get("transcript_path"), ended_at, judge_redact)
+            except Exception:
+                pass
         flush_fires(final=final)
         if _rbp:
             _rbp.drain_legacy(globals(), final)  # the pre-keying shared ledger
@@ -4667,18 +4531,20 @@ def main():
     # of the shared one. No claim (the overwhelming case) → the real base.
     set_active_base(cwd)
     repo, root, gitdir, branch = repo_of_call(data)
-    if not repo:            # never invent a repository for a projectless call
-        if mode == "session" and _host_arg() == "codex":
-            print(json.dumps({"hookSpecificOutput": {
-                "hookEventName": "SessionStart",
-                "additionalContext": (
-                    "MemHub Rulebook: this task starts outside a Git repository. "
-                    "Codex may omit exec_command.workdir from hook payloads, so "
-                    "formal rules cannot identify that checkout. For repository "
-                    "shell commands, use an explicit, shell-quoted absolute "
-                    "`cd <repo> && ...` prefix (including when workdir is set), "
-                    "or start the task in the repository."
-                )}}))
+    # Projectless: judged on the `repo=""` book, which holds only rules with
+    # empty `scope_repos`, so they bind wherever the session runs.
+    note = CODEX_NO_REPO if not repo and mode == "session" and _host_arg() == "codex" else None
+    if not repo and not projectless_enabled():
+        if note:
+            emit("SessionStart", note)
+        return 0
+    # The repository allowlist (repo_allow.py): with a repos.json, a call whose
+    # checkout it leaves out gets no rule, no fetch and no state — judged by
+    # the CALL's checkout, so a session in a parent folder of several repos is
+    # served in the listed ones and silent in the rest. The Claude hook
+    # command gates the session-wide lanes the same way; this is the
+    # per-call half.
+    if not call_enabled(root):
         return 0
     if mode == "fetch":
         fetch_book(repo)
@@ -4689,16 +4555,23 @@ def main():
         show_upgrade(repo, session, "PreToolUse")
         return 0
     rules, rule_version, fetched_at, sources = load_rules(repo)
+    # No book at all for this call's repo: fetch it now, bounded, or the
+    # first call that names a repo is judged on nothing (`first_fetch`).
+    if mode in ("pre", "codex-pre"):
+        rules, fetched_at, sources = first_fetch(repo, rules, fetched_at, sources)
     # A Codex bridge trusted before SessionStart was wired (three handlers)
     # never ran the session lane's fetch. Refresh before a first/stale
     # pre-call so such an install cannot silently miss a gate.
     if codex_pre and _age_s(fetched_at) >= REFRESH_AFTER_S:
         rules, fetched_at, sources = refresh_if_stale(repo, rules, fetched_at, sources)
     tool = data.get("tool_name", "")
-    ctx = {"session": session, "agent_id": agent_id_of(data), "repo": repo,
+    ctx = {"session": session, "agent_id": agent_id_of(data), "repo": repo or None,   # projectless: null, as session events
            "branch": branch, "tool": tool, "rule_version": rule_version,
            "source_message_id": message_id_of(data), "worktree": worktree_key(root),
-           "host": _host_arg()}
+           "host": _host_arg(),
+           # Local-only, like `host`: the call this fire is anchored on, so the
+           # Stop lane can build the effect judge's window (fire_effect.py).
+           "tool_use_id": str(data.get("tool_use_id") or "") or None}
     if mode == "prompt":
         # UserPromptSubmit. It arms ordering rules silently: anything printed
         # here is injected above the person's own words, and an arming is not
@@ -4714,8 +4587,19 @@ def main():
         # subject again. The pre lane's detached refresh cannot help — it
         # lands after the prompt it needed to see.
         text = str(data.get("prompt") or "")
-        if text and not harness_prompt(text):
-            rules, fetched_at, sources = refresh_if_stale(repo, rules, fetched_at, sources)
+        # A command body is not the person's words: the host's wrappers say
+        # so by regex, UserPromptExpansion for every command (fire_effect.py
+        # attaches only the person's own reaction to the waiting windows).
+        typed = bool(text) and not harness_prompt(text) and not recent_expansion(session)
+        try:
+            import fire_effect  # noqa: PLC0415 — beside this file
+            fire_effect.on_prompt(_ledger_dir(), os.path.dirname(state_path(session)), session,
+                                  text, _now(), judge_redact,
+                                  person=typed and not agent_message(text))
+        except Exception:
+            pass
+        if typed:
+            rules, fetched_at, sources = refresh_for_prompt(repo, rules, fetched_at, sources)
             arm_obligations(rules, repo, gitdir, session, "prompt", prompt=text)
         elif text:
             # A wake-up is not worth making the session wait for the server:
@@ -4760,7 +4644,7 @@ def main():
             pass
         if show_upgrade(repo, session, "SessionStart"):
             return 0
-        session_digest(rules, repo, gitdir, ctx)
+        session_digest(rules, repo, gitdir, ctx, note)
         arm_obligations(rules, repo, gitdir, session, "session")
         return 0
     if mode == "pre":
@@ -4814,14 +4698,20 @@ def main():
                     if mode == "pre" and (tool in EDIT_TOOLS or patched) else {})
     rtext = result_text(data.get("tool_response")) if mode == "post" else ""
     resp = data.get("tool_response") if (mode == "post" and tool == "Bash") else None
+    if mode == "post" and str(data.get("hook_event_name") or "") == "PostToolUseFailure":
+        rtext, resp = failure_result(data)   # a failed call's `error`, same lane (ENG-1236)
     ordering = None
     dedup_keys = {}
 
     # The events this call is. The tool call itself, always; and for a Bash
-    # call that wrote files, one synthetic Write per file, so an edit rule sees
-    # a heredoc / write_text() / sed -i the way it sees the Write tool. The
-    # edit lane of `evaluate` is a pre-phase lane and the ordering engine arms
-    # on a post-phase edit, so a synthetic event carries both phases.
+    # call that writes files, one synthetic Write per file, so an edit rule
+    # sees a heredoc / write_text() / sed -i the way it sees the Write tool.
+    # Twice over: in the PRE lane from the command line (`bash_write_targets`,
+    # via "bash-pre": before the write, so it can still be refused), and in
+    # the POST lane from the disk (`bash_written_files`, via "bash": the
+    # backstop for writes the command line does not show). The edit lane of
+    # `evaluate` is a pre-phase lane and the ordering engine arms on a
+    # post-phase edit, so a post synthetic event carries both phases.
     # Synthetic edits go FIRST: inside the command the writes happened before
     # its final segment, so a `python fix.py && pytest` must read as edit,
     # then receipt — the other order would arm an obligation the same call
@@ -4829,6 +4719,7 @@ def main():
     real = {"tool": tool, "phase": mode, "order_phase": mode, "cmd": cmd, "fp": fp,
             "body": body, "added": added, "rtext": rtext, "resp": resp, "via": None, "read": None}
     events = []
+    pre_written = []      # (rule id, real path) the pre lane fired for this Bash call
     if tool == "Bash":
         marks = st.setdefault("bash_t0", {})
         call_key = str(data.get("tool_use_id") or "last")
@@ -4836,20 +4727,43 @@ def main():
             marks[call_key] = time.time()
             for k in list(marks)[:-BASH_EDIT_MARKS_KEPT]:
                 marks.pop(k, None)
+            # Each written file is judged by the book of the repo it is in:
+            # the call's, or another checkout's (`echo > ../other/x.csv`).
+            for path, text in bash_write_targets(cwd, cmd) if cmd else []:
+                book = None if os.path.isdir(path) else _file_book(path, repo, root, rules, True)
+                if book and _armed(book[0], "edit"):
+                    events.append({"tool": "Write", "phase": "pre", "order_phase": "pre",
+                                   "cmd": "", "fp": book[2], "body": text, "added": None,
+                                   "rtext": "", "resp": None, "via": "bash-pre", "read": None,
+                                   "root": book[1], "rules": book[0], "at": book[3]})
         else:
             t0 = marks.pop(call_key, None)
             if t0 is None and call_key != "last":
                 t0 = marks.pop("last", None)
+            done = st.setdefault("bash_pre", {})
+            pre_written = done.pop(call_key, None) or (done.pop("last", None) if call_key != "last" else None) or []
             wants_edits = any(r.get("on") in ("edit", "ordering") and r.get("status", "active") == "active"
                               for r in rules)
             if t0 is not None and wants_edits:
-                for path, is_new in bash_written_files(root, cmd, t0):
-                    text = read_edit_body(path, is_new)
-                    if text is None:
-                        continue
-                    events.append({"tool": "Write", "phase": "pre", "order_phase": "post",
-                                   "cmd": "", "fp": path, "body": text, "rtext": "",
-                                   "resp": None, "via": "bash"})
+                # Every checkout of this repo the command ran or wrote in, and
+                # the session's own: found from the command, not its spelling.
+                also = []
+                for d in bash_dirs(cwd, cmd) + [os.path.dirname(p) for p, _ in bash_write_targets(cwd, cmd)] + [cwd]:
+                    w = _write_root(os.path.join(d, "_"), repo, root)[0]
+                    if w and w not in also:
+                        also.append(w)
+                scans = [(root, also, rules, None)]
+                for p, _ in bash_write_targets(cwd, cmd):     # another repo's checkout, its own book
+                    book = _file_book(p, repo, root, rules, False)
+                    if book and book[3] and _armed(book[0], "edit") and all(x[0] != book[1] for x in scans):
+                        scans.append((book[1], (), book[0], book[3]))
+                for sroot, salso, srules, sat in scans:
+                    for path, is_new, wt in bash_written_files(sroot, cmd, t0, salso):
+                        text = read_edit_body(path, is_new)
+                        if text is not None:
+                            events.append({"tool": "Write", "phase": "pre", "order_phase": "post",
+                                           "cmd": "", "fp": path, "body": text, "rtext": "", "resp": None,
+                                           "via": "bash", "root": wt, "rules": srules, "at": sat})
     # A patch is an edit tool call, not a file a command already wrote: its
     # events keep the call's own phase, exactly like Claude's Edit. The edit
     # lane judges it at pre, where a gate can still refuse it (via None), and
@@ -4865,15 +4779,18 @@ def main():
     # a cat/head/tail/less/more/sed segment names, in the pre phase, because
     # unlike a written file these have not happened yet and CAN be refused.
     # Measured only when a read rule is armed: a line count is one file walk.
-    wants_reads = mode == "pre" and any(r.get("on") == "read" and r.get("status", "active") == "active"
-                                        for r in rules)
+    # A file in another repo's checkout is judged by that repo's read rules.
+    wants_reads = mode == "pre" and _armed(rules, "read")
     if wants_reads and tool in READ_TOOLS and fp:
         real["read"] = read_facts(fp, offset=inp.get("offset"), limit=inp.get("limit"))
-    elif wants_reads and tool == "Bash" and cmd:
+    elif mode == "pre" and tool == "Bash" and cmd:
         for path, pulled in bash_reads(cwd, cmd):
-            events.append({"tool": "Read", "phase": "pre", "order_phase": "pre", "cmd": cmd,
-                           "fp": path, "body": "", "rtext": "", "resp": None,
-                           "via": "bash-read", "read": read_facts(path, pulled=pulled)})
+            book = _file_book(path, repo, root, rules, True) or (rules, root, path, None)
+            if _armed(book[0], "read"):
+                events.append({"tool": "Read", "phase": "pre", "order_phase": "pre", "cmd": cmd,
+                               "fp": book[2], "body": "", "rtext": "", "resp": None,
+                               "via": "bash-read", "read": read_facts(book[2], pulled=pulled),
+                               "root": book[1], "rules": book[0], "at": book[3]})
 
     # Conversions (rule-fire-events-spec §2): did this call run the action a
     # rule's `converted_rx` names? Posted as a `converted` event for EVERY
@@ -4966,8 +4883,10 @@ def main():
     fired_on = {}          # rule id → the event that fired it (its path, for the ledger and the line)
     for ev in events:
         etool, ephase, ecmd, efp, ebody = ev["tool"], ev["phase"], ev["cmd"], ev["fp"], ev["body"]
-        for r in rules:
-            if r.get("on") in ("session", "anchor") or not scope_ok(r, repo, gitdir) \
+        at = ev.get("at")         # a file in ANOTHER repo's checkout: that book, its edit/read rules
+        for r in rules if ev.get("rules") is None else ev["rules"]:
+            if r.get("on") in ("session", "anchor") or (at and r.get("on") not in ("edit", "read")) \
+                    or not scope_ok(r, *((at["repo"], at["gitdir"]) if at else (repo, gitdir))) \
                     or r.get("status", "active") != "active":   # draft = not armed (§6)
                 continue
             rid = r["id"]
@@ -4975,10 +4894,14 @@ def main():
                 continue
 
             if r.get("on") == "ordering":
+                # A write the command has not made yet arms nothing: the post
+                # lane's disk scan arms on the write that happened.
+                if ev.get("via") == "bash-pre":
+                    continue
                 # Path scope says which EDITS arm the obligation. The receipt
                 # and the gated call are Bash and carry no path, so they are
                 # never filtered here — only an edit outside the scope is.
-                if etool in EDIT_TOOLS and not path_in_scope(r, efp, root):
+                if etool in EDIT_TOOLS and not path_in_scope(r, efp, ev.get("root") or root):
                     continue
                 if stale_arming(st, r):
                     # Armed for an earlier version of this rule. The rule that
@@ -5016,18 +4939,22 @@ def main():
                     fired_on[rid] = ev
                 continue
 
-            if not path_in_scope(r, efp if etool in EDIT_TOOLS + READ_TOOLS else "", root):
+            if not path_in_scope(r, efp if etool in EDIT_TOOLS + READ_TOOLS else "",
+                                 ev.get("root") or root):
+                continue
+            # The pre lane already fired this rule on this file of this call.
+            if ev.get("via") == "bash" and [rid, os.path.realpath(efp)] in pre_written:
                 continue
             scope = r.get("fire_scope", "session")
             # A gate blocks EVERY matching call — never deduped (§5.3), in
             # any lane the hook can refuse: a Bash command, an edit the tool
             # has not written yet, or a read — the Read tool's own, or one a
             # Bash segment is about to make. `via` guards the difference: a
-            # synthetic EDIT event is a file a command ALREADY wrote, so it
-            # cannot be refused and keeps its rule's ordinary dedup; a
-            # synthetic READ has not happened, and refusing the command is
-            # refusing the read.
-            if ephase == "pre" and r.get("mode") == "gate" and ev.get("via") in (None, "bash-read") \
+            # post-lane synthetic EDIT ("bash") is a file a command ALREADY
+            # wrote, so it cannot be refused and keeps its rule's ordinary
+            # dedup; a pre-lane one ("bash-pre") and a synthetic READ have not
+            # happened, and refusing the command is refusing the write or read.
+            if ephase == "pre" and r.get("mode") == "gate" and ev.get("via") in (None, "bash-read", "bash-pre") \
                     and ((etool == "Bash" and r.get("on") == "bash")
                          or (etool in EDIT_TOOLS and r.get("on") == "edit")
                          or (etool in READ_TOOLS and r.get("on") == "read")):
@@ -5060,7 +4987,7 @@ def main():
                 st["spec_pending"][json.dumps([rid, probe_root, probe_branch])] = {"root": probe_root, "branch": probe_branch, "spec_dir": spec_given.get("spec_dir", "docs/specs"), "paths": [spec.path for spec, _ in hits]}
                 r = dict(r)
                 r["text"], r["_spec_detail"] = _spec_untouched_text(r["text"], hits)
-            fired_now.append(r)
+            fired_now.append(dict(r, _at=at) if at else r)
             fired_on[rid] = ev
 
     # One instant for everything this call records: its fires, and the
@@ -5080,7 +5007,7 @@ def main():
         records the file, prefixed so a reader can count how many edits
         arrive through Bash versus the Write tool."""
         ev = fired_on.get(r["id"])
-        if ev and ev.get("via") == "bash":
+        if ev and ev.get("via") in ("bash", "bash-pre"):
             return f"bash-edit {ev['fp']}"
         if ev and ev.get("via") == "bash-read":
             return f"bash-read {ev['fp']}"
@@ -5136,11 +5063,13 @@ def main():
         return 0
 
     # §5.3: which of this call's fires are GATES. Only a call the hook sees
-    # BEFORE it runs can be blocked — a pre-hook Bash command, or a pre-hook
+    # BEFORE it runs can be blocked — a pre-hook Bash command, a pre-hook
     # edit, which `evaluate` matches against `tool_input`, the content the tool
-    # is about to write. A fire from the synthetic lane (`via == "bash"`, a file
-    # discovered after a command wrote it) is post-hoc whatever its rule says,
-    # so it advises: there is nothing left to refuse.
+    # is about to write, or a file the Bash command is about to write
+    # (`via == "bash-pre"`): refusing the command refuses the write. A fire
+    # from the post-lane synthetic lane (`via == "bash"`, a file discovered
+    # after a command wrote it) is post-hoc whatever its rule says, so it
+    # advises: there is nothing left to refuse.
     def _gateable(r):
         if mode != "pre" or r.get("mode") != "gate":
             return False
@@ -5148,7 +5077,8 @@ def main():
         if via == "bash":
             return False
         if tool == "Bash":
-            return r.get("on") in ("bash", "ordering") or (r.get("on") == "read" and via == "bash-read")
+            return r.get("on") in ("bash", "ordering") or (r.get("on") == "read" and via == "bash-read") \
+                or (r.get("on") == "edit" and via == "bash-pre")
         if tool in READ_TOOLS:
             return r.get("on") == "read"
         # A patch at pre has not applied yet, so it can be refused like an Edit.
@@ -5258,11 +5188,13 @@ def main():
         knows which file a Write was, but a heredoc's target is buried in
         the command it just ran."""
         ev = fired_on.get(r["id"])
-        if not ev or ev.get("via") not in ("bash", "bash-read"):
+        if not ev or ev.get("via") not in ("bash", "bash-pre", "bash-read"):
             return ""
-        path = ev["fp"]
-        if root and path.startswith(root.rstrip("/") + "/"):
-            path = os.path.relpath(path, root)
+        path, eroot = ev["fp"], ev.get("root") or root
+        if eroot and path.startswith(eroot.rstrip("/") + "/"):
+            path = os.path.relpath(path, eroot)
+        if ev.get("via") == "bash-pre":
+            return f" _(in `{path}`, which that command writes)_"
         if ev.get("via") == "bash-read":
             n = (ev.get("read") or {}).get("lines")
             return f" _(`{path}`, {n} lines, read by that command)_" if n is not None \
@@ -5379,6 +5311,20 @@ def main():
     for r in cut:   # the per-call cap has a cost; make it visible, never silent
         log_fires(ctx, [r], hook_phase=mode, mode="suppressed", excerpt=_excerpt(r),
                   raw_counts=raw, dedup_keys=dedup_keys, fired_at=fired_at, judge=judged)
+        # …and never a spend: a rule the cap cut was not shown, so it keeps
+        # its dedup and can fire on a later call — marked fired here, a
+        # session-scoped rule that lost the cap once was gone for the session.
+        unfire(st, r, dedup_keys.get(r["id"]), marks, reset_raw=True)
+    if mode == "pre" and tool == "Bash":
+        # The writes this call's pre lane fired on, so the post lane's disk
+        # scan does not fire the same rule on the same file a second time.
+        wrote = [[r["id"], os.path.realpath(fired_on[r["id"]]["fp"])] for r in shown
+                 if (fired_on.get(r["id"]) or {}).get("via") == "bash-pre"]
+        if wrote:
+            done = st.setdefault("bash_pre", {})
+            done[str(data.get("tool_use_id") or "last")] = wrote
+            for k in list(done)[:-BASH_EDIT_MARKS_KEPT]:
+                done.pop(k, None)
     for r in shown:
         st["raw"][r["id"]] = 0
         if ids.get(r["id"]) and r["id"] in same_call:
