@@ -80,11 +80,16 @@ def test_every_claude_handler_is_guarded_and_only_boundaries_capture():
         for group in groups:
             for handler in group["hooks"]:
                 commands.append((event, handler["command"]))
-    assert len(commands) == 21   # - the three retired directive-recall
+    assert len(commands) == 22   # + PostToolUseFailure (rulebook_hook.py post —
+                                 # the failure lane, ENG-1236),
+                                 # + UserPromptExpansion (rulebook_hook.py
+                                 # expansion — a typed command noted, ENG-1235),
+                                 # - the three retired directive-recall
                                  # handlers (PreToolUse ×2, PostToolUse),
-                                 # + PreToolUse (add_memory_gate.py, and
-                                 # create_rule_origin.py — the session a rule
-                                 # is filed from),
+                                 # - the retired add_memory_gate.py (the
+                                 # server removed add_memory),
+                                 # + PreToolUse (create_rule_origin.py — the
+                                 # session a rule is filed from),
                                  # + UserPromptSubmit (brain_brief.py prompt,
                                  # and rulebook_hook.py prompt — the lane that
                                  # arms a prompt-armed obligation),

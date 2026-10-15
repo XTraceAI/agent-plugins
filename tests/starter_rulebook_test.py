@@ -297,10 +297,12 @@ def test_the_skill_asks_before_it_reads_and_warns_before_it_waits() -> None:
     check("--all is only ever the person's ask", "only when they ask for all of" in skill)
     check("one scope for the whole batch, decided before anything is filed",
           "one scope for the\nwhole batch" in skill)
-    check("…org-wide unless the person says otherwise, without asking",
-          "**Otherwise `org`** — do not ask" in skill)
+    check("…just the person unless the batch is plainly for everyone, without asking",
+          "**Otherwise `personal`** —" in skill and "Do not ask," in skill)
+    check("…and an explicit 'just me' is never escalated",
+          '"just me" / "only me" / "personal" → `personal`' in skill)
     check("…and the workspace scope only when they ask for it",
-          "never offer the\nworkspace scope unprompted" in skill)
+          "never offer the workspace scope unprompted" in skill)
     check("the skill never makes a rulebook", "create_rulebook" not in skill)
 
 
@@ -708,6 +710,126 @@ def test_a_judge_field_the_server_would_refuse_fails_the_run() -> None:
     body = next(c["body"] for c in cands if c["id"] == "sleep-poll")
     check("a reason with no sentence that fits is left off, and the rule still files",
           p.returncode == 0 and "why" not in body and body["when"] and body["do"])
+
+
+def _run_args(repo: Path, out: Path, *extra: str):
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PLUGIN_ROOT"}
+    p = subprocess.run([sys.executable, str(SCRIPT), "all", "--repo", str(repo), "--out", str(out), *extra],
+                       capture_output=True, text=True, env=env, timeout=300)
+    load = lambda n: json.loads((out / n).read_text())
+    return p, load("signals.json"), load("candidates.json")
+
+
+def _verify_body(body: dict, fires: list, silent: list) -> tuple[bool, list]:
+    sys.path.insert(0, str(ROOT / "plugins" / "memhub" / "scripts"))
+    import rulebook_verify as V
+    ok, _, lines = V.verify(body, fires, silent)
+    return ok, lines
+
+
+def test_a_test_run_launched_the_usual_ways_clears_the_push_gate() -> None:
+    """The receipt knew only bare `pytest`; on one repo 2,082 of 2,290 runs were
+    `uv run python -m pytest`, so the gate never cleared and people learned to override it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = _make(PYTHON_REPO, Path(tmp) / "svc")
+        p, signals, cands = _run_args(repo, Path(tmp) / "out")
+        body = {c["id"]: c["body"] for c in cands}["suite-before-push"]
+        ran = ["uv run python -m pytest tests/", "uv run --extra dev pytest -q", ".venv/bin/pytest -q",
+               ".venv/bin/python3.12 -m pytest", "poetry run pytest", "$PY -m pytest tests/ -q", "uvx pytest"]
+        ok, lines = _verify_body(body, fires=["edit:src/a.py >> ok:uv run python -m pytest --version >> gate:git push",
+                                              "edit:src/a.py >> ok:grep -rn pytest docs/ >> gate:git push"],
+                                 silent=["edit:src/a.py >> ok:%s >> gate:git push" % r for r in ran])
+        check("every launcher form clears suite-before-push; --version and a grep do not", ok, "\n".join(lines))
+
+
+def test_a_linter_launched_the_usual_ways_clears_the_lint_gate() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = _make(PYTHON_REPO, Path(tmp) / "svc")
+        p, signals, cands = _run_args(repo, Path(tmp) / "out")
+        body = {c["id"]: c["body"] for c in cands}["lint-before-push"]
+        ok, lines = _verify_body(body, fires=["edit:src/a.py >> ok:uv run ruff --version >> gate:git push"],
+                                 silent=["edit:src/a.py >> ok:%s >> gate:git push" % r for r in
+                                         ("uv run ruff check .", "uvx ruff check .", ".venv/bin/mypy app",
+                                          "uv run python -m mypy app", "ruff format --check .")])
+        check("every launcher form clears lint-before-push", ok, "\n".join(lines))
+
+
+def test_the_cap_is_the_hooks_own() -> None:
+    """The starter cuts patterns to the hook's load cap, read from the hook — never a copy that can
+    go stale (one sat at 400 while the hook loaded 2000)."""
+    sys.path.insert(0, str(SCRIPT.parent))
+    sys.path.insert(0, str(SKILL.parents[1] / "scripts"))
+    import rulebook_hook as H
+    import starter_rulebook as S
+    check("starter RX_MAX is the hook's _RX_MAX", S.RX_MAX == H._RX_MAX, "%s vs %s" % (S.RX_MAX, H._RX_MAX))
+
+
+def test_every_toolchain_mix_keeps_its_receipts_loadable() -> None:
+    """Python + two Node runners + Go + Rust: both receipts keep the full Python launcher and still
+    load."""
+    files = {**PYTHON_REPO, **NODE_REPO, "go.mod": "module x\n", "a_test.go": "package x\n",
+             "Cargo.toml": "[package]\nname = 'x'\n", "src/lib.rs": "\n", "Makefile": "test:\n\tpytest\n"}
+    with tempfile.TemporaryDirectory() as tmp:
+        p, signals, cands = _run_args(_make(files, Path(tmp) / "poly"), Path(tmp) / "out")
+        slots = signals["slots"]
+        check("exit 0, every rule verifies", p.returncode == 0, p.stdout[-400:])
+        sys.path.insert(0, str(SCRIPT.parent))
+        import starter_rulebook as S
+        check("both receipts fit the hook's cap with CMD in front",
+              all(len(slots["CMD"]) + len(slots[k]) <= S.RX_MAX for k in ("test_receipt_rx", "lint_receipt_rx")))
+        check("both receipts carry the full launcher",
+              all(slots[k].count(S.PY_LAUNCH) == 1 for k in ("test_receipt_rx", "lint_receipt_rx")),
+              str([slots[k] for k in ("test_receipt_rx", "lint_receipt_rx")]))
+
+
+def test_a_linter_only_the_ci_runs_is_still_evidence() -> None:
+    files = {"pyproject.toml": '[project]\nname = "svc"\n', "app/a.py": "x = 1\n",
+             ".github/workflows/lint.yml": "jobs:\n  l:\n    steps:\n      - run: uvx ruff check .\n"}
+    with tempfile.TemporaryDirectory() as tmp:
+        p, signals, _ = _run_args(_make(files, Path(tmp) / "ci"), Path(tmp) / "out")
+        check("ruff run by CI is found", "ruff check ." in (signals["signals"]["lint"].get("value") or []),
+              signals["signals"]["lint"]["evidence"])
+
+
+def _commits(repo: Path, branch: str, subjects: list, start: str = "trunk") -> None:
+    env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
+    g = lambda *a: subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t", *a],
+                                  check=True, capture_output=True, env=env)
+    g("checkout", "-q", "-b", branch, start)
+    for s in subjects:
+        g("commit", "-q", "--allow-empty", "-m", s)
+    g("update-ref", "refs/remotes/origin/" + branch, "HEAD")
+    g("checkout", "-q", "trunk")
+
+
+def test_the_branch_pull_requests_land_on_is_named_and_one_flag_guards_it() -> None:
+    """origin/HEAD is `trunk`, but the team merges every PR into `staging`. The scan names staging
+    (a hint, not a slot) and does NOT name a feature branch whose tip a merge bot versioned."""
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = _make(BARE_REPO, Path(tmp) / "flow")
+        _commits(repo, "staging", ["feat: a (#1)", "fix: b (#2)", "Merge pull request #3 from acme/c", "feat: d (#4)"])
+        _commits(repo, "fm-feat", ["wip", "more work", "address review", "chore: version 1.2.0 (#9)"])
+        p, signals, cands = _run_args(repo, Path(tmp) / "out")
+        ev = signals["signals"]["branch"]
+        check("the hint names staging and not the bot-versioned feature branch",
+              ev.get("also_landing") == ["staging"], str(ev))
+        check("…and only names it: the guarded branch is still origin/HEAD alone",
+              signals["slots"]["default_branch_rx"] == "^(trunk)$")
+        check("…and says the flag to pass", "--default-branch trunk --default-branch staging" in ev["evidence"])
+
+        p, signals, cands = _run_args(repo, Path(tmp) / "out2", "--default-branch", "trunk",
+                                      "--default-branch", "staging")
+        check("exit 0 with two branches", p.returncode == 0, p.stdout[-400:])
+        check("one flag fills every branch slot", signals["slots"]["default_branch_rx"] == "^(trunk|staging)$"
+              and signals["slots"]["default_branch"] == "trunk")
+        body = {c["id"]: c["body"] for c in cands}
+        rx = body["push-main-refspec"]["matcher"]["command_rx"]
+        for cmd in ("git push origin HEAD:staging", "git push origin trunk"):
+            check(f"refspec rule fires on `{cmd}`", bool(re.search(rx, cmd)))
+        check("…and not on a feature branch", not re.search(rx, "git push origin HEAD:fm-feat"))
+        ok, lines = _verify_body(body["push-main"], fires=[{"case": "git push", "branch": "staging"}],
+                                 silent=[{"case": "git push", "branch": "fm-feat"}])
+        check("push-main guards a push made from staging", ok, "\n".join(lines))
 
 
 if __name__ == "__main__":

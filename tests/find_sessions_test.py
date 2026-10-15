@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = (ROOT / "plugins" / "memhub" / "skills" / "find-contributing-sessions"
+SCRIPT = (ROOT / "plugins" / "memhub" / "skills" / "link-pr"
           / "scripts" / "find_sessions.py")
 SCRIPTS = ROOT / "plugins" / "memhub" / "scripts"
 
@@ -493,6 +493,390 @@ def test_git_add_and_commit_are_found_by_tokens_not_at_command_position():
               for pth in find_sessions._git_pathspecs(text)])
     check("a non-path git subcommand is not collected",
           find_sessions._git_path_arguments("git log --oneline") == [])
+
+
+# --- batch mode (ENG-1128): many PRs, facts read with gh, one pass ---------
+#
+# A fake `gh` on PATH answers from a JSON file and logs every call, so the
+# suite needs neither the real CLI nor the network.
+
+_FAKE_GH = '''\
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_GH_LOG"], "a", encoding="utf-8") as log:
+    log.write(json.dumps(args) + "\\n")
+db = json.load(open(os.environ["FAKE_GH_DB"], encoding="utf-8"))
+if args[:2] == ["pr", "view"]:
+    reply = db.get("view", {}).get(args[2])
+elif args[:1] == ["api"]:
+    reply = db.get("api", {}).get(args[1])
+else:
+    reply = None
+if reply is None or reply == "FAIL":
+    sys.stderr.write("gh: secret-ish diagnostic that must not be echoed\\n")
+    sys.exit(1)
+sys.stdout.write(reply if isinstance(reply, str) else json.dumps(reply))
+'''
+
+
+def _pr_view(url: str, files: list[str], head: str, base: str = "main",
+             shas: list[str] = (), created: str = "2026-09-10T00:00:00Z",
+             title: str = "a pull request") -> dict:
+    return {"url": url, "title": title, "headRefName": head, "baseRefName": base,
+            "createdAt": created, "files": [{"path": f} for f in files],
+            "commits": [{"oid": s} for s in shas]}
+
+
+def _fake_gh(td: str, db: dict) -> tuple[dict, Path]:
+    """PATH with a fake `gh` first, plus the env it reads; returns (env, log)."""
+    bin_dir = Path(td) / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    gh = bin_dir / "gh"
+    gh.write_text(f"#!{sys.executable}\n" + _FAKE_GH, encoding="utf-8")
+    gh.chmod(0o755)
+    db_path = Path(td) / "gh-db.json"
+    db_path.write_text(json.dumps(db), encoding="utf-8")
+    log = Path(td) / "gh-log.jsonl"
+    log.write_text("", encoding="utf-8")
+    env = {"PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+           "FAKE_GH_DB": str(db_path), "FAKE_GH_LOG": str(log)}
+    return env, log
+
+
+def run_batch(home: Path, env_extra: dict, *args: str,
+              prs_file_lines: list[str] | None = None) -> tuple[int, str, str]:
+    extra: list[str] = []
+    listing = None
+    if prs_file_lines is not None:
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False,
+                                         encoding="utf-8") as handle:
+            handle.write("\n".join(prs_file_lines) + "\n")
+            listing = handle.name
+        extra = ["--prs-from", listing]
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPT), *extra, *args],
+            capture_output=True, text=True, encoding="utf-8", timeout=120,
+            env={**os.environ, "HOME": str(home), "USERPROFILE": str(home),
+                 "PYTHONUTF8": "1", "MEMHUB_PLUGIN_SCRIPTS": str(SCRIPTS),
+                 **env_extra})
+        return proc.returncode, proc.stdout, proc.stderr
+    finally:
+        if listing:
+            os.unlink(listing)
+
+
+def _gh_calls(log: Path) -> list[list[str]]:
+    return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+
+
+PR_A = "https://github.com/acme/repo/pull/7"
+PR_B = "https://github.com/acme/repo/pull/8"
+
+
+def test_batch_ranks_each_session_under_the_pr_it_wrote():
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td) / "home"
+        wt = str(Path(td) / "checkouts" / "repo")
+        claude_session(home, "writer-a", wt, branch="feat/a",
+                       edits=[f"{wt}/app/a1.py", f"{wt}/app/a2.py"])
+        claude_session(home, "writer-b", wt, branch="feat/b",
+                       edits=[f"{wt}/app/b1.py", f"{wt}/app/b2.py"])
+        # Edited one file of each PR on neither branch: shows under BOTH.
+        claude_session(home, "both", wt, branch="scratch",
+                       edits=[f"{wt}/app/a1.py", f"{wt}/app/b1.py", f"{wt}/app/shared.py"])
+        env, log = _fake_gh(td, {"view": {
+            PR_A: _pr_view(PR_A, ["app/a1.py", "app/a2.py", "app/shared.py"], "feat/a",
+                           title="feat: the a side"),
+            PR_B: _pr_view(PR_B, ["app/b1.py", "app/b2.py"], "feat/b")}})
+        rc, out, err = run_batch(home, env, "--pr-url", PR_A, "--pr-url", PR_B,
+                                 "--host", "claude")
+        check("batch exits 0 with a JSON object", rc == 0 and out.strip().startswith("{"),
+              out + err)
+        doc = json.loads(out) if rc == 0 else {"prs": []}
+        by_url = {p["pr_url"]: p for p in doc["prs"]}
+        check("both PRs come back, in input order",
+              [p["pr_url"] for p in doc["prs"]] == [PR_A, PR_B], out[:300])
+        a_ids = [c["conversation_id"] for c in by_url.get(PR_A, {}).get("candidates", [])]
+        b_ids = [c["conversation_id"] for c in by_url.get(PR_B, {}).get("candidates", [])]
+        check("PR A's writer leads PR A", a_ids[:1] == ["writer-a"], repr(a_ids))
+        check("PR B's writer leads PR B", b_ids[:1] == ["writer-b"], repr(b_ids))
+        check("PR A's writer is not a candidate for PR B", "writer-a" not in b_ids,
+              repr(b_ids))
+        check("a session that touched both PRs is a candidate for both",
+              "both" in a_ids and "both" in b_ids, repr((a_ids, b_ids)))
+        check("the PR's own metadata rides along",
+              by_url.get(PR_A, {}).get("title") == "feat: the a side"
+              and by_url[PR_A]["repo"] == "acme/repo" and by_url[PR_A]["number"] == 7
+              and by_url[PR_A]["head_ref"] == "feat/a", out[:400])
+        check("candidate rows keep the single-mode shape",
+              by_url.get(PR_A, {}).get("candidates")
+              and set(by_url[PR_A]["candidates"][0]) == {
+                  "conversation_id", "session_id", "host", "cwd", "mtime", "score",
+                  "evidence"}, out[:400])
+        check("no transcript prose in batch output", PROSE not in out)
+        check("sessions_scanned counts parsed sessions", doc.get("sessions_scanned") == 3,
+              repr(doc.get("sessions_scanned")))
+        views = [c for c in _gh_calls(log) if c[:2] == ["pr", "view"]]
+        check("gh pr view is given the URL, never a bare number",
+              sorted(c[2] for c in views) == sorted([PR_A, PR_B]), repr(views))
+
+
+def test_batch_parses_each_transcript_once():
+    """The point of batching: 25 PRs over 200 sessions must not read every
+    transcript 25 times."""
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td) / "home"
+        wt = str(Path(td) / "repo")
+        for index in range(3):
+            claude_session(home, f"s{index}", wt, branch="feat/a",
+                           edits=[f"{wt}/app/a1.py"])
+        env, _log = _fake_gh(td, {"view": {
+            PR_A: _pr_view(PR_A, ["app/a1.py"], "feat/a"),
+            PR_B: _pr_view(PR_B, ["app/a1.py"], "feat/b")}})
+        # A child process, not this one: the readers fix their store paths from
+        # $HOME at IMPORT, so only a process started with the fake HOME is
+        # guaranteed never to read the developer's real transcripts.
+        counter = (
+            "import importlib.util, json, sys\n"
+            f"spec = importlib.util.spec_from_file_location('fs', {str(SCRIPT)!r})\n"
+            "fs = importlib.util.module_from_spec(spec); spec.loader.exec_module(fs)\n"
+            "reader = fs.readers.reader_for('claude'); original = reader.to_canonical\n"
+            "calls = []\n"
+            "def counting(path, *a, **k):\n"
+            "    calls.append(str(path)); return original(path, *a, **k)\n"
+            "reader.to_canonical = counting\n"
+            "rc = fs.main(sys.argv[1:])\n"
+            "sys.stderr.write('CALLS=' + json.dumps(calls) + '\\n')\n"
+            "sys.exit(rc)\n")
+        proc = subprocess.run(
+            [sys.executable, "-c", counter, "--pr-url", PR_A, "--pr-url", PR_B,
+             "--host", "claude"],
+            capture_output=True, text=True, encoding="utf-8", timeout=120,
+            env={**os.environ, "HOME": str(home), "USERPROFILE": str(home),
+                 "PYTHONUTF8": "1", "MEMHUB_PLUGIN_SCRIPTS": str(SCRIPTS), **env})
+        line = [ln for ln in proc.stderr.splitlines() if ln.startswith("CALLS=")]
+        calls = json.loads(line[0][len("CALLS="):]) if line else []
+        check("counted batch run exits 0", proc.returncode == 0, proc.stderr[-300:])
+        check("every parse was inside the fake HOME",
+              calls and all(c.startswith(str(home)) for c in calls), repr(calls[:3]))
+        check("three sessions, two PRs → three parses, not six",
+              len(calls) == 3 and len(set(calls)) == 3, repr(calls))
+
+
+def test_batch_skips_a_bad_pr_and_keeps_going():
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td) / "home"
+        wt = str(Path(td) / "repo")
+        claude_session(home, "writer-a", wt, branch="feat/a", edits=[f"{wt}/app/a1.py"])
+        wrong = "https://github.com/acme/repo/pull/9"
+        failing = "https://github.com/acme/repo/pull/10"
+        empty = "https://github.com/acme/repo/pull/11"
+        env, _log = _fake_gh(td, {"view": {
+            PR_A: _pr_view(PR_A, ["app/a1.py"], "feat/a"),
+            # gh answered for a DIFFERENT pull request than the one asked for.
+            wrong: _pr_view("https://github.com/other/thing/pull/99", ["x.py"], "x"),
+            failing: "FAIL",
+            empty: _pr_view(empty, [], "feat/empty")}})
+        rc, out, err = run_batch(
+            home, env, "--host", "claude",
+            prs_file_lines=["# a comment", "", PR_A, wrong, failing, empty,
+                            "not a url", PR_A + "/", PR_A + "#discussion"])
+        doc = json.loads(out) if rc == 0 else {"prs": [], "skipped_prs": []}
+        reasons = {s["pr_url"]: s["reason"] for s in doc["skipped_prs"]}
+        check("exit 0 although most PRs failed", rc == 0, err)
+        check("the good PR is still scanned",
+              [p["pr_url"] for p in doc["prs"]] == [PR_A], out[:300])
+        check("a mismatched gh answer → url_mismatch", reasons.get(wrong) == "url_mismatch",
+              repr(reasons))
+        check("a failing gh call → gh_failed", reasons.get(failing) == "gh_failed",
+              repr(reasons))
+        check("a PR with no files → no_files", reasons.get(empty) == "no_files",
+              repr(reasons))
+        check("an unparseable line → invalid_url", reasons.get("not a url") == "invalid_url",
+              repr(reasons))
+        check("the same PR spelled three ways is scanned once",
+              len(doc["prs"]) == 1 and PR_A not in reasons, repr(doc["skipped_prs"]))
+        check("gh's own stderr is never echoed", "secret-ish" not in out + err, err)
+
+
+def test_batch_url_spellings_and_redirects():
+    """A PR tab (`/files`), `http://` and `www.github.com` all name the PR the
+    user meant; a renamed repo is the same PR under another name, reported as
+    such rather than lumped in with a gh answer for a different PR."""
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td) / "home"
+        wt = str(Path(td) / "repo")
+        claude_session(home, "writer-a", wt, branch="feat/a", edits=[f"{wt}/app/a1.py"])
+        renamed = "https://github.com/acme/old-name/pull/12"
+        env, log = _fake_gh(td, {"view": {
+            PR_A: _pr_view(PR_A, ["app/a1.py"], "feat/a",
+                           title="fix: Ёжик Álvaro — non-ASCII survives"),
+            renamed: _pr_view("https://github.com/acme/new-name/pull/12", ["x.py"], "x")}})
+        rc, out, err = run_batch(
+            home, env, "--host", "claude",
+            prs_file_lines=[PR_A + "/files", "http://github.com/acme/repo/pull/7",
+                            "https://www.github.com/acme/repo/pull/7/commits/abc1234",
+                            renamed])
+        doc = json.loads(out) if rc == 0 else {"prs": [], "skipped_prs": []}
+        check("three spellings of PR A collapse to one scanned PR",
+              [p["pr_url"] for p in doc["prs"]] == [PR_A], out[:300] + err)
+        check("gh is asked about the normalised URL",
+              [c[2] for c in _gh_calls(log) if c[:2] == ["pr", "view"]][:1] == [PR_A],
+              repr(_gh_calls(log)))
+        check("a non-ASCII title comes through intact",
+              doc["prs"] and doc["prs"][0]["title"] == "fix: Ёжик Álvaro — non-ASCII survives",
+              out[:300])
+        check("a renamed repo → url_redirected with the canonical URL",
+              {"pr_url": renamed, "reason": "url_redirected",
+               "canonical_url": "https://github.com/acme/new-name/pull/12"}
+              in doc["skipped_prs"], repr(doc["skipped_prs"]))
+
+
+def test_batch_matches_single_mode_evidence():
+    """Batch scoring reuses one feature pass per session; its evidence must be
+    exactly what single mode reports for the same PR."""
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td) / "home"
+        wt = str(Path(td) / "repo")
+        sha = "abcdef1234567890abcdef1234567890abcdef12"
+        # The helper pairs every result with the FIRST call (`t1`), so the
+        # commit must be that call for its output to count as proof.
+        claude_session(home, "committer", wt, branch="feat/a",
+                       commands=["git commit -m 'x' app/a1.py app/a2.py"],
+                       results=[f"[feat/a {sha[:7]}] x"])
+        env, _log = _fake_gh(td, {"view": {
+            PR_A: _pr_view(PR_A, ["app/a1.py", "app/a2.py"], "feat/a", shas=[sha],
+                           created="2026-09-10T00:00:00Z")}})
+        rc, out, err = run_batch(home, env, "--pr-url", PR_A, "--host", "claude")
+        batch = json.loads(out)["prs"][0]["candidates"] if rc == 0 else []
+        rc2, out2, err2 = run(home, ["app/a1.py", "app/a2.py"], "--branch", "feat/a",
+                              "--base", "main", "--sha", sha,
+                              "--created-at", "2026-09-10T00:00:00Z",
+                              "--repo", "repo", "--host", "claude")
+        single = json.loads(out2) if rc2 == 0 else None
+        check("batch and single mode agree row for row", batch and batch == single,
+              f"{batch!r}\n{single!r}")
+        check("…including the sha proof", batch and batch[0]["evidence"]["shas"] == [sha[:7]],
+              repr(batch))
+
+
+def test_batch_caps_the_number_of_prs():
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td) / "home"
+        home.mkdir()
+        env, log = _fake_gh(td, {"view": {
+            PR_A: _pr_view(PR_A, ["a.py"], "feat/a"),
+            PR_B: _pr_view(PR_B, ["b.py"], "feat/b")}})
+        rc, out, err = run_batch(home, env, "--pr-url", PR_A, "--pr-url", PR_B,
+                                 "--max-prs", "1", "--host", "claude")
+        doc = json.loads(out) if rc == 0 else {"prs": [], "skipped_prs": []}
+        check("only the first PR is scanned",
+              [p["pr_url"] for p in doc["prs"]] == [PR_A], out[:300])
+        check("the second is reported over_cap",
+              doc["skipped_prs"] == [{"pr_url": PR_B, "reason": "over_cap"}],
+              repr(doc["skipped_prs"]))
+        check("…and gh was never asked about it",
+              all(PR_B not in c for c in _gh_calls(log)), repr(_gh_calls(log)))
+
+
+def test_batch_pages_a_large_pr_s_files_through_the_api():
+    """`gh pr view --json files` stops at 100. A PR past that must be read
+    through the REST API."""
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td) / "home"
+        wt = str(Path(td) / "repo")
+        claude_session(home, "late-file", wt, branch="elsewhere",
+                       edits=[f"{wt}/app/f150.py", f"{wt}/app/f151.py"])
+        first_page = [f"app/f{i}.py" for i in range(100)]
+        everything = "\n".join(f"app/f{i}.py" for i in range(160)) + "\n"
+        env, log = _fake_gh(td, {
+            "view": {PR_A: _pr_view(PR_A, first_page, "feat/big")},
+            "api": {"repos/acme/repo/pulls/7/files": everything}})
+        rc, out, err = run_batch(home, env, "--pr-url", PR_A, "--host", "claude")
+        doc = json.loads(out) if rc == 0 else {"prs": []}
+        api = [c for c in _gh_calls(log) if c[:1] == ["api"]]
+        check("the files API was paged", len(api) == 1 and "--paginate" in api[0],
+              repr(api))
+        cands = doc["prs"][0]["candidates"] if doc["prs"] else []
+        check("a file past the first 100 still counts as evidence",
+              cands and "app/f150.py" in cands[0]["evidence"]["files"], out[:300])
+
+
+def test_batch_skips_an_enterprise_host():
+    """MemHub's link_pr takes github.com PRs only, so an enterprise PR is
+    reported as unsupported_host — never scanned, never asked of gh, and it
+    does not use up the PR cap."""
+    ghe = "https://ghe.corp/acme/repo/pull/7"
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td) / "home"
+        home.mkdir()
+        env, log = _fake_gh(td, {"view": {
+            ghe: _pr_view(ghe, ["a.py"], "feat/a"),
+            PR_A: _pr_view(PR_A, ["a.py"], "feat/a")}})
+        rc, out, err = run_batch(home, env, "--pr-url", ghe, "--pr-url", ghe + "/files",
+                                 "--pr-url", PR_A, "--max-prs", "1", "--host", "claude")
+        doc = json.loads(out) if rc == 0 else {"prs": [], "skipped_prs": []}
+        check("the enterprise PR is skipped once as unsupported_host",
+              doc["skipped_prs"] == [{"pr_url": ghe, "reason": "unsupported_host"}],
+              repr(doc["skipped_prs"]) + err)
+        check("…the github.com PR still fits under the cap",
+              [p["pr_url"] for p in doc["prs"]] == [PR_A], out[:300])
+        check("…and gh was never asked about it",
+              all(not any("ghe.corp" in a for a in c) for c in _gh_calls(log)),
+              repr(_gh_calls(log)))
+
+
+def test_batch_repo_filter_is_per_pr():
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td) / "home"
+        # No git remote in these directories, so the repo name falls back to
+        # the directory's basename — `repo` and `other-project`.
+        in_repo = str(Path(td) / "repo")
+        elsewhere = str(Path(td) / "other-project")
+        claude_session(home, "in-repo", in_repo, branch="x", edits=[f"{in_repo}/README.md"],
+                       commands=["git switch -c feat/a"])
+        claude_session(home, "elsewhere", elsewhere, branch="x",
+                       edits=[f"{elsewhere}/README.md"], commands=["git switch -c feat/a"])
+        # GitHub names are case-insensitive: a checkout spelled `REPO` is the PR's repo.
+        shouted = str(Path(td) / "upper" / "REPO")
+        claude_session(home, "shouted", shouted, branch="x",
+                       edits=[f"{shouted}/README.md"], commands=["git switch -c feat/a"])
+        env, _log = _fake_gh(td, {"view": {PR_A: _pr_view(PR_A, ["README.md"], "feat/a")}})
+        rc, out, err = run_batch(home, env, "--pr-url", PR_A, "--host", "claude")
+        doc = json.loads(out) if rc == 0 else {"prs": [{"candidates": []}]}
+        ids = [c["conversation_id"] for c in doc["prs"][0]["candidates"]]
+        check("the session in the PR's repo stays", "in-repo" in ids, repr(ids))
+        check("…and so does one whose checkout spells it in another case",
+              "shouted" in ids, repr(ids))
+        check("an unrelated project's README.md does not", "elsewhere" not in ids, repr(ids))
+
+
+def test_batch_argument_errors_are_clean():
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td) / "home"
+        home.mkdir()
+        env, _log = _fake_gh(td, {"view": {}})
+        listing = Path(td) / "files.txt"
+        listing.write_text("a.py\n", encoding="utf-8")
+        for label, args in (
+                ("both modes", ["--files-from", str(listing), "--pr-url", PR_A]),
+                ("neither mode", []),
+                ("a single-mode flag in a batch", ["--pr-url", PR_A, "--branch", "x"]),
+                ("--repo in a batch", ["--pr-url", PR_A, "--repo", "repo"]),
+                ("--max-prs 0", ["--pr-url", PR_A, "--max-prs", "0"])):
+            rc, _out, err = run_batch(home, env, *args)
+            check(f"{label} → exit 2, no traceback",
+                  rc == 2 and "ERROR" in err and "Traceback" not in err, err)
+        # gh absent: PATH holds only python's own directory.
+        bare = {"PATH": str(Path(sys.executable).parent)}
+        if (Path(sys.executable).parent / "gh").exists():
+            print("  skip gh-absent check: gh sits next to python")
+        else:
+            rc, _out, err = run_batch(home, bare, "--pr-url", PR_A)
+            check("gh not on PATH → exit 2 naming gh",
+                  rc == 2 and "gh not found" in err and "Traceback" not in err, err)
 
 
 if __name__ == "__main__":

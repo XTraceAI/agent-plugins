@@ -105,14 +105,14 @@ def test_the_finder_collects_facts_from_the_pr_it_was_given() -> None:
     """`gh pr view <n>` resolves the number against the CURRENT checkout, so a
     URL for another repo would have ranked sessions against a different pull
     request and then linked them to the one the user named (Codex, #182)."""
-    base = ROOT / "plugins" / "memhub" / "skills" / "find-contributing-sessions"
+    base = ROOT / "plugins" / "memhub" / "skills" / "link-pr"
     skill = (base / "SKILL.md").read_text(encoding="utf-8")
     scanner = (base / "scripts" / "find_sessions.py").read_text(encoding="utf-8")
     flat = " ".join(skill.split())
     # Since ENG-1128 the scanner collects the facts itself (batch mode), so the
     # property moved into the script: step 1 still resolves a bare NUMBER to a
     # URL, and the facts are read from that URL.
-    facts = skill[skill.index("## 2. Collect the facts"):skill.index("## 3. One consolidated")]
+    facts = skill[skill.index("### 3.2 Collect the facts"):skill.index("### 3.3 One consolidated")]
     check("the skill hands the scanner URLs, not numbers",
           "--prs-from" in facts and "**by URL**" in facts)
     check("…and it says why", "resolves the number against the CURRENT checkout" in flat)
@@ -124,16 +124,17 @@ def test_the_finder_collects_facts_from_the_pr_it_was_given() -> None:
 
 def test_the_finder_maps_my_unlinked_prs() -> None:
     """ENG-1128: no argument maps the caller's own unlinked PRs through the
-    backend's list tool, `--pr` names specific ones, and without a linked
+    backend's list tool, `--find <pr>...` names specific ones, and without a linked
     GitHub identity the user's own `gh` is the fallback."""
-    skill = (ROOT / "plugins" / "memhub" / "skills" / "find-contributing-sessions"
+    skill = (ROOT / "plugins" / "memhub" / "skills" / "link-pr"
              / "SKILL.md").read_text(encoding="utf-8")
     flat = " ".join(skill.split())
-    for text in ("list_my_unlinked_prs(limit=25)", "--pr <url-or-number>",
+    for text in ("list_my_unlinked_prs(limit=25)", "--find [pr-or-url ...]",
                  "gh search prs --author=@me", "`github_identity_linked: false`",
                  "`github_connected: false`", "legacy_branch_sessions",
-                 "Link nothing without an explicit yes", "Never send `pr_type`"):
-        check(f"find-contributing-sessions says {text!r}", text in flat)
+                 "Link nothing without an explicit yes", "Never send `pr_type` from `--find`",
+                 'link_source="session_found"'):
+        check(f"link-pr --find says {text!r}", text in flat)
     frontmatter = skill.split("---", 2)[1]
     for spelling in ("mcp__plugin_memhub_memhub__list_my_unlinked_prs",
                      "mcp__plugin_memhub_memhub__list_my_unlinked_prs"):
@@ -250,16 +251,21 @@ def test_create_rule_skill_keeps_its_authoring_gates() -> None:
                  # cp/git/python3/rm can still fire on the parent's shell.
                  "must be the sub-agent's rather than the parent's",
                  # ENG-1195: one rulebook per scope. Step 0 decides who the
-                 # rule applies to without asking: org-wide unless the person
-                 # says "just me" or names a workspace, and the workspace
-                 # scope is never offered unprompted.
+                 # rule applies to without asking, and the workspace scope is
+                 # never offered unprompted. ENG-1243: personal unless the
+                 # person puts it on everyone or the agent can say in one
+                 # sentence why anyone working in the repo or org needs it.
                  "## 0. Who it applies to",
-                 "**Otherwise use `org`.**",
+                 "| `personal` (**the default**) |",
+                 "**Otherwise use `personal`**",
+                 "why\n   the rule is right for **anyone**",
+                 "with that one\nsentence",
                  "never offer the workspace scope",
                  "`scope` from step 0",
-                 # the harness draft path files org-wide and never looks up
-                 # or makes a book
-                 'always files with `scope: "org"`',
+                 # the harness draft path files personal too, says its org
+                 # reason in `why`, and never looks up or makes a book
+                 'a harness draft files with\n    `scope: "personal"`',
+                 "(`Org-wide because …`)",
                  # the report names who the rule reaches, never a stored
                  # book name
                  "never a\nrulebook's stored name"):
@@ -307,7 +313,7 @@ def test_the_authoring_skills_send_the_rule_judge_its_four_fields() -> None:
           "inherits what it does not name" in file_ and "re-state `when`" in file_)
     harness = (CREATE_RULE / "references" / "harness.md").read_text(encoding="utf-8")
     check("the harness draft's call carries `when`, `do`, `why`",
-          '`scope: "org"`, `title`, `statement`, `when`, `do`, `why`' in harness)
+          '`scope` (step 0 above), `title`, `statement`, `when`, `do`, `why`' in harness)
     check("…written without asking", "`when`, `do` and `why` are written here without asking" in harness)
 
     start = (skills / "start-rulebook" / "SKILL.md").read_text(encoding="utf-8")
@@ -333,13 +339,14 @@ def test_the_authoring_skills_send_the_rule_judge_its_four_fields() -> None:
 # shipped file that still names a removed tool (or the old `memory_type`
 # parameter) teaches the agent a call the server refuses. ENG-1195 retired
 # `create_rulebook` (rulebooks are made per scope by the server; the backend
-# keeps a deprecated shim for older plugins), so the plugin's surface is 33.
+# keeps a deprecated shim for older plugins), so the plugin's surface is 33;
+# the backend then removed `add_memory`, so it is 32.
 _MCP_SURFACE = {
     "list_agent_brains", "get_brain_overview", "search_memory", "read_memory",
     "get_artifact_lineage", "list_tags", "save_artifact", "ingest_document_from_url",
     "tag_memory", "copy_to_agent_brain", "delete_memory", "create_agent_brain",
     "share_agent_brain", "list_agent_brain_access", "list_brain_folders",
-    "move_brain_to_folder", "list_sessions", "add_memory", "import_conversation",
+    "move_brain_to_folder", "list_sessions", "import_conversation",
     "list_rulebooks", "list_rules", "create_rule", "link_pr",
     "unlink_pr", "list_my_unlinked_prs", "get_spec_workflow", "list_skills",
     "get_skill", "create_skill", "list_orgs", "list_workspaces", "create_workspace",
@@ -354,8 +361,8 @@ _REMOVED_MCP = (
 )
 
 
-def test_mcp_surface_is_33_tools() -> None:
-    check("the surface this test pins is 33 tools", len(_MCP_SURFACE) == 33)
+def test_mcp_surface_is_32_tools() -> None:
+    check("the surface this test pins is 32 tools", len(_MCP_SURFACE) == 32)
 
 
 def test_shipped_files_name_no_removed_mcp_tool() -> None:

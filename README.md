@@ -62,9 +62,18 @@ curl -fsSL https://raw.githubusercontent.com/XTraceAI/agent-plugins/main/install
 
 This installs MemHub into each of Claude Code, Codex and Cursor it finds on
 `PATH` (`sh -s -- --agents claude,codex` for a subset), disables any other
-enabled MemHub copy in Claude Code so sessions are not captured twice, installs
-the Codex hooks bridge, and signs the machine in once — every agent's capture
-hooks read the same credential. It is safe to re-run. It cannot do the steps
+enabled MemHub copy in Claude Code so sessions are not captured twice, turns on
+Claude Code's marketplace auto-update and its fork agent (`--no-auto-update` /
+`--no-fork-agent` leave either as it is), installs the Codex hooks bridge, and
+signs the machine in once — every agent's capture hooks read the same
+credential. On a first install it asks two things when a terminal is attached:
+where MemHub is active (only repositories you add later with
+`/memhub:repos add .`, every repository, or a list now) and whether to show the
+companion animal (off by default; a one-line status strip shows instead).
+`--selected-repos`, `--all-repos`, `--repos org/a,org/b`, `--companion` and
+`--no-companion` answer from the command line (after `sh -s --`); unattended, it
+picks selected repositories (none yet) and no animal. It is safe to re-run. It
+cannot do the steps
 only the host UI can: restarting, trusting the Codex hooks in `/hooks`, and
 selecting **Add** in Cursor; it prints those at the end. The per-host steps
 below are the same install done by hand.

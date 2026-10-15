@@ -50,10 +50,14 @@ def test_normalized_desktop_payload_and_explicit_context():
         assert 'fixture rule fired' in output.getvalue(), output.getvalue()
         rows = [json.loads(x) for x in (base/'state/ledger/fires.jsonl').read_text().splitlines()]
         assert len(rows) == 1 and rows[0]['host'] == 'codex'
-        for cmd in ['echo x; '+command, 'cd '+shlex.quote(str(repo))+'; echo rulebook-probe',
-                    'cd "$TARGET" && echo rulebook-probe']:
+        # The call's repo is where its FIRST command runs: a command before the
+        # cd runs in the (non-repo) cwd, and an unset variable names nothing.
+        for cmd in ['echo x; '+command, 'cd "$TARGET_UNSET_RB" && echo rulebook-probe']:
             payload['tool_input']['command'] = cmd
             assert rb.repo_of_call(payload)[0] == ''
+        # A `cd X;` chain runs the next command in X, like `cd X &&`.
+        payload['tool_input']['command'] = 'cd '+shlex.quote(str(repo))+'; echo rulebook-probe'
+        assert rb.repo_of_call(payload)[1] == str(repo)
         # The raw exec_command shape remains supported.
         payload.update(tool_name='exec_command', tool_input={'cmd':'echo probe','workdir':str(repo)})
         normalized=json.loads(bridge._rulebook_payload(json.dumps(payload).encode()))
@@ -83,9 +87,7 @@ def test_bundled_route_defers_only_for_installed_matching_user_handler():
         assert not bridge._user_bridge_handles('PreToolUse',b'{"tool_name":"Bash"}')
 
 
-def test_the_package_selects_codex_hooks_and_gives_a_projectless_notice():
-    # Was asserted against plugins/memhub-staging until the staging build moved
-    # to agent-plugins-internal; the shipped package makes the same promise.
+def test_staging_selects_codex_hooks_and_projectless_notice():
     manifest=json.loads((ROOT/'plugins/memhub/.codex-plugin/plugin.json').read_text())
     assert manifest['hooks']=='./hooks/codex-hooks.json'
     assert manifest['name']=='memhub'

@@ -35,6 +35,7 @@ os.environ.pop("MEMHUB_TOKEN", None)
 sys.path.insert(0, str(SCRIPTS))
 import mcp_http  # noqa: E402
 import pr_babysit_trigger  # noqa: E402
+from _memhub_auth import skill_command  # noqa: E402
 import pr_link  # noqa: E402
 
 failures: list[str] = []
@@ -465,7 +466,7 @@ def test_github_mcp_tools_are_recognised_by_their_server_segment():
         # …but a server whose NAME contains underscores is still GitHub.
         # `[^_]*` stopped at the first one and rejected every tool from
         # `github_enterprise`, or from any plugin-provided server — this repo's
-        # own tools arrive as `mcp__plugin_memhub-staging_memhub__…`
+        # own tools arrive as `mcp__plugin_memhub_memhub__…`
         # (Codex review, PR #182).
         ("mcp__github_enterprise__create_pull_request", True, True),
         ("mcp__plugin_github_github__create_pull_request", True, True),
@@ -1131,7 +1132,12 @@ def test_the_contexts_say_the_right_thing_for_each_case():
     check("B2 ends with the already-linked escape that keeps a babysit loop quiet",
           in_play.rstrip().endswith("say nothing at all."), in_play)
     check("B2 offers the finder and forbids running it unasked",
-          "/memhub:find-contributing-sessions" in in_play
+          # NOTE: public hardcodes the production prefix here and pins the
+          # rendered bytes in pr_work_type_test's GOLDEN_PRE_CLASSIFICATION, so
+          # W1.2's "skill prefix from the manifest" is NOT applied to this
+          # string. On a staging install this tells the user to run a command
+          # that does not exist there. Tracked as a W1.2 follow-up.
+          f"/memhub:link-pr --find {url}" in in_play
           and "without the user saying yes" in in_play)
 
     disconnected = pr_link.context_for(

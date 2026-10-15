@@ -16,11 +16,14 @@ Covers:
   back to the MAIN checkout, so a rule scoped to the repo matches from any of
   its worktrees — the machinery was always correct, only the starting point
   was wrong;
-* a Bash call carries no path, so a non-git cwd stays silent exactly as
-  before (the fail-open property the hook is built on);
-* the session cwd is the trust boundary: a path outside it is ignored, a
-  symlink under it cannot smuggle the lookup out, and a relative path binds
-  to the SESSION's cwd rather than this process's;
+* a Bash call that names no directory keeps the cwd, so a non-git cwd stays
+  silent exactly as before (the fail-open property the hook is built on);
+* what the call TOUCHES decides, wherever it is: a file in another checkout,
+  or a Bash command's `cd` chain / `git -C` (`~`, `$HOME`, `$VAR`, relative
+  paths resolved), so the target repo's book judges it — not the session's
+  (2026-10 audit: 28 of 56 explained misses were a call judged by the
+  session repo's book); a target that is no checkout keeps the cwd answer;
+  a relative path binds to the SESSION's cwd rather than this process's;
 * `root` comes back in the session's own path space, because it keys
   OrderingEngine state (`{rid}@{root}:{branch}`) and one worktree reached two
   ways would split into two keys and silently re-arm its rules;
@@ -125,7 +128,7 @@ BODY = "_client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)\n"
 
 
 def unit_checks() -> None:
-    """`repo_of_call` and `_acted_on_dir` are pure and importable — replayed
+    """`repo_of_call` and `_call_seed` are pure and importable — replayed
     here, so what is tested is what runs."""
     with tempfile.TemporaryDirectory() as td:
         container = os.path.join(td, "container")   # holds checkouts, is not one
@@ -163,7 +166,8 @@ def unit_checks() -> None:
 
         # --- no path to act on: unchanged, still silent ----------------------
         check("a Bash call from a container cwd still resolves nothing",
-              call(container, command="git push") == ("", "", "", ""))
+              rb.repo_of_call({"cwd": container, "tool_name": "Bash",
+                               "tool_input": {"command": "git push"}}) == ("", "", "", ""))
         check("no tool_input at all (SessionStart) still resolves nothing",
               rb.repo_of_call({"cwd": container}) == ("", "", "", ""))
         # Assert the PAIR: main and the worktree now share a repo NAME, so a
@@ -172,33 +176,40 @@ def unit_checks() -> None:
         check("a cwd inside a checkout is unaffected when no file is named",
               rb.repo_of_call({"cwd": wt})[:2] == ("MainRepo", wt))
 
-        # --- the trust boundary ---------------------------------------------
-        check("an absolute path OUTSIDE the session cwd is ignored",
-              call(container, file_path=os.path.join(outside, "app", "svc.py"))
-              == ("", "", "", ""))
+        # --- the call's own target decides, wherever it is ------------------
+        def bash(cwd, command, home=None):
+            saved = os.environ.get("HOME")
+            if home is not None:
+                os.environ["HOME"] = home
+            try:
+                return rb.repo_of_call({"cwd": cwd, "tool_name": "Bash",
+                                        "tool_input": {"command": command}})
+            finally:
+                if home is not None:
+                    os.environ["HOME"] = saved if saved is not None else ""
 
-        link = os.path.join(container, "escape")
-        try:
-            os.symlink(outside, link)
-            check("a symlink under cwd cannot smuggle the lookup outside it",
-                  call(container, file_path=os.path.join(link, "app", "svc.py"))
-                  == ("", "", "", ""))
-        except (OSError, NotImplementedError):      # unprivileged Windows
-            print("SKIP  symlink containment (symlinks unavailable)")
-
-        # The DANGEROUS direction, and the one a resolved-only check misses: a
-        # link OUTSIDE cwd whose target is inside it. Containment on the real
-        # path passes, while the lexical parents still lead to another
-        # checkout — which is the one `repo_info` would walk up into.
-        inward = os.path.join(td, "outside-link")
-        try:
-            os.symlink(os.path.join(container, "MainRepo-feature"), inward)
-            check("a symlink outside cwd pointing INTO it does not escape the boundary",
-                  call(container, file_path=os.path.join(inward, "app", "svc.py"))
-                  == ("", "", "", ""),
-                  str(call(container, file_path=os.path.join(inward, "app", "svc.py"))))
-        except (OSError, NotImplementedError):
-            print("SKIP  inward-symlink containment (symlinks unavailable)")
+        check("an Edit of a file in ANOTHER checkout resolves that checkout",
+              call(wt, file_path=os.path.join(outside, "app", "svc.py"))[:2]
+              == ("OutsideRepo", outside))
+        check("`cd <other repo> && git push` from a checkout resolves the other repo",
+              bash(wt, f"cd {outside} && git push")[:2] == ("OutsideRepo", outside))
+        check("`cd ~/<other repo> && git push` expands ~ and resolves it",
+              bash(wt, "cd ~/OutsideRepo && git push", home=td)[:2] == ("OutsideRepo", outside))
+        check("`cd $HOME/…` and `${HOME}` expand too",
+              bash(wt, "cd $HOME/OutsideRepo && git push", home=td)[:2] == ("OutsideRepo", outside)
+              and bash(wt, 'cd "${HOME}/OutsideRepo"; git push', home=td)[:2] == ("OutsideRepo", outside))
+        check("a relative `cd ../..` chain resolves against the cwd",
+              bash(wt, "cd .. && cd ../OutsideRepo && git status")[:2] == ("OutsideRepo", outside))
+        check("`git -C <other repo>` resolves the other repo",
+              bash(wt, f"git -C {outside} push")[:2] == ("OutsideRepo", outside))
+        check("a `cd` into a subdirectory of the same checkout keeps it",
+              bash(wt, "cd app && ls")[:2] == ("MainRepo", wt))
+        check("a `cd` to a directory that is no checkout keeps the cwd's",
+              bash(wt, f"cd {td} && ls")[:2] == ("MainRepo", wt))
+        check("an unresolvable `cd \"$(…)\"` keeps the cwd's",
+              bash(wt, f'cd "$(echo {outside})" && git push')[:2] == ("MainRepo", wt))
+        check("an unset variable keeps the cwd's",
+              bash(wt, "cd $NO_SUCH_VAR_RB && git push")[:2] == ("MainRepo", wt))
 
         # --- one path space per session (the OrderingEngine key) ------------
         # An absolute path spelled in a different-but-equivalent space
@@ -266,12 +277,11 @@ def unit_checks() -> None:
               call(container, notebook_path=os.path.join(wt, "app", "n.ipynb"))[:2]
               == ("MainRepo", wt))
         check("a junk file_path does not shadow a good notebook_path",
-              rb._acted_on_dir(container, {"file_path": 123,
-                                           "notebook_path": os.path.join(wt, "app", "n.ipynb")})
-              == os.path.join(wt, "app"))
+              call(container, file_path=123, notebook_path=os.path.join(wt, "app", "n.ipynb"))[:2]
+              == ("MainRepo", wt))
         check("a file that resolves nowhere falls back to the cwd's checkout",
               rb.repo_of_call({"cwd": wt, "tool_input":
-                               {"file_path": os.path.join(outside, "a.py")}})[0]
+                               {"file_path": os.path.join(td, "loose", "a.py")}})[0]
               == "MainRepo")
 
 
@@ -321,15 +331,68 @@ def hook_checks() -> None:
         check("Bash from a container cwd is still silent, exit 0",
               rc == 0 and out.strip() == "", out)
 
-        # A file outside the session cwd must not reach across into another
-        # checkout's book, even when one is cached for it.
+        # A file in ANOTHER checkout is judged by that checkout's book: its
+        # scoped rule fires, and the session repo's rule does not.
         other = mkmain(td, "MainRepo2")
-        seed_book(base, "MainRepo2", [dict(RULE, _scope_repos=["MainRepo2"])])
-        rc, out = run("pre", {"session_id": "o1", "cwd": container, "tool_name": "Write",
+        seed_book(base, "MainRepo2", [dict(RULE, id="metered-llm-2", _scope_repos=["MainRepo2"]),
+                                      {"id": "no-push-2", "on": "bash", "rx": r"\bgit\s+push\b",
+                                       "_scope_repos": ["MainRepo2"], "text": "MainRepo2 pushes go via CI",
+                                       "why": "w"}])
+        rc, out = run("pre", {"session_id": "o1", "cwd": wt, "tool_name": "Write",
                               "tool_input": {"file_path": os.path.join(other, "app", "x.py"),
                                              "content": BODY}}, env)
-        check("a file outside the session cwd loads no book and stays silent",
-              rc == 0 and out.strip() == "", out)
+        check("an Edit of a file in another repo is judged by that repo's book",
+              rc == 0 and "[metered-llm-2]" in ctx(out) and "[metered-llm]" not in ctx(out), out)
+        rc, out = run("pre", {"session_id": "o2", "cwd": wt, "tool_name": "Bash",
+                              "tool_input": {"command": "cd ~/MainRepo2 && git push"}},
+                      dict(env, HOME=td))
+        check("`cd ~/<other repo> && git push` fires the other repo's scoped rule",
+              rc == 0 and "[no-push-2]" in ctx(out), out)
+        rc, out = run("pre", {"session_id": "o3", "cwd": wt, "tool_name": "Bash",
+                              "tool_input": {"command": "git push"}}, dict(env, HOME=td))
+        check("…and the same push in the session's own repo does not",
+              rc == 0 and "[no-push-2]" not in ctx(out), out)
+
+        # A Bash command that WRITES or READS a file in another repo's checkout,
+        # with no `cd` (the call stays the session repo's), has that file
+        # judged by the other repo's book — the live repro of PR #176's review.
+        repo_a = mkmain(td, "RepoA")                      # the session's repo, no rules
+        seed_book(base, "MainRepo2", [
+            {"id": "no-data-files", "on": "edit", "path_rx": r"(^|/)[^/]*\.(csv|tsv)$",
+             "text": "Never commit data files to the repo", "why": "w"},
+            {"id": "meter", "on": "edit", "path_rx": r"^(?:.*/)?app/.*\.py$",
+             "content_rx": r"(AsyncOpenAI|AsyncAnthropic)\(\s*api_key", "text": "Every model call reaches the meter",
+             "why": "w"},
+            {"id": "no-meter-gate", "on": "edit", "mode": "gate", "path_rx": r"app/gated/.*\.py$",
+             "content_rx": r"AsyncOpenAI\(", "text": "Gated meter", "why": "w"},
+            {"id": "readme-read", "on": "read", "path_rx": r"README\.md$", "text": "Read the README via the brain",
+             "why": "w"},
+            {"id": "no-push-2", "on": "bash", "rx": r"\bgit\s+push\b", "_scope_repos": ["MainRepo2"],
+             "text": "MainRepo2 pushes go via CI", "why": "w"}])
+        henv = dict(env, HOME=td)
+        for n, cmd, want in [
+                (1, "echo a,b > ../MainRepo2/live_probe.csv", "[no-data-files]"),
+                (2, "tee $HOME/MainRepo2/app/services/live_probe_llm.py >/dev/null <<'PY'\n"
+                    "client = AsyncOpenAI(api_key=key)\nPY", "[meter]"),
+                (3, "cat ~/MainRepo2/README.md", "[readme-read]"),
+                (4, f"printf 'x,y' > {other}/data/t.tsv", "[no-data-files]")]:
+            rc, out = run("pre", {"session_id": f"x{n}", "cwd": repo_a, "tool_name": "Bash",
+                                  "tool_use_id": f"x{n}", "tool_input": {"command": cmd}}, henv)
+            check(f"a Bash write/read into another repo is judged by that repo's book ({want})",
+                  rc == 0 and want in ctx(out), out)
+        rc, out = run("pre", {"session_id": "x5", "cwd": repo_a, "tool_name": "Bash",
+                              "tool_input": {"command": "cat > ~/MainRepo2/app/gated/m.py <<'EOF'\n"
+                                             "c = AsyncOpenAI()\nEOF"}}, henv)
+        check("…and that repo's gate-mode edit rule blocks the command",
+              rc == 0 and '"permissionDecision": "deny"' in out and "[no-meter-gate]" in out, out)
+        rc, out = run("pre", {"session_id": "x6", "cwd": repo_a, "tool_name": "Bash",
+                              "tool_input": {"command": "echo a,b > ../MainRepo2/x.csv && git push"}}, henv)
+        check("…while the command's own rules stay the session repo's (no MainRepo2 push rule)",
+              "[no-data-files]" in ctx(out) and "[no-push-2]" not in ctx(out), out)
+        with open(os.path.join(base, "ledger", "fires.jsonl"), encoding="utf-8") as f:
+            rows = [json.loads(line) for line in f if '"x1"' in line]
+        check("…and the fire is recorded against the repo whose book fired it",
+              [r["repo"] for r in rows] == ["MainRepo2"], str(rows))
 
         # An edit that does not match still says nothing — the fix widens where
         # rules are LOOKED for, never what counts as a match.
