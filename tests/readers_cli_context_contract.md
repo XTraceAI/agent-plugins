@@ -54,3 +54,10 @@ delayed legacy usage is checked through the same guard. Per-record high-water
 charges are not refunded while reconciliation may still reference removed rows.
 Selected record growth also preflights the existing 4 MiB body bound. This is an
 encoded ownership bound, not an exact Python heap measurement.
+
+The final complete-source check walks rollout paths directly and compares the
+same path/revision snapshot as initial discovery. It charges the cumulative
+entry budget for every walked entry without constructing unused session-list
+rows again, and checks the existing deadline between revision reads. Initial
+session discovery and all ceilings are unchanged. Wide histories beyond the
+same cumulative entry limit still refuse the entire page.

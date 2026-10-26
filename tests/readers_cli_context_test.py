@@ -31,6 +31,18 @@ def fixture(home, count=35):
     return path, rows
 
 
+def wide_fixture(home, unrelated):
+    target, rows = fixture(home, 2)
+    other = []
+    for n in range(unrelated):
+        sid = f'22222222-3333-4444-8555-{n:012x}'
+        path = target.parent / f'rollout-2026-01-01T00-00-00-{sid}.jsonl'
+        cli.write_jsonl(path, [history.row(0, 'session_meta', {'id': sid,
+            'timestamp': cli.STAMP, 'cwd': '/synthetic/project', 'originator': 'codex_cli'})])
+        other.append(path)
+    return target, rows, other
+
+
 def run(home, request=None):
     request = request or {'version': 1, 'kind': 'first'}
     result, rows = cli.run(home, 'codex', '--exact-detail', '--session', SID,
@@ -371,6 +383,118 @@ def test_selected_record_ledger_growth_is_preflighted_before_body_ownership():
         except context.ContextRefusal:
             pass
     assert (owner.bytes,owner.records,owner.bodies)==before
+
+
+def test_wide_history_rechecks_paths_without_rebuilding_session_rows():
+    from readers import codex
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        wide_fixture(home, 1100)
+        full, canonical = cli.run(home, 'codex', '--exact-detail', '--session', SID)
+        assert full.returncode == 0, full.stderr
+        calls, spent = [], []
+        original_list, original_observe = codex.list_sessions, readers_cli.DetailBudget.observe
+        def listed(*args, **kwargs):
+            rows = original_list(*args, **kwargs)
+            calls.append(len(spent))
+            return rows
+        def observed(self):
+            original_observe(self)
+            spent.append(self.entries)
+        with patch.object(codex, 'list_sessions', listed), patch.object(readers_cli.DetailBudget, 'observe', observed):
+            status, page, codes = here(home)
+        assert status == 0 and not codes
+        assert page[1:] == canonical[1:]
+        assert len(calls) == 1
+        # The unchanged tree would charge that same walk plus rows twice.
+        assert calls[0] * 2 > readers_cli.DETAIL_MAX_DISCOVERY_ENTRIES
+        assert calls[0] < max(spent) <= readers_cli.DETAIL_MAX_DISCOVERY_ENTRIES
+        assert len(spent) == max(spent)  # The cumulative budget was never reset.
+
+
+def test_wider_history_still_refuses_at_the_unchanged_cumulative_entry_cap():
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        wide_fixture(home, 1400)
+        status, page, codes = here(home)
+        assert readers_cli.DETAIL_MAX_DISCOVERY_ENTRIES == 4096
+        assert status == 2 and not page and 'detail_limit_discovery_entries' in codes
+
+
+def test_final_path_snapshot_refuses_added_claimants_revisions_and_root_retargets():
+    for mutation in ('claimant', 'unrelated-revision', 'root-retarget'):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            target, rows, others = wide_fixture(home, 2)
+            configured = home / '.codex/sessions'
+            if mutation == 'root-retarget':
+                held = home / 'original-sessions'
+                configured.rename(held)
+                configured.symlink_to(held, target_is_directory=True)
+                (home / 'replacement-sessions').mkdir()
+            original = context.Rows.__getitem__
+            fired = False
+            def changed(self, index):
+                nonlocal fired
+                value = original(self, index)
+                if not fired:
+                    fired = True
+                    if mutation == 'claimant':
+                        cli.write_jsonl(target.parent / 'copy' / target.name, rows)
+                    elif mutation == 'unrelated-revision':
+                        with others[0].open('a') as handle:
+                            handle.write(' \n')
+                    else:
+                        configured.unlink()
+                        configured.symlink_to(home / 'replacement-sessions', target_is_directory=True)
+                return value
+            with patch.object(context.Rows, '__getitem__', changed):
+                status, page, codes = here(home)
+            assert fired and status == 2 and not page, (mutation, codes)
+
+
+def test_final_path_discovery_errors_refuse_the_entire_page():
+    from readers import codex
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        fixture(home, 2)
+        original = codex._rollout_files
+        calls = 0
+        def unreadable(on_error=None, observe=None):
+            nonlocal calls
+            calls += 1
+            found = original(on_error=on_error, observe=observe)
+            if calls == 2:
+                on_error(OSError('synthetic discovery failure'))
+            return found
+        with patch.object(codex, '_rollout_files', unreadable):
+            status, page, codes = here(home)
+        assert calls == 2 and status == 2 and not page and 'discovery_incomplete' in codes
+
+
+def test_final_path_revisions_check_the_existing_deadline_between_files():
+    from readers import codex
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        wide_fixture(home, 2)
+        original_paths, original_revision = codex._rollout_files, readers_cli.source_revision
+        calls, clock = 0, [0.0]
+        final = False
+        def paths(on_error=None, observe=None):
+            nonlocal calls, final
+            calls += 1
+            found = original_paths(on_error=on_error, observe=observe)
+            final = calls == 2
+            return found
+        def revision(*args, **kwargs):
+            value = original_revision(*args, **kwargs)
+            if final:
+                clock[0] = 31.0
+            return value
+        with patch.object(codex, '_rollout_files', paths), patch.object(readers_cli, 'source_revision', revision), \
+                patch.object(readers_cli, 'detail_now', lambda: clock[0]):
+            status, page, codes = here(home)
+        assert final and status == 2 and not page and 'detail_deadline' in codes
 
 
 if __name__ == '__main__':

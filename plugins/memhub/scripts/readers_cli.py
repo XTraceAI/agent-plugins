@@ -1778,10 +1778,13 @@ def main(argv=None) -> int:
                     witness_root_held(reader, anchors)
                 except WitnessUnowned:
                     raise SourceChanged("context root changed") from None
-                current = reader.list_sessions(None,
+                current = reader._rollout_files(
                     on_error=lambda error: diagnostic("discovery_incomplete"), observe=budget.observe)
-                snapshot = sorted((str(Path(row["path"])), source_revision(Path(row["path"]), "codex"))
-                                  for row in current)
+                snapshot = []
+                for current_path in current:
+                    budget.check()
+                    snapshot.append((str(current_path), source_revision(current_path, "codex")))
+                snapshot.sort()
                 if incomplete or snapshot != context_snapshot or current_revision(path) != revision:
                     raise SourceChanged("context sources changed")
                 sys.stdout.write(encoded)
