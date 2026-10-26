@@ -1,0 +1,503 @@
+#!/usr/bin/env python3
+"""Check a candidate rule against the engine that will actually run it.
+
+A rule can be well-formed, match the command you had in mind, and still be
+wrong in ways nobody sees until it is live and nagging the whole team:
+
+  * it fires on a command that merely MENTIONS the pattern (`grep "git push"`),
+    which is the largest false-fire class we have measured;
+  * it still fires after the author fixes the thing it asked for, so complying
+    with the rule does not silence it;
+  * its pattern is too long or backtracks, so the hook drops the WHOLE rule at
+    load time — silently, on every teammate's machine.
+
+So this runs the candidate through `rulebook_hook.to_hook_rule()`,
+`evaluate()`, `given_ok()` and `OrderingEngine` — the same code the live hook
+uses, never a re-implementation — against cases the author supplies. Exit 0 =
+every case behaved; exit 1 = at least one did not, and the table says which.
+
+  rulebook_verify.py --rule '<create_rule JSON>' \
+      --fires 'gh pr merge 7' \
+      --silent 'grep -rn "gh pr merge" docs/' \
+      --silent 'ls -la'
+
+  rulebook_verify.py --rule-file cand.json --cases cases.json
+
+For an `edit` / `write` rule, a case is `path::content`:
+
+  --fires '/repo/src/db.py::conn = connect(url, verify=False)' \
+  --silent '/repo/src/db.py::conn = connect(url)'
+
+A rule with a `given` block needs the facts it asks about. Give them once for
+every case (`--branch`, `--diff-path`, `--diff-lines`, `--dirty`,
+`--user-said`), or per case in a `--cases` file, where a case may be an
+object: {"case": "git push", "branch": "main", "diff_paths": [...],
+"diff_lines": 620, "dirty": true, "user_said": ["please push it"]}.
+No git runs and no transcript is read — the fixture IS the repo.
+
+For a `read` rule a case is the Read tool (`read:<path>`, narrowed with
+`@<offset>,<limit>` or `@<limit>`) or a shell command run through the same
+parser the hook uses (`bash:<command>`, relative paths against `--cwd`).
+`--file-lines N` stands in for the file's length so a case needs no real
+file; `--agent-main false` runs the case as a subagent:
+
+  --fires  'read:/repo/src/service.py' --file-lines 900 \
+  --silent 'read:/repo/src/service.py@1,200' \
+  --silent 'bash:cat src/service.py | head -50' \
+  --silent 'bash:cat src/service.py' --agent-main false
+
+An `ordering` rule is verified as a SEQUENCE of steps joined by ` >> `, ending
+in the gated call; the case fires when that call is gated:
+
+  --fires  'edit:src/a.py >> gate:git push'
+  --silent 'edit:src/a.py >> ok:pytest tests/ >> gate:git push'
+  --fires  'edit:src/a.py >> red:pytest tests/ >> gate:git push'
+
+Stdlib only; no network; no server concepts.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import rulebook_hook as H  # noqa: E402  (path set above so the engine is importable)
+
+_FIXTURE_KEYS = ("branch", "diff_paths", "diff_lines", "dirty", "user_said",
+                 "file_lines", "agent_main", "cwd")
+
+
+# `create_rule` takes the matcher nested; the hook reads a flat row. Build the
+# `?view=hook` shape so `to_hook_rule` does the same translation it does live.
+def _hook_row(rule: dict) -> dict:
+    row = dict(rule)
+    row.setdefault("rule_id", "candidate")
+    row.setdefault("status", "active")
+    row.setdefault("version", 1)
+    row.setdefault("delivery", "agent_hook" if (rule.get("matcher") or rule.get("ordering"))
+                   else "session_context")
+    return row
+
+
+def _split_case(raw: str) -> tuple[str, str]:
+    """`path::content` for edit/write rules; everything else is a command."""
+    if "::" in raw:
+        path, _, content = raw.partition("::")
+        return path, content
+    return "", raw
+
+
+def _case(raw, base_fixture: dict | None) -> tuple[str, dict]:
+    """A case is a string, or an object carrying its own facts. Per-case facts
+    override the ones given for every case."""
+    fixture = dict(base_fixture or {})
+    if isinstance(raw, dict):
+        fixture.update({k: raw[k] for k in _FIXTURE_KEYS if k in raw})
+        raw = str(raw.get("case", ""))
+    return str(raw), fixture
+
+
+def _probes(fixture: dict) -> "H.Probes":
+    """A Probes that answers from the fixture and never touches git or a
+    transcript: a fact the fixture does not give is None, which is exactly
+    what the live hook sees when a probe fails — the rule stays silent."""
+    pre = {"branch": fixture.get("branch"),
+           "diff_paths": list(fixture["diff_paths"]) if "diff_paths" in fixture else None,
+           "diff_lines": fixture.get("diff_lines"),
+           "dirty": fixture.get("dirty"),
+           "user_turns": list(fixture["user_said"]) if "user_said" in fixture else None,
+           "agent_main": fixture.get("agent_main", True),
+           "base": None}
+    return H.Probes("", pre["branch"], fixture=pre)
+
+
+def _ordering_fires(hook_rule: dict, raw: str) -> bool:
+    """Replay `step >> step >> gate:cmd` through the real OrderingEngine in a
+    throwaway state dir. Steps: `edit:<path>`, `ok:<cmd>` (green receipt),
+    `red:<cmd>` (red receipt), `session` (the SessionStart arming),
+    `prompt:<what the person typed>` (the UserPromptSubmit arming),
+    `gate:<cmd>` (the gated pre-call). The case fires when the LAST gate step
+    is gated.
+
+    A `prompt:` step whose text does not match the rule's `armed_by_rx` arms
+    nothing and is not an error — that is the silent case worth writing.
+
+    `session` and `prompt` exist because an obligation armed by either is
+    armed OUTSIDE the engine — `arm_obligations` writes it into session state
+    and the pre lane hands it to `feed`. Without a step for them, a rule whose
+    only arming event is `session` or `prompt` could never make a `--fires`
+    case pass, so the authoring skill's mandatory verification step would
+    reject every rule written to the two recipes it documents. `H.arms_on` is
+    the same predicate the live lanes use, so a rule this blesses is a rule
+    the hook actually arms."""
+    steps = [s.strip() for s in raw.split(">>") if s.strip()]
+    rule = dict(hook_rule)
+    outcome = None
+    armed = None
+    armed_once = set()
+    saved = H.BASE
+    with tempfile.TemporaryDirectory() as td:
+        H.BASE = td
+        try:
+            eng = H.OrderingEngine("/verify-worktree", "*")
+            for step in steps:
+                kind, _, arg = step.partition(":")
+                kind, arg = kind.strip(), arg.strip()
+                if kind == "edit":
+                    outcome = eng.feed(rule, hook_phase="post", tool="Edit", file_path=arg,
+                                       armed=armed)
+                elif kind in ("ok", "red"):
+                    outcome = eng.feed(rule, hook_phase="post", tool="Bash", cmd=arg,
+                                       ok=(kind == "ok"), armed=armed)
+                    if outcome == "discharged":
+                        armed = None        # what main() does on a discharge
+                elif kind in ("session", "prompt"):
+                    # The step is refused only when the RULE cannot be armed by
+                    # this event at all — that is a case written against the
+                    # wrong rule. A `prompt:` whose text does not match
+                    # `armed_by_rx` is not an error: it is the silent case
+                    # every prompt-armed rule should carry, the one proving the
+                    # rule stays quiet when nobody raised the subject.
+                    spec = rule.get("ordering") or {}
+                    events = tuple(spec.get("armed_by_events", ("edit", "write")))
+                    if kind not in events:
+                        raise ValueError(
+                            "step %r cannot arm this rule: armed_by_events is %r"
+                            % (step, list(events)))
+                    if kind == "prompt" and not spec.get("armed_by_rx"):
+                        raise ValueError(
+                            "step %r needs the rule to carry armed_by_rx — without one "
+                            "a prompt-armed rule arms on nothing" % step)
+                    # The live lane refuses to arm on a prompt the HARNESS
+                    # wrote, so the verifier has to as well — otherwise a
+                    # case passes here and the rule never arms in a session,
+                    # which is the one discrepancy `arms_on` exists to
+                    # prevent.
+                    # SessionStart is once per session even when the client
+                    # fires it again on resume or `/clear` — `arm_obligations`
+                    # records `session:<rule>` in `armed_once` and refuses the
+                    # rest. Without that here, `session >> ok:git fetch >>
+                    # session >> gate:…` reported a fire, so a case whose LIVE
+                    # behaviour is correctly discharged failed the mandatory
+                    # authoring verification.
+                    if kind == "session" and kind in armed_once:
+                        pass
+                    elif kind == "prompt" and H.harness_prompt(arg):
+                        pass
+                    elif H.arms_on(rule, kind, arg):
+                        armed_once.add(kind)
+                        armed = kind
+                elif kind == "gate":
+                    outcome = eng.feed(rule, hook_phase="pre", tool="Bash", cmd=arg,
+                                       armed=armed)
+                else:
+                    raise ValueError(
+                        "unknown ordering step %r "
+                        "(edit: | ok: | red: | session | prompt: | gate:)" % step)
+        finally:
+            H.BASE = saved
+    return outcome == "fired"
+
+
+def _read_fires(hook_rule: dict, raw: str, fixture: dict) -> bool:
+    """`read:<path>[@<offset>,<limit>|@<limit>]` is the Read tool; `bash:<cmd>`
+    goes through `bash_reads`, the parser the hook runs on a shell command,
+    and fires if ANY file it names does. `file_lines` stands in for the
+    length of every file in the case; without it the path is measured on
+    disk, and a path that does not exist has no facts and never fires."""
+    kind, sep, rest = raw.partition(":")
+    total = fixture.get("file_lines")
+    probes = _probes(fixture)
+    if kind == "bash" and sep:
+        for path, pulled in H.bash_reads(fixture.get("cwd") or os.getcwd(), rest):
+            if H.evaluate(hook_rule, hook_phase="pre", tool="Read", cmd=rest, file_path=path) \
+                    and H.given_ok(hook_rule, probes, read=H.read_facts(path, pulled=pulled, total=total)):
+                return True
+        return False
+    if kind != "read" or not sep:
+        raise ValueError("a read rule's case is 'read:<path>[@offset,limit]' or 'bash:<command>'")
+    path, offset, limit = rest, None, None
+    if "@" in rest:
+        path, _, span = rest.rpartition("@")
+        a, _, b = span.partition(",")
+        try:
+            offset, limit = (int(a), int(b)) if b else (None, int(a))
+        except ValueError:
+            raise ValueError("the narrowing after '@' is '<offset>,<limit>' or '<limit>'") from None
+    facts = H.read_facts(path, offset=offset, limit=limit, total=total)
+    return bool(H.evaluate(hook_rule, hook_phase="pre", tool="Read", file_path=path)) \
+        and H.given_ok(hook_rule, probes, read=facts)
+
+
+def _fires(hook_rule: dict, raw: str, fixture: dict | None = None) -> bool:
+    on = hook_rule.get("on")
+    if on == "ordering":
+        return _ordering_fires(hook_rule, raw)
+    if on == "read":
+        return _read_fires(hook_rule, raw, fixture or {})
+    path, content = _split_case(raw)
+    if on in ("edit", "write", "write_stdlib"):
+        hit = H.evaluate(hook_rule, hook_phase="pre", tool="Edit",
+                         file_path=path or "/repo/file.py", body=content)
+    elif on in ("result", "output"):
+        hit = H.evaluate(hook_rule, hook_phase="post", tool="Bash",
+                         cmd=path or "pytest", result_text=content)
+    else:
+        hit = H.evaluate(hook_rule, hook_phase="pre", tool="Bash", cmd=content)
+    return bool(hit) and H.given_ok(hook_rule, _probes(fixture or {}))
+
+
+def _load_failure(rule: dict, out: list[str]) -> None:
+    matcher = rule.get("matcher") or {}
+    for key, pat in matcher.items():
+        if key.endswith("_rx") and not H.rx_ok(pat):
+            why = ("longer than %d characters" % H._RX_MAX) if len(str(pat)) > H._RX_MAX \
+                else "does not compile, or backtracks catastrophically"
+            out.append("             %s: %s" % (key, why))
+    given = matcher.get("given")
+    if given is not None and (H.given_norm(given) is None or H.given_unsupported(given)):
+        known = ", ".join("%s.%s" % (b, k) for b, ks in H._GIVEN.items() for k in ks)
+        out.append("             given: unknown key or wrong value kind (known: %s)" % known)
+    unknown = H.ordering_unsupported(rule.get("ordering"))
+    if unknown:
+        out.append("             %s: not a key this hook knows (known: %s)"
+                   % (unknown, ", ".join(sorted(H._ORDERING_KEYS))))
+    if not any(l.startswith("             ") for l in out):
+        out.append("             no engine block, or two of them, or a missing id")
+
+
+def verify(rule: dict, fires: list, silent: list,
+           fixture: dict | None = None) -> tuple[bool, bool, list[str]]:
+    """(every case behaved, the rule is fire-testable at all, the report lines).
+
+    A `session_context` rule has no matcher, so it is not fire-testable and
+    must not be held to the "prove it fires" requirement.
+    """
+    out: list[str] = []
+
+    # 1. The load gate. A rule that does not survive this never runs at all,
+    #    and the hook says nothing when it drops one.
+    #
+    #    A key the hook does not know is refused HERE even though the hook now
+    #    degrades it to advice rather than dropping it. The two answer
+    #    different questions: to a hook reading a book it did not write, an
+    #    unknown key is a rule from a newer plugin and running it as advice is
+    #    the honest outcome; to an author checking a rule they are about to
+    #    file, it is a typo, and filing a rule that can never gate on the
+    #    machine that just linted it is not an outcome anyone wants.
+    row = _hook_row(rule)
+    hook_rule = H.to_hook_rule(row)
+    unknown = H.given_unsupported((row.get("matcher") or {}).get("given")) \
+        or H.ordering_unsupported(row.get("ordering"))
+    if not unknown and H.matcher_unsupported(row.get("matcher")):
+        # A matcher predicate the hook has no code for. The hook degrades the
+        # rule to advice and ignores the predicate; to the author that is a
+        # rule firing outside the scope they wrote, and an ADVISORY one would
+        # otherwise verify clean and be filed that way.
+        unknown = "matcher." + H.matcher_unsupported(row.get("matcher"))
+    # ANY degradation costs a gate its teeth: `to_hook_rule` forces
+    # `mode: advise` on a rule this hook cannot honour in full, so a gate
+    # carrying one cannot block on the runtime being tested. The author has to
+    # hear that HERE, or create-rule files a "verified" gate that blocks
+    # nothing, ever.
+    #
+    # A malformed floor and a floor simply ABOVE this hook degrade
+    # identically, and checking only the malformed one was a distinction with
+    # no difference to the author. `_degraded` is the fact itself rather than
+    # one of its causes, so an unknown key or arming event lands here too.
+    degraded = (hook_rule or {}).get("_degraded")
+    if degraded and str(rule.get("mode", "advise")) == "gate":
+        out.append("LOAD   FAIL  %s — so this GATE can only advise on this "
+                   "runtime, and would block nothing" % degraded)
+        _load_failure(rule, out)
+        return False, False, out
+    if degraded:
+        # Only an ADVISORY rule reaches here (a degraded gate failed above),
+        # and an authored `advise` stays advise once the floor is met — the
+        # upgrade restores the condition, not a gate the author never wrote.
+        out.append("NOTE         %s — it still advises; once the plugin is new "
+                   "enough the whole rule is evaluated" % degraded)
+    if hook_rule is None or unknown:
+        out.append("LOAD   FAIL  the hook would drop this rule at load time" if hook_rule is None
+                   else "LOAD   FAIL  this hook does not understand `%s`" % unknown)
+        _load_failure(rule, out)
+        return False, False, out
+    out.append("LOAD   ok    the hook loads it (patterns compile, within bounds)")
+
+    if hook_rule.get("on") == "session":
+        out.append("NOTE         a session_context rule has no matcher — nothing to fire-test")
+        return True, False, out
+
+    ok = True
+    for raw in fires:
+        case, fx = _case(raw, fixture)
+        try:
+            hit = _fires(hook_rule, case, fx)
+        except ValueError as exc:
+            out.append("FIRES  FAIL  %s" % exc)
+            ok = False
+            continue
+        ok &= hit
+        out.append("FIRES  %-5s %s" % ("ok" if hit else "FAIL", case[:88]))
+    for raw in silent:
+        case, fx = _case(raw, fixture)
+        try:
+            hit = _fires(hook_rule, case, fx)
+        except ValueError as exc:
+            out.append("SILENT FAIL  %s" % exc)
+            ok = False
+            continue
+        ok &= not hit
+        out.append("SILENT %-5s %s" % ("FAIL" if hit else "ok", case[:88]))
+    return ok, True, out
+
+
+def _literal_of(rx: str) -> str:
+    """A plausible command fragment the pattern would match.
+
+    Only for generating the self-mention cases, so it does not need to be a
+    regex inverse — it needs to be something a person would actually type.
+    Whitespace classes become a space, anchors and word boundaries drop out,
+    escapes lose their backslash, and anything still regex-shaped (a class, a
+    group, a quantifier) means we cannot guess honestly, so we give up rather
+    than emit a nonsense literal that passes vacuously.
+    """
+    out, i = [], 0
+    while i < len(rx):
+        c = rx[i]
+        if c == "\\" and i + 1 < len(rx):
+            nxt = rx[i + 1]
+            if nxt == "s":
+                out.append(" ")
+            elif nxt in "bAZzGB<>":
+                pass                      # a zero-width assertion types as nothing
+            elif nxt.isalnum():
+                return ""                 # \d, \w, \S … — a class, not a literal
+            else:
+                out.append(nxt)           # an escaped literal: \. \- \/ …
+            i += 2
+            if i < len(rx) and rx[i] in "+*?":
+                i += 1                    # the quantifier on what we just took
+            continue
+        if c in "[](){}|.*+?^$":
+            return ""                     # real regex structure — do not guess
+        out.append(c)
+        i += 1
+    return " ".join("".join(out).split())
+
+
+def _self_mention(rule: dict) -> list[str]:
+    """The cases an author reliably forgets. A pattern almost never wants to
+    match a command that only quotes it — searching for a rule's own trigger is
+    how you investigate it, and firing there trains people to ignore the rule."""
+    matcher = rule.get("matcher") or {}
+    rx = matcher.get("command_rx")
+    if not rx or matcher.get("event") not in (None, "bash"):
+        return []
+    literal = _literal_of(rx)
+    if len(literal) < 4:
+        return []                         # nothing honest to build a case from
+    return ['grep -rn "%s" .' % literal,
+            "python3 -c 'print(\"%s\")'" % literal]
+
+
+def _bool(v: str) -> bool:
+    if v.lower() in ("1", "true", "yes"):
+        return True
+    if v.lower() in ("0", "false", "no"):
+        return False
+    raise argparse.ArgumentTypeError("expected true or false, got %r" % v)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--rule", help="the candidate as the JSON you would send to create_rule")
+    src.add_argument("--rule-file", help="that JSON, in a file")
+    ap.add_argument("--fires", action="append", default=[],
+                    metavar="CASE", help="must fire (repeatable); 'path::content' for edit rules; "
+                                         "'step >> … >> gate:cmd' for ordering rules")
+    ap.add_argument("--silent", action="append", default=[],
+                    metavar="CASE", help="must NOT fire (repeatable)")
+    ap.add_argument("--cases", help='JSON file: {"fires": [...], "silent": [...]}; a case may be '
+                                    'an object {"case": …, "branch": …, "diff_paths": […], …}')
+    ap.add_argument("--no-self-mention", action="store_true",
+                    help="skip the generated grep / python -c cases")
+    fx = ap.add_argument_group("given facts (apply to every case; a --cases object overrides)")
+    fx.add_argument("--branch", help="the checked-out branch name")
+    fx.add_argument("--diff-path", action="append", default=None, metavar="PATH",
+                    help="a path the branch has changed (repeatable; none given = no changes known)")
+    fx.add_argument("--diff-lines", type=int, help="added+deleted lines against the base")
+    fx.add_argument("--dirty", type=_bool, help="whether the working tree has changes")
+    fx.add_argument("--user-said", action="append", default=None, metavar="TEXT",
+                    help="a user turn from this session (repeatable; none given = no transcript)")
+    fx.add_argument("--file-lines", type=int, metavar="N",
+                    help="read rules: the length of every file a case names (no real file needed)")
+    fx.add_argument("--agent-main", type=_bool, metavar="BOOL",
+                    help="read rules: false runs the case inside a subagent (default true)")
+    fx.add_argument("--cwd", help="read rules: where a 'bash:' case's relative paths resolve")
+    args = ap.parse_args()
+
+    raw = args.rule
+    if args.rule_file:
+        with open(args.rule_file, encoding="utf-8") as f:
+            raw = f.read()
+    try:
+        rule = json.loads(raw)
+    except ValueError as exc:
+        print("the rule is not valid JSON: %s" % exc, file=sys.stderr)
+        return 2
+
+    fixture: dict = {}
+    if args.branch is not None:
+        fixture["branch"] = args.branch
+    if args.diff_path is not None:
+        fixture["diff_paths"] = args.diff_path
+    if args.diff_lines is not None:
+        fixture["diff_lines"] = args.diff_lines
+    if args.dirty is not None:
+        fixture["dirty"] = args.dirty
+    if args.user_said is not None:
+        fixture["user_said"] = args.user_said
+    if args.file_lines is not None:
+        fixture["file_lines"] = args.file_lines
+    if args.agent_main is not None:
+        fixture["agent_main"] = args.agent_main
+    if args.cwd is not None:
+        fixture["cwd"] = args.cwd
+
+    fires, silent = list(args.fires), list(args.silent)
+    if args.cases:
+        with open(args.cases, encoding="utf-8") as f:
+            extra = json.load(f)
+        fires += list(extra.get("fires") or [])
+        silent += list(extra.get("silent") or [])
+    generated = [] if args.no_self_mention else _self_mention(rule)
+    silent += generated
+
+    ok, testable, lines = verify(rule, fires, silent, fixture)
+    print("\n".join(lines))
+
+    if generated:
+        print("\n(the last %d SILENT cases were generated: a rule should not fire on a\n"
+              " command that merely mentions its own trigger)" % len(generated))
+    # Independent of the cases above: an author who supplied none has not shown
+    # the rule can trigger at all, and needs telling even when something else
+    # already failed.
+    if testable and not fires:
+        print("\nNo --fires case given, so nothing proved this rule CAN fire. Add one.")
+        ok = False
+    if ok:
+        print("\nAll cases behaved. Worth adding one more --silent: the form of the\n"
+              "problem AFTER someone fixes it. A rule that still fires once you have\n"
+              "complied is one people learn to ignore.")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
