@@ -2,6 +2,7 @@
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 from unittest.mock import patch
@@ -389,11 +390,13 @@ def test_wide_history_rechecks_paths_without_rebuilding_session_rows():
     from readers import codex
     with tempfile.TemporaryDirectory() as td:
         home = Path(td)
-        wide_fixture(home, 1100)
+        _, _, others = wide_fixture(home, 1100)
         full, canonical = cli.run(home, 'codex', '--exact-detail', '--session', SID)
         assert full.returncode == 0, full.stderr
-        calls, spent = [], []
+        calls, spent, budgets = [], [], []
         original_list, original_observe = codex.list_sessions, readers_cli.DetailBudget.observe
+        original_get = context.Rows.__getitem__
+        fired = False
         def listed(*args, **kwargs):
             rows = original_list(*args, **kwargs)
             calls.append(len(spent))
@@ -401,15 +404,26 @@ def test_wide_history_rechecks_paths_without_rebuilding_session_rows():
         def observed(self):
             original_observe(self)
             spent.append(self.entries)
-        with patch.object(codex, 'list_sessions', listed), patch.object(readers_cli.DetailBudget, 'observe', observed):
+            budgets.append(self)
+        def get(self, index):
+            nonlocal fired
+            value = original_get(self, index)
+            if not fired:
+                fired = True
+                with others[0].open('a') as handle:
+                    handle.write(' \n')
+            return value
+        with patch.object(codex, 'list_sessions', listed), patch.object(readers_cli.DetailBudget, 'observe', observed), \
+                patch.object(context.Rows, '__getitem__', get):
             status, page, codes = here(home)
-        assert status == 0 and not codes
+        assert fired and status == 0 and not codes
         assert page[1:] == canonical[1:]
         assert len(calls) == 1
         # The unchanged tree would charge that same walk plus rows twice.
         assert calls[0] * 2 > readers_cli.DETAIL_MAX_DISCOVERY_ENTRIES
         assert calls[0] < max(spent) <= readers_cli.DETAIL_MAX_DISCOVERY_ENTRIES
         assert len(spent) == max(spent)  # The cumulative budget was never reset.
+        assert budgets[0].probes == 1102 < readers_cli.DETAIL_MAX_PROBES
 
 
 def test_wider_history_still_refuses_at_the_unchanged_cumulative_entry_cap():
@@ -421,8 +435,8 @@ def test_wider_history_still_refuses_at_the_unchanged_cumulative_entry_cap():
         assert status == 2 and not page and 'detail_limit_discovery_entries' in codes
 
 
-def test_final_path_snapshot_refuses_added_claimants_revisions_and_root_retargets():
-    for mutation in ('claimant', 'unrelated-revision', 'root-retarget'):
+def test_final_path_snapshot_refuses_added_claimants_and_root_retargets():
+    for mutation in ('claimant', 'root-retarget'):
         with tempfile.TemporaryDirectory() as td:
             home = Path(td)
             target, rows, others = wide_fixture(home, 2)
@@ -441,9 +455,6 @@ def test_final_path_snapshot_refuses_added_claimants_revisions_and_root_retarget
                     fired = True
                     if mutation == 'claimant':
                         cli.write_jsonl(target.parent / 'copy' / target.name, rows)
-                    elif mutation == 'unrelated-revision':
-                        with others[0].open('a') as handle:
-                            handle.write(' \n')
                     else:
                         configured.unlink()
                         configured.symlink_to(home / 'replacement-sessions', target_is_directory=True)
@@ -451,6 +462,353 @@ def test_final_path_snapshot_refuses_added_claimants_revisions_and_root_retarget
             with patch.object(context.Rows, '__getitem__', changed):
                 status, page, codes = here(home)
             assert fired and status == 2 and not page, (mutation, codes)
+
+
+def test_foreign_appends_preserve_selected_records_at_each_probe_phase_and_root_alias():
+    for alias in (False, True):
+        for phase in ('before-open', 'before-probe', 'after-probe', 'selected-body'):
+            with tempfile.TemporaryDirectory() as td:
+                home = Path(td)
+                target, _, others = wide_fixture(home, 1)
+                if alias:
+                    configured = target.parent
+                    held = home / 'held-sessions'
+                    configured.rename(held)
+                    configured.symlink_to(held, target_is_directory=True)
+                foreign = others[0].resolve()
+                original_bytes = target.read_bytes()
+                full, canonical = cli.run(home, 'codex', '--exact-detail', '--session', SID)
+                assert full.returncode == 0, full.stderr
+                old_probe, old_get = readers_cli.probe_header, context.Rows.__getitem__
+                old_revision = readers_cli.source_revision
+                fired, proofs = False, []
+                foreign_revisions = 0
+                def append():
+                    nonlocal fired
+                    if not fired:
+                        fired = True
+                        with foreign.open('a') as handle:
+                            handle.write(json.dumps(history.message(1, 'assistant', 'foreign tail')) + '\n')
+                def revision(path, *args, **kwargs):
+                    nonlocal foreign_revisions
+                    value = old_revision(path, *args, **kwargs)
+                    if Path(path).resolve() == foreign:
+                        foreign_revisions += 1
+                        if foreign_revisions == 2 and phase == 'before-open':
+                            append()
+                    return value
+                def probe(reader, handle, observed, budget, proof=None):
+                    is_foreign = observed.st_ino == foreign.stat().st_ino
+                    if is_foreign and phase == 'before-probe':
+                        append()
+                    value = old_probe(reader, handle, observed, budget, proof)
+                    if is_foreign:
+                        proofs.append((dict(proof), budget, dict(budget.probed)))
+                        if phase == 'after-probe':
+                            append()
+                    return value
+                def get(self, index):
+                    value = old_get(self, index)
+                    if phase == 'selected-body':
+                        append()
+                    return value
+                with patch.object(readers_cli, 'probe_header', probe), patch.object(context.Rows, '__getitem__', get), \
+                        patch.object(readers_cli, 'source_revision', revision):
+                    status, page, codes = here(home)
+                assert fired and status == 0 and not codes, (alias, phase, codes)
+                assert page[1:] == canonical[1:] and target.read_bytes() == original_bytes
+                proof, budget, stamps = proofs[0]
+                assert proof['length'] > 0 and len(proof['digest']) == 32
+                assert budget.probes == 3  # Two initial headers, one changed foreign prefix.
+                assert all(budget.probed[key] == stamp for key, stamp in stamps.items())
+                if phase != 'before-open':
+                    assert budget.probed[proof['identity']] != readers_cli.file_stamp(foreign.stat())
+
+
+def test_changed_foreign_identity_header_and_prefix_fail_before_output():
+    for mutation in ('header', 'prefix-body', 'replace', 'truncate', 'remove', 'unreadable', 'alias'):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            _, _, others = wide_fixture(home, 1)
+            foreign = others[0]
+            with foreign.open('a') as handle:
+                handle.write(json.dumps(history.message(1, 'assistant', 'x' * 20000)) + '\n')
+            old_get = context.Rows.__getitem__
+            fired = False
+            def get(self, index):
+                nonlocal fired
+                value = old_get(self, index)
+                if not fired:
+                    fired = True
+                    if mutation in ('header', 'prefix-body'):
+                        stamp = foreign.stat()
+                        data = foreign.read_bytes()
+                        data = (data.replace(others[0].stem[-36:].encode(), SID.encode(), 1)
+                                if mutation == 'header' else data.replace(b'xxxxxxxx', b'XXXXXXXX', 1))
+                        foreign.write_bytes(data)
+                        os.utime(foreign, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+                    elif mutation == 'replace':
+                        saved = foreign.rename(foreign.with_suffix('.saved'))
+                        foreign.write_bytes(saved.read_bytes())
+                    elif mutation == 'truncate':
+                        foreign.write_bytes(foreign.read_bytes().splitlines(keepends=True)[0])
+                    elif mutation == 'remove':
+                        foreign.unlink()
+                    elif mutation == 'unreadable':
+                        foreign.unlink()
+                        foreign.mkdir()
+                    else:
+                        saved = foreign.rename(foreign.with_suffix('.saved'))
+                        foreign.symlink_to(saved)
+                return value
+            with patch.object(context.Rows, '__getitem__', get):
+                status, page, codes = here(home)
+            assert fired and status == 2 and not page, (mutation, codes)
+
+
+def test_selected_change_between_original_snapshot_and_probe_is_refused():
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        target, rows = fixture(home, 2)
+        original = readers_cli.source_revision
+        fired = False
+        def revision(path, *args, **kwargs):
+            nonlocal fired
+            value = original(path, *args, **kwargs)
+            if Path(path).resolve() == target.resolve() and not fired:
+                fired = True
+                with target.open('a') as handle:
+                    handle.write(json.dumps(history.message(len(rows), 'user', 'selected append')) + '\n')
+            return value
+        with patch.object(readers_cli, 'source_revision', revision):
+            status, page, codes = here(home)
+        assert fired and status == 2 and not page and 'source_changed' in codes
+
+
+def test_foreign_shrink_uses_the_larger_initial_or_probe_observation():
+    for larger in ('initial', 'probe'):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            _, _, others = wide_fixture(home, 1)
+            foreign = others[0]
+            with foreign.open('a') as handle:
+                handle.write(json.dumps(history.message(1, 'assistant', 'x' * 20000)) + '\n')
+            initial = foreign.read_bytes()
+            old_revision, old_get = readers_cli.source_revision, context.Rows.__getitem__
+            revisions, fired = 0, False
+            def revision(path, *args, **kwargs):
+                nonlocal revisions
+                value = old_revision(path, *args, **kwargs)
+                if Path(path).resolve() == foreign.resolve():
+                    revisions += 1
+                    if revisions == 2:
+                        if larger == 'initial':
+                            foreign.write_bytes(initial.splitlines(keepends=True)[0])
+                        else:
+                            with foreign.open('a') as handle:
+                                handle.write(' ' * 10000 + '\n')
+                return value
+            def get(self, index):
+                nonlocal fired
+                value = old_get(self, index)
+                if not fired:
+                    fired = True
+                    if larger == 'probe':
+                        foreign.write_bytes(initial)  # Prefix holds, but probe-observed tail disappeared.
+                return value
+            with patch.object(readers_cli, 'source_revision', revision), patch.object(context.Rows, '__getitem__', get):
+                status, page, codes = here(home)
+            assert revisions >= 2 and status == 2 and not page and 'source_changed' in codes, (larger, codes)
+
+
+def test_observed_foreign_shrink_cannot_be_hidden_by_regrowth():
+    for phase in ('preparation', 'probe'):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            _, _, others = wide_fixture(home, 1)
+            foreign = others[0].resolve()
+            with foreign.open('a') as handle:
+                handle.write(json.dumps(history.message(1, 'assistant', 'x' * 20000)) + '\n')
+            initial = foreign.read_bytes()
+            shorter = initial.splitlines(keepends=True)[0]
+            old_revision, old_source = readers_cli.source_revision, readers_cli.regular_source
+            revisions, opens, fired = 0, 0, False
+            def revision(path, *args, **kwargs):
+                nonlocal revisions, fired
+                value = old_revision(path, *args, **kwargs)
+                if Path(path).resolve() == foreign and phase == 'preparation':
+                    revisions += 1
+                    if revisions == 1:
+                        foreign.write_bytes(shorter)
+                    elif revisions == 2:
+                        fired = True
+                        foreign.write_bytes(initial)
+                return value
+            @contextlib.contextmanager
+            def source(path, *args, **kwargs):
+                nonlocal opens, fired
+                is_foreign = Path(path).resolve() == foreign
+                if is_foreign:
+                    opens += 1
+                if is_foreign and opens == 3 and phase == 'probe':
+                    foreign.write_bytes(shorter)
+                with old_source(path, *args, **kwargs) as observed:
+                    if is_foreign and opens == 3 and phase == 'probe':
+                        fired = True
+                        foreign.write_bytes(initial)
+                    yield observed
+            with patch.object(readers_cli, 'source_revision', revision), \
+                    patch.object(readers_cli, 'regular_source', source):
+                status, page, codes = here(home)
+            assert fired and foreign.read_bytes() == initial
+            assert status == 2 and not page and 'source_changed' in codes, (phase, codes)
+
+
+def test_foreign_growth_during_prefix_recheck_keeps_selected_canonical_parity():
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        _, _, others = wide_fixture(home, 1)
+        foreign = others[0]
+        full, canonical = cli.run(home, 'codex', '--exact-detail', '--session', SID)
+        assert full.returncode == 0, full.stderr
+        old_get, old_read = context.Rows.__getitem__, readers_cli.ProbeReader.readinto
+        fired, rechecked = False, False
+        def append():
+            with foreign.open('a') as handle:
+                handle.write(' \n')
+        def get(self, index):
+            nonlocal fired
+            value = old_get(self, index)
+            if not fired:
+                fired = True
+                append()
+            return value
+        def read(self, buffer):
+            nonlocal rechecked
+            value = old_read(self, buffer)
+            if self.budget.probes == 3 and not rechecked:
+                rechecked = True
+                append()
+            return value
+        with patch.object(context.Rows, '__getitem__', get), patch.object(readers_cli.ProbeReader, 'readinto', read):
+            status, page, codes = here(home)
+        assert fired and rechecked and status == 0 and not codes
+        assert page[1:] == canonical[1:]
+
+
+def test_context_preserves_every_saved_identity_and_nondecreasing_size_observation():
+    for mutation in ('prepared-growth-then-shrink', 'saved-final-shrink',
+                     'saved-final-replacement', 'post-prefix-growth-then-shrink'):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            _, _, others = wide_fixture(home, 1)
+            foreign = others[0].resolve()
+            header = foreign.read_bytes()
+            middle, large = header + b' ' * 10000 + b'\n', header + b' ' * 20000 + b'\n'
+            if mutation != 'prepared-growth-then-shrink':
+                foreign.write_bytes(large)
+            saved = foreign.with_suffix('.saved')
+            old_revision, old_source = readers_cli.source_revision, readers_cli.regular_source
+            old_get, old_read = context.Rows.__getitem__, readers_cli.ProbeReader.readinto
+            revisions, fired, restored, prefix_read = 0, False, False, False
+            def revision(path, *args, **kwargs):
+                nonlocal revisions, fired, restored
+                value = old_revision(path, *args, **kwargs)
+                if Path(path).resolve() == foreign:
+                    revisions += 1
+                    if mutation == 'prepared-growth-then-shrink':
+                        if revisions == 1:
+                            foreign.write_bytes(large)
+                        elif revisions == 2:
+                            fired = True
+                            foreign.write_bytes(middle)
+                    elif revisions == 3 and mutation.startswith('saved-final'):
+                        restored = True
+                        if mutation == 'saved-final-shrink':
+                            foreign.write_bytes(large)
+                        else:
+                            foreign.unlink()
+                            saved.rename(foreign)
+                return value
+            def get(self, index):
+                nonlocal fired
+                value = old_get(self, index)
+                if not fired and mutation != 'prepared-growth-then-shrink':
+                    fired = True
+                    if mutation == 'saved-final-shrink':
+                        foreign.write_bytes(middle)
+                    elif mutation == 'saved-final-replacement':
+                        foreign.rename(saved)
+                        foreign.write_bytes(large)
+                    else:
+                        with foreign.open('ab') as handle:
+                            handle.write(b' \n')
+                return value
+            def read(self, buffer):
+                nonlocal prefix_read
+                value = old_read(self, buffer)
+                if mutation == 'post-prefix-growth-then-shrink' and self.budget.probes == 3 and not prefix_read:
+                    prefix_read = True
+                    with foreign.open('ab') as handle:
+                        handle.write(b' ' * 20000 + b'\n')
+                return value
+            @contextlib.contextmanager
+            def source(path, *args, **kwargs):
+                nonlocal restored
+                if Path(path).resolve() == foreign and prefix_read and not restored:
+                    restored = True
+                    foreign.write_bytes(large + b' ' * 10000 + b'\n')
+                with old_source(path, *args, **kwargs) as value:
+                    yield value
+            with patch.object(readers_cli, 'source_revision', revision), \
+                    patch.object(readers_cli, 'regular_source', source), \
+                    patch.object(context.Rows, '__getitem__', get), \
+                    patch.object(readers_cli.ProbeReader, 'readinto', read):
+                status, page, codes = here(home)
+            assert fired and (mutation == 'prepared-growth-then-shrink' or restored), mutation
+            assert status == 2 and not page and 'source_changed' in codes, (mutation, status, codes)
+
+
+def test_foreign_prefix_rechecks_spend_cumulative_probe_byte_and_deadline_limits():
+    for limit, expected in (('probes', 'detail_limit_probes'), ('bytes', 'detail_limit_probe_bytes'),
+                            ('deadline', 'detail_deadline'), ('deadline-during-read', 'detail_deadline')):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            target, _, others = wide_fixture(home, 1)
+            foreign = others[0]
+            initial_bytes = target.stat().st_size + foreign.stat().st_size
+            old_get, old_check = context.Rows.__getitem__, readers_cli.context_prefix_held
+            old_read = readers_cli.ProbeReader.readinto
+            fired, checked, clock = False, False, [0.0]
+            def get(self, index):
+                nonlocal fired
+                value = old_get(self, index)
+                if not fired:
+                    fired = True
+                    with foreign.open('a') as handle:
+                        handle.write(' \n')
+                return value
+            def check(path, proof, observation, budget):
+                nonlocal checked
+                checked = True
+                assert budget.probes == 2 and budget.probe_bytes == initial_bytes
+                if limit == 'deadline':
+                    clock[0] = 31.0
+                return old_check(path, proof, observation, budget)
+            def read(self, buffer):
+                value = old_read(self, buffer)
+                if limit == 'deadline-during-read' and self.budget.probes == 3:
+                    clock[0] = 31.0
+                return value
+            with patch.object(context.Rows, '__getitem__', get), \
+                    patch.object(readers_cli, 'context_prefix_held', check), \
+                    patch.object(readers_cli, 'DETAIL_MAX_PROBES', 2 if limit == 'probes' else 2048), \
+                    patch.object(readers_cli, 'DETAIL_MAX_PROBE_TOTAL_BYTES',
+                                 initial_bytes + foreign.stat().st_size - 1 if limit == 'bytes' else 64*1024*1024), \
+                    patch.object(readers_cli.ProbeReader, 'readinto', read), \
+                    patch.object(readers_cli, 'detail_now', lambda: clock[0]):
+                status, page, codes = here(home)
+            assert fired and checked and status == 2 and not page and expected in codes, (limit, codes)
 
 
 def test_final_path_discovery_errors_refuse_the_entire_page():

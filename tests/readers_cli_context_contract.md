@@ -55,9 +55,27 @@ charges are not refunded while reconciliation may still reference removed rows.
 Selected record growth also preflights the existing 4 MiB body bound. This is an
 encoded ownership bound, not an exact Python heap measurement.
 
-The final complete-source check walks rollout paths directly and compares the
-same path/revision snapshot as initial discovery. It charges the cumulative
-entry budget for every walked entry without constructing unused session-list
-rows again, and checks the existing deadline between revision reads. Initial
-session discovery and all ceilings are unchanged. Wide histories beyond the
-same cumulative entry limit still refuse the entire page.
+The final complete-source check walks rollout paths directly and preserves the
+initial path set, configured root and every original file identity. Selected
+files must retain their full original and prepared revisions, descriptor and
+body checks. For unrelated files, each initial bounded header probe records a
+digest and length of the exact prefix it consumed, tied to its parsed native
+session ID. Only unrelated files whose full revision changed are probed again:
+the same anchored regular file must not shrink below either its initial or
+probe-observed length, and that entire prefix must still match. Unused foreign
+bodies may grow; they are not claimed immutable. A shrink directly observed
+during preparation or the initial probe refuses even if the file later regrows.
+Context checks retain the initial device/inode and a nondecreasing size floor
+through the original snapshot, prepared revision, header open, saved final
+revision, prefix open, post-prefix descriptor stat, and name reopen. Each saved
+fact is checked before a fresher observation can supersede it: restoring the
+original file or regrowing it cannot erase an observed replacement or decrease.
+These are checks of the context revision/open observations, not an atomic
+filesystem snapshot; shared helpers' intermediate identity-only checks are
+unchanged. Replacement, header/prefix change, missing/new sources and incomplete
+discovery still refuse all output.
+The extra probes and bytes spend the same cumulative probe/deadline limits;
+selected acquisition stamps are never replaced. The walk charges every entry
+without constructing unused session-list rows again. Initial session discovery
+and all ceilings are unchanged. Wide histories beyond the same cumulative
+entry limit still refuse the entire page.

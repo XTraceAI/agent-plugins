@@ -6,6 +6,7 @@ import argparse
 from collections import Counter
 from contextlib import closing, contextmanager
 import datetime
+import hashlib
 import io
 import itertools
 import json
@@ -665,12 +666,16 @@ class DetailBudget:
         if not count % DETAIL_DEADLINE_STRIDE:
             self.check()
 
-    def begin_probe(self, observed) -> None:
-        """Count one identity probe and remember what the file was when probed."""
+    def count_probe(self) -> None:
+        """Charge a probe without changing any earlier acquisition stamp."""
         self.check()
         self.probes += 1
         if self.probes > self.max_probes:
             raise DetailLimit("detail_limit_probes")
+
+    def begin_probe(self, observed) -> None:
+        """Count one identity probe and remember what the file was when probed."""
+        self.count_probe()
         key, stamp = identity(observed), file_stamp(observed)
         if self.probed.setdefault(key, stamp) != stamp:
             raise SourceChanged("a source changed between two probes of it")
@@ -779,12 +784,13 @@ class ProbeReader(io.RawIOBase):
     buffer rather than what was read. So it refuses a buffered handle.
     """
 
-    def __init__(self, handle, observed, budget: DetailBudget):
+    def __init__(self, handle, observed, budget: DetailBudget, digest=None):
         if isinstance(handle, io.BufferedIOBase):
             raise TypeError("a probe must read the descriptor, not a buffer over it")
         super().__init__()
         self.handle, self.size, self.budget = handle, observed.st_size, budget
         self.consumed = 0
+        self.digest = digest
 
     def readable(self) -> bool:
         return True
@@ -796,17 +802,73 @@ class ProbeReader(io.RawIOBase):
         self.budget.check()
         view = memoryview(buffer)[:min(len(buffer), allowed, self.size - self.consumed)]
         read = self.handle.readinto(view)
+        if self.digest is not None:
+            self.digest.update(view[:read])
         self.consumed += read
         self.budget.probe_bytes += read
         return read
 
 
-def probe_header(reader, handle, observed, budget):
+def probe_header(reader, handle, observed, budget, proof=None):
     """The reader's header probe, under the probe budget when there is one."""
     if budget is None:
         return reader._session_header(handle)
     budget.begin_probe(observed)
-    return reader._session_header(io.BufferedReader(ProbeReader(handle, observed, budget)))
+    digest = hashlib.sha256() if proof is not None else None
+    raw = ProbeReader(handle, observed, budget, digest)
+    header = reader._session_header(io.BufferedReader(raw))
+    if proof is not None:
+        proof.update(size=observed.st_size, length=raw.consumed, digest=digest.digest(),
+                     identity=identity(observed))
+    return header
+
+
+class ContextObservation:
+    """Keep every context revision/open observation bound to its first file.
+
+    Growth raises the size floor. A later healthy observation cannot erase a
+    different identity or a smaller size that this read already observed.
+    """
+
+    def __init__(self, entry):
+        self.identity, self.size = entry_identity(entry), entry[1]
+
+    def observe(self, key, size):
+        if key != self.identity or size < self.size:
+            raise SourceChanged("context source identity changed or size decreased")
+        self.size = size
+
+    def revision(self, revision):
+        self.observe(entry_identity(revision[0]), revision[0][1])
+
+    def opened(self, observed):
+        self.observe(identity(observed), observed.st_size)
+
+
+def context_prefix_held(path, proof, observation, budget):
+    """Recheck a changed foreign file's original identity bytes, not its body.
+
+    The initial header probe established its native SID. A later append does
+    not invalidate that ownership if the same anchored file still holds every
+    byte the probe actually consumed. This proof spends the original probe
+    budget without replacing the stamp used to acquire selected bodies.
+    """
+    with regular_source(path, proof["identity"], buffered=False) as (handle, observed):
+        observation.opened(observed)
+        budget.count_probe()
+        digest = hashlib.sha256()
+        raw = ProbeReader(handle, observed, budget, digest)
+        buffer = bytearray(io.DEFAULT_BUFFER_SIZE)
+        while raw.consumed < proof["length"]:
+            remaining = proof["length"] - raw.consumed
+            if not raw.readinto(memoryview(buffer)[:min(len(buffer), remaining)]):
+                raise SourceChanged("context identity prefix disappeared")
+        observation.opened(os.fstat(handle.fileno()))
+        if digest.digest() != proof["digest"]:
+            raise SourceChanged("context identity prefix changed")
+    with regular_source(path, proof["identity"]) as (_, after):
+        observation.opened(after)
+    budget.check()
 
 
 def reserve_selected(budget: DetailBudget, members) -> None:
@@ -1493,10 +1555,14 @@ def main(argv=None) -> int:
         return 2
 
     context_snapshot = None
+    context_proofs = {}
+    context_observations = {}
     if context_request is not None:
         try:
-            context_snapshot = sorted((str(Path(row["path"])), source_revision(Path(row["path"]), "codex"))
-                                      for row in sessions)
+            context_snapshot = {str(Path(row["path"])): source_revision(Path(row["path"]), "codex")
+                                for row in sessions}
+            context_observations = {name: ContextObservation(revision[0])
+                                    for name, revision in context_snapshot.items()}
         except (OSError, ValueError, TypeError):
             diagnostic("discovery_incomplete")
             return 2
@@ -1539,6 +1605,7 @@ def main(argv=None) -> int:
     origin_disputed = set()
     for session in sessions:
         path = Path(session["path"])
+        context_name = str(path)
         probed = False
         try:
             if budget is not None:
@@ -1552,6 +1619,8 @@ def main(argv=None) -> int:
                 path, anchor = path.resolve(strict=True), None
             else:
                 path, anchor = discovered_path(path_reader, path, anchors)
+                if context_snapshot is not None and anchor != entry_identity(context_snapshot[context_name][0]):
+                    raise SourceChanged("context source identity changed before preparation")
                 if args.source_witness:
                     names = codex_witness.rollout_name(path.name)
                     if names is None:
@@ -1580,6 +1649,8 @@ def main(argv=None) -> int:
                     if anchor is None:
                         raise ValueError("saved Cursor source was excluded by discovery")
             revision = source_revision(path, args.host, expect=anchor)
+            if context_snapshot is not None:
+                context_observations[context_name].revision(revision)
             if latest_basis is not None and not basis_unchanged(latest_basis):
                 # The clock this selection was ranked on changed before the
                 # baseline: a fresh invocation might rank another session.
@@ -1606,7 +1677,11 @@ def main(argv=None) -> int:
                 # other values; malformed duplicates must not appear unique.
                 with regular_source(path, revision_identity(revision, path),
                                     buffered=budget is None) as (handle, observed):
-                    source_header = probe_header(reader, handle, observed, budget)
+                    proof = {} if context_snapshot is not None else None
+                    if proof is not None:
+                        context_observations[context_name].opened(observed)
+                    source_header = (probe_header(reader, handle, observed, budget) if proof is None else
+                                     probe_header(reader, handle, observed, budget, proof))
                 if bulk_evidence:
                     origin_disputed |= origin_dispute(path, source_header)
                     probed = True
@@ -1620,6 +1695,12 @@ def main(argv=None) -> int:
                     if selection and args.source_witness:
                         witness_flat(path, source_header, source_header["payload"]["id"])
                 sid = native_text(source_header.get("payload", {}).get("id"), required=True)
+                if proof is not None:
+                    proof.update(path=path, sid=sid)
+                    context_proofs[context_name] = proof
+                    if sid == args.session and (revision[0][1:] != context_snapshot[context_name][0][1:]
+                            or file_stamp(observed) != (revision[0][1], revision[0][2], revision[0][5])):
+                        raise SourceChanged("selected context source changed before preparation")
                 if explicit_basis is not None and sid != args.session:
                     raise ValueError("paginated filename and native identity disagree")
                 # Every identified rollout, whichever session it names: a fork
@@ -1780,13 +1861,29 @@ def main(argv=None) -> int:
                     raise SourceChanged("context root changed") from None
                 current = reader._rollout_files(
                     on_error=lambda error: diagnostic("discovery_incomplete"), observe=budget.observe)
-                snapshot = []
+                snapshot = {}
                 for current_path in current:
                     budget.check()
-                    snapshot.append((str(current_path), source_revision(current_path, "codex")))
-                snapshot.sort()
-                if incomplete or snapshot != context_snapshot or current_revision(path) != revision:
+                    name = str(current_path)
+                    snapshot[name] = source_revision(current_path, "codex")
+                    if name in context_observations:
+                        context_observations[name].revision(snapshot[name])
+                if incomplete or snapshot.keys() != context_snapshot.keys():
                     raise SourceChanged("context sources changed")
+                for name, original in context_snapshot.items():
+                    budget.check()
+                    proof = context_proofs[name]
+                    resolved, anchor = discovered_path(reader, name, anchors)
+                    if (resolved != proof["path"] or anchor != entry_identity(original[0])
+                            or anchor != proof["identity"]):
+                        raise SourceChanged("context source identity changed")
+                    if snapshot[name] != original:
+                        if proof["sid"] == args.session:
+                            raise SourceChanged("selected context source changed")
+                        context_prefix_held(resolved, proof, context_observations[name], budget)
+                if current_revision(path) != revision:
+                    raise SourceChanged("context selected sources changed")
+                budget.check()
                 sys.stdout.write(encoded)
                 sys.stdout.flush()
                 detail_emitted = True
