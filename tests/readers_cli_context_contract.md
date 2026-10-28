@@ -42,9 +42,11 @@ all passes. A fork's parent is opened once per pass through the identity
 discovery recorded and read forward, buffered, up to its captured length: every
 byte counts toward the same scan limit and the parent's bytes toward the source
 limit. A parent line may be up to 64 MiB, because the parent can hold large tool
-outputs such as screenshots; it is held one line at a time, and the fork's own
-rows keep the 8 MiB line limit. The prefix lines each pass reads count with the
-fork's own rows toward the 200,000 row limit, as in the full read. A parent that
+outputs such as screenshots; it is held one line at a time (reading and parsing
+a line takes about three times its size), and the fork's own rows keep the 8 MiB
+line limit. The prefix lines each pass reads, up to the fork point, count with
+the fork's own rows toward the 200,000 row limit; the full read also counts the
+parent's rows after the fork point, which this read never parses. A parent that
 shrinks, grows or is replaced while it is read refuses the page. Descriptor, source name, configured root and complete discovered
 source set are checked before output. No source snapshot or transcript cache is
 written. Limits remain finite: 256 MiB source (the fork and its parent together), 2 GiB cumulative replay, 32 full

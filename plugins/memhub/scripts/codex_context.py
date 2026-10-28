@@ -31,8 +31,9 @@ CONTEXT_BEFORE = 12
 # reads, and the prefix is never held whole.
 PREFIX_BUFFER_BYTES = 1024 * 1024
 # One line of a fork's referenced prefix: the parent can hold large tool outputs
-# (screenshots); only its counters are read, one line at a time. The fork's own
-# rows keep the exact-detail line limit.
+# (screenshots); only its counters are read, one line at a time. Reading and
+# parsing a line holds about three times its size. The fork's own rows keep the
+# exact-detail line limit.
 MAX_PREFIX_LINE_BYTES = 64 * 1024 * 1024
 
 
@@ -282,8 +283,9 @@ def read(reader, path, revision, header, request, budget, api, group=None, refer
                 if api.identity(after) != api.identity(seen) or api.file_stamp(after) != api.file_stamp(seen):
                     raise api.SourceChanged("referenced history changed")
 
-        # Native rows one pass reads: the fork's own and its referenced prefix
-        # lines, as the whole read counts them. Each pass starts again.
+        # Native rows one pass reads: the fork's own and the referenced prefix
+        # lines up to the fork point (the whole read also counts the parent's
+        # later rows, which this read never parses). Each pass starts again.
         pass_rows = rows.count
 
         def count_row():
