@@ -1,14 +1,19 @@
 """Bounded pages in final canonical order, sharing Codex conversion and usage.
 
-Only one flat rollout or original paginated root is supported. A metadata pass
-finds final record IDs after the shared ledger overlay; a second pass retains
-only those bodies. Rows are replayed from a validated descriptor, never staged.
+One flat rollout or one paginated rollout is supported: an original root, or a
+fork whose history the planner resolved to a rollout of the session it was
+forked from. That other rollout is never part of the page: only its referenced
+prefix's usage counters are read, forward through one validated descriptor, so
+the fork's first usage delta is its own work. A metadata pass finds final
+record IDs after the shared ledger overlay; a second pass retains only those
+bodies. Rows are replayed from a validated descriptor, never staged.
 """
 from contextlib import contextmanager
 import hashlib
 import io
 import json
 import os
+from pathlib import Path
 
 from readers import codex_history, codex_witness
 from readers.strict_json import loads
@@ -22,6 +27,14 @@ MAX_RECORDS = 200
 MAX_RETAINED_BYTES = 4 * 1024 * 1024
 MAX_OUTPUT_BYTES = 1024 * 1024
 CONTEXT_BEFORE = 12
+# Read-ahead for a fork's referenced prefix: a 100 MB prefix is about a hundred
+# reads, and the prefix is never held whole.
+PREFIX_BUFFER_BYTES = 1024 * 1024
+# One line of a fork's referenced prefix: the parent can hold large tool outputs
+# (screenshots); only its counters are read, one line at a time. Reading and
+# parsing a line holds about three times its size. The fork's own rows keep the
+# exact-detail line limit.
+MAX_PREFIX_LINE_BYTES = 64 * 1024 * 1024
 
 
 class ContextRefusal(ValueError):
@@ -62,6 +75,54 @@ def selection(text):
         raise ContextRefusal("context_invalid_cursor") from None
 
 
+class Window(io.RawIOBase):
+    """An unbuffered descriptor read up to its observed length, every byte charged.
+
+    Reading stops at the observed length; a file that ends earlier has shrunk.
+    """
+    def __init__(self, handle, length, charge, budget, api):
+        super().__init__()
+        self.handle, self.length, self.charge, self.budget, self.api = handle, length, charge, budget, api
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        self.budget.check()
+        remaining = self.length - self.handle.tell()
+        if not remaining:
+            return 0
+        read = self.handle.readinto(memoryview(buffer)[:remaining])
+        if not read:
+            raise self.api.SourceChanged("source shrank")
+        self.charge(read)
+        return read
+
+
+class Prefix:
+    """A referenced rollout read forward line by line, for its prefix counters.
+
+    Buffered, so a long prefix is not one system call per byte. Every byte is
+    charged to the page's scan counter, each line is held to the prefix line
+    bound and counted as a native row through ``count``, and the deadline is
+    checked per line. Lines end at a newline only, as
+    ``codex_history.prefix_usage`` requires.
+    """
+    def __init__(self, handle, length, charge, count, budget, api):
+        self.count, self.budget, self.api = count, budget, api
+        self.lines = io.BufferedReader(Window(handle, length, charge, budget, api),
+                                       buffer_size=PREFIX_BUFFER_BYTES)
+
+    def readline(self):
+        self.budget.check()
+        raw = self.lines.readline(MAX_PREFIX_LINE_BYTES + 1)
+        if len(raw) > MAX_PREFIX_LINE_BYTES:
+            raise self.api.DetailLimit("detail_limit_line_bytes")
+        if raw:
+            self.count()
+        return raw
+
+
 class Rows:
     """An index of complete row byte offsets, with bounded seek/read replay."""
     def __init__(self, handle, length, budget, api):
@@ -69,22 +130,9 @@ class Rows:
         self.scanned = self.passes = 0
         self.offsets = []
         handle.seek(0)
-        owner = self
-        class View(io.RawIOBase):
-            def readable(self):
-                return True
-            def readinto(self, buffer):
-                owner.budget.check()
-                remaining = owner.length - owner.handle.tell()
-                if not remaining:
-                    return 0
-                read = owner.handle.readinto(memoryview(buffer)[:remaining])
-                if not read:
-                    raise owner.api.SourceChanged("source shrank")
-                owner.charge(read)
-                return read
         offset = count = 0
-        with open_lines(View()) as lines:
+        self.count = 0
+        with open_lines(Window(handle, length, self.charge, budget, api)) as lines:
             while offset < length:
                 budget.check()
                 try:
@@ -94,6 +142,7 @@ class Rows:
                 if not raw:
                     raise api.SourceChanged("source shrank")
                 count += 1
+                self.count = count
                 if count > budget.max_native_rows:
                     raise api.DetailLimit("detail_limit_native_rows")
                 try:
@@ -179,10 +228,19 @@ class RetainedOwnership:
         self.bodies = bodies
 
 
-def read(reader, path, revision, header, request, budget, api, group=None):
+def read(reader, path, revision, header, request, budget, api, group=None, references=()):
+    """One page of ``path``'s session; ``references`` as ``codex_history.references``."""
     sid = header["native_session_id"]
-    if group is not None and (len(group) != 1 or group[0][4] is not None):
-        raise api.DetailUnsupported("context requires one original rollout")
+    base = None
+    if group is not None:
+        if len(group) != 1:
+            raise api.DetailUnsupported("context requires one rollout")
+        base = group[0][4]
+    # A history reference is read only when discovery resolved the rollout it
+    # names; the shared read validates the rest of the chain.
+    if (base is None) != (not references) or (base is not None and references[-1][0] != base["thread_id"]):
+        raise api.DetailUnsupported("context requires a resolved history reference")
+    referenced = {str(item[1]) for item in references}
     digest = hashlib.sha256(json.dumps(["memhub.codex.context.v1", sid, str(path), revision],
                                      separators=(",", ":")).encode()).hexdigest()
     if request.get("generation") is not None and request["generation"] != digest:
@@ -192,26 +250,55 @@ def read(reader, path, revision, header, request, budget, api, group=None):
         rows = Rows(handle, observed.st_size, budget, api)
         opening = rows[0] if rows else {}
         payload = opening.get("payload", {})
-        if (payload.get("forked_from_id") is not None or payload.get("history_base") is not None or
+        if ((base is None and payload.get("forked_from_id") is not None) or
+                payload.get("history_base") != base or
                 payload.get("subagent_history_start_ordinal") not in (None, 0, 1)):
-            raise api.DetailUnsupported("context requires one original rollout without inherited context")
+            raise api.DetailUnsupported("context requires one rollout without inherited context")
         if group is None:
             names = codex_witness.rollout_name(path.name)
             if names != (sid, None) or not codex_witness.flat_header(opening, sid):
                 raise api.DetailUnsupported("context requires one flat rollout")
         else:
-            # The shared planner has already proved a single original root.
-            # The shared read validates every row ordinal and ledger as usual.
-            if opening.get("ordinal") != 0:
+            # The shared planner has already proved a single root, original or
+            # forked. The shared read validates every row ordinal and ledger.
+            if opening.get("ordinal") != (0 if base is None else base["end_ordinal_exclusive"]):
                 raise ValueError("invalid root ordinal")
 
         @contextmanager
-        def acquire(*args):
-            yield rows
+        def acquire(source, host, source_revision):
+            if str(source) == str(path):
+                yield rows
+                return
+            if str(source) not in referenced:
+                raise api.DetailUnsupported("context acquires only its own sources")
+            # A referenced rollout of another session: opened once per pass
+            # through the identity discovery anchored, charged against this
+            # page's source cap, and read forward only as far as its prefix.
+            source = Path(source)
+            with api.regular_source(source, api.revision_identity(source_revision, source),
+                                    buffered=False) as (prefix, seen):
+                budget.charge_file(source, seen)
+                yield Prefix(prefix, seen.st_size, rows.charge, count_row, budget, api)
+                after = os.fstat(prefix.fileno())
+                if api.identity(after) != api.identity(seen) or api.file_stamp(after) != api.file_stamp(seen):
+                    raise api.SourceChanged("referenced history changed")
+
+        # Native rows one pass reads: the fork's own and the referenced prefix
+        # lines up to the fork point (the whole read also counts the parent's
+        # later rows, which this read never parses). Each pass starts again.
+        pass_rows = rows.count
+
+        def count_row():
+            nonlocal pass_rows
+            pass_rows += 1
+            if pass_rows > budget.max_native_rows:
+                raise api.DetailLimit("detail_limit_native_rows")
 
         start = end = target = None
         positions = {}
         def normalize(selected):
+            nonlocal pass_rows
+            pass_rows = rows.count
             bodies = 0
             retained = []
             ownership = RetainedOwnership(api, budget, lambda uuid: uuid in selected and
@@ -246,7 +333,8 @@ def read(reader, path, revision, header, request, budget, api, group=None):
             else:
                 records, native = codex_history.read(group, acquire, title_index={},
                     record_guard=budget.hold_records, row_provider=lambda source: source,
-                    record_projection=project, retention_guard=ownership.guard)
+                    record_projection=project, retention_guard=ownership.guard,
+                    references=references)
             if native["session_id"] != sid:
                 raise api.SourceChanged("native identity changed")
             return records, native

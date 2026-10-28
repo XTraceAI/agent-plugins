@@ -33,9 +33,10 @@ With Python 3.10 or newer on a POSIX host:
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=plugins/memhub/scripts:tests python3 tests/readers_cli_context_test.py
 ```
 
-The 13 tests check canonical record parity, paginated usage reconciliation, exact
-anchors and navigation, source changes, newline framing, malformed late records,
-resource bounds and pre-retention ownership checks. All source data is synthetic;
+The 31 tests check canonical record parity, paginated usage reconciliation, exact
+anchors and navigation, forked sessions (parity, own usage, parent refusals and a
+large parent), source changes, newline framing, malformed late records, resource
+bounds and pre-retention ownership checks. All source data is synthetic;
 no model is invoked. The test runner gives each CLI process its synthetic home,
 limits stdout to 64 MiB and stderr to 1 MiB, and stops it after 35 seconds.
 The bounded reader protocol and its limits are documented in
