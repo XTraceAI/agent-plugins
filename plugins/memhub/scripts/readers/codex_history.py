@@ -207,10 +207,15 @@ def project_context(rows, records, sources, convert):
 def _acquired(source):
     """One acquired segment as a binary reader.
 
-    An acquirer hands back either a private snapshot path or the segment bytes
-    the caller already holds; both are read here the same way, and neither
-    reopens the native name the caller validated.
+    An acquirer hands back a private snapshot path, the segment bytes the
+    caller already holds, or a binary reader the caller already opened and
+    validated (anything with ``readline``), which is passed through as is and
+    read from where it stands, so it serves one prefix read.
+    None of them reopens the native name the caller validated.
     """
+    if hasattr(source, 'readline'):
+        yield source
+        return
     if isinstance(source, (bytes, bytearray, memoryview)):
         yield io.BytesIO(bytes(source))
         return
@@ -254,9 +259,10 @@ def read(group, acquire, *, title_index=None, record_guard=None, origin=None, hu
     """Normalize every physical segment once, including abandoned tails.
 
     ``acquire`` is the caller's bounded source acquisition, called as
-    ``acquire(path, 'codex', revision)``. It may yield a private snapshot path
-    or the segment's bytes; a referenced prefix is re-read from the segment
-    already acquired for it, so a history reference costs no second read.
+    ``acquire(path, 'codex', revision)``. It may yield a private snapshot path,
+    the segment's bytes, or an open binary reader; a referenced prefix is
+    re-read from the segment already acquired for it, so a history reference
+    costs no second read.
 
     ``record_guard`` bounds what the whole group may hold. Each segment's
     conversion is guarded against the total already kept, so the ceiling is a

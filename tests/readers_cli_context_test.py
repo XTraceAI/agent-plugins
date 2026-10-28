@@ -44,17 +44,45 @@ def wide_fixture(home, unrelated):
     return target, rows, other
 
 
-def run(home, request=None):
+def forked(home, pairs=0, parent_pairs=0, pad=''):
+    """A fork of SID's original rollout, cut after ``parent_pairs`` + 1 turns.
+
+    The parent's prefix ends at cumulative usage (10 + p, 2 + p); its later,
+    abandoned tail is far larger. The fork's own work adds (15, 4), then (5, 1)
+    per extra turn, so every usage delta of the fork is its own work.
+    """
+    rows = [history.row(0, 'session_meta', {'id': SID, 'timestamp': cli.STAMP,
+        'cwd': '/synthetic/project', 'originator': 'codex_cli', 'history_mode': 'paginated'})]
+    for n in range(parent_pairs + 1):
+        rows += [history.message(len(rows), 'user', f'parent ask {n} {pad}'),
+                 history.message(len(rows) + 1, 'assistant', f'parent reply {n}')]
+        rows.append(history.tokens(len(rows), 10 + n, 2 + n))
+    cutoff = len(rows)
+    rows += [history.message(cutoff, 'user', 'abandoned parent ask'), history.tokens(cutoff + 1, 9000, 900)]
+    parent = cli.write_jsonl(home / f'.codex/sessions/2026/01/01/rollout-2026-01-01T00-00-00-{SID}.jsonl', rows)
+    path, fork_rows = history.fork_fixture(home, parent, rows, cutoff)
+    seed = 10 + parent_pairs, 2 + parent_pairs
+    fork_rows[3] = history.tokens(fork_rows[3]['ordinal'], seed[0] + 15, seed[1] + 4)
+    for n in range(pairs):
+        fork_rows += [history.message(fork_rows[-1]['ordinal'] + 1, 'user', f'fork question {n}'),
+                      history.message(fork_rows[-1]['ordinal'] + 2, 'assistant', f'fork answer {n}')]
+        fork_rows.append(history.tokens(fork_rows[-1]['ordinal'] + 1,
+                                        seed[0] + 20 + 5 * n, seed[1] + 5 + n))
+    cli.write_jsonl(path, fork_rows)
+    return parent, path
+
+
+def run(home, request=None, sid=SID):
     request = request or {'version': 1, 'kind': 'first'}
-    result, rows = cli.run(home, 'codex', '--exact-detail', '--session', SID,
+    result, rows = cli.run(home, 'codex', '--exact-detail', '--session', sid,
                            '--context-page', json.dumps(request))
     return result, rows
 
 
-def here(home, request=None):
+def here(home, request=None, sid=SID):
     out, err = io.StringIO(), io.StringIO()
     with detail.rooted(home, 'codex'), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-        status = readers_cli.main(['--host', 'codex', '--exact-detail', '--session', SID,
+        status = readers_cli.main(['--host', 'codex', '--exact-detail', '--session', sid,
             '--context-page', json.dumps(request or {'version': 1, 'kind': 'first'})])
     return status, [json.loads(line) for line in out.getvalue().splitlines()], detail.codes_of(err.getvalue())
 
@@ -171,6 +199,136 @@ def test_invalid_late_rows_and_unsupported_history_return_no_page():
             cli.write_jsonl(path, rows)
             result, page = run(home)
             assert result.returncode == 2 and not page, (mutation, result.stderr)
+
+
+def pages(home, sid, canonical):
+    """Every page of ``sid`` in order, each checked against ``canonical``."""
+    result, page = run(home, sid=sid)
+    seen = []
+    while True:
+        assert result.returncode == 0, result.stderr
+        meta = page[0]['context_page']
+        assert {k: v for k, v in page[0].items() if k != 'context_page'} == canonical[0]
+        assert page[1:] == canonical[1:][meta['start']:meta['end']]
+        seen += page[1:]
+        if meta['end'] == meta['total']:
+            return seen, meta
+        result, page = run(home, {'version': 1, 'kind': 'after', 'position': meta['end'],
+                                  'generation': meta['digest']}, sid)
+
+
+def test_fork_pages_match_full_exact_detail_and_count_only_own_usage():
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        forked(home, pairs=110, parent_pairs=3)
+        full, canonical = cli.run(home, 'codex', '--exact-detail', '--session', history.FORK)
+        assert full.returncode == 0, full.stderr
+        seen, meta = pages(home, history.FORK, canonical)
+        assert seen == canonical[1:] and meta['total'] == len(seen) > context.MAX_RECORDS
+        assert not any('parent' in json.dumps(record) for record in seen)
+        usage = [record['message']['usage'] for record in seen if 'usage' in record['message']]
+        assert (usage[0]['input_tokens'], usage[0]['output_tokens']) == (15, 4)
+        assert all((u['input_tokens'], u['output_tokens']) == (5, 1) for u in usage[1:])
+        late = canonical[-3]
+        result, page = run(home, anchor(late, generation=meta['digest']), history.FORK)
+        assert result.returncode == 0, result.stderr
+        at = page[0]['context_page']
+        assert page[1:][at['target'] - at['start']] == late
+
+
+def test_fork_without_its_resolved_parent_prefix_returns_no_page():
+    from readers import codex_history
+    for mutation in ('missing', 'unresolved', 'truncated', 'appended-during-read',
+                     'shrunk-during-read', 'source-cap', 'line-cap'):
+        with tempfile.TemporaryDirectory() as td:
+            home = Path(td)
+            parent, fork = forked(home, parent_pairs=2, pad='p' * 5000 if mutation == 'line-cap' else '')
+            cutoff = json.loads(fork.read_text().splitlines()[0])['payload']['history_base']['end_byte_offset']
+            patches, fired = [], []
+            if mutation == 'missing':
+                parent.unlink()
+            elif mutation == 'unresolved':
+                patches.append(patch.object(codex_history, 'references', lambda *args: []))
+            elif mutation == 'truncated':
+                with parent.open('r+b') as handle:
+                    handle.truncate(cutoff - 1)
+            elif mutation.endswith('during-read') or mutation == 'line-cap':
+                original = context.Prefix.readline
+                def changed(self):
+                    if mutation == 'line-cap':
+                        try:
+                            return original(self)
+                        except readers_cli.DetailLimit:
+                            fired.append(True)
+                            raise
+                    if not fired:
+                        fired.append(True)
+                        if mutation.startswith('appended'):
+                            with parent.open('ab') as handle:
+                                handle.write(b'{}\n')
+                        else:
+                            with parent.open('r+b') as handle:
+                                handle.truncate(cutoff - 1)
+                    return original(self)
+                patches.append(patch.object(context.Prefix, 'readline', changed))
+            elif mutation == 'source-cap':
+                patches.append(patch.object(context, 'MAX_SOURCE_BYTES',
+                                            fork.stat().st_size + parent.stat().st_size - 1))
+            if mutation == 'line-cap':
+                patches.append(patch.object(readers_cli, 'DETAIL_MAX_LINE_BYTES', 4096))
+            with contextlib.ExitStack() as stack:
+                for item in patches:
+                    stack.enter_context(item)
+                status, page, codes = here(home, sid=history.FORK)
+            assert status == 2 and not page, (mutation, codes)
+            expected = {'missing': 'discovery_incomplete', 'unresolved': 'detail_prerequisite_unsupported',
+                        'truncated': 'session_unreadable', 'appended-during-read': 'source_changed',
+                        'shrunk-during-read': 'source_changed', 'source-cap': 'detail_limit_source_bytes',
+                        'line-cap': 'detail_limit_line_bytes'}[mutation]
+            assert expected in codes, (mutation, codes)
+            # The change or the line limit was met while the prefix was read.
+            assert fired or mutation not in ('appended-during-read', 'shrunk-during-read', 'line-cap')
+
+
+def test_fork_reads_a_large_parent_prefix_forward_without_holding_it():
+    """A parent past the whole-read cap; XTRACE_FORK_PARENT_MB raises its size."""
+    import time
+    import tracemalloc
+    size = int(os.environ.get('XTRACE_FORK_PARENT_MB', '26')) * 1024 * 1024
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        # About 3 KB per turn: many ordinary rows, not a few huge ones.
+        pad = 'x' * 2048
+        parent, fork = forked(home, pairs=3, parent_pairs=size // (len(pad) + 512) + 1, pad=pad)
+        assert parent.stat().st_size > max(size, readers_cli.DETAIL_MAX_SOURCE_BYTES)
+        whole, none = cli.run(home, 'codex', '--exact-detail', '--session', history.FORK)
+        assert whole.returncode == 2 and not none and 'detail_limit_source_bytes' in whole.stderr
+        # The unlimited ordinary export is the parity oracle past the whole-read cap.
+        export, canonical = cli.run(home, 'codex', '--session', history.FORK)
+        assert export.returncode == 0, export.stderr
+        reads = []
+        original = context.Window.readinto
+        def counted(self, buffer):
+            read = original(self, buffer)
+            reads.append(read)
+            return read
+        tracemalloc.start()
+        try:
+            began = time.monotonic()
+            with patch.object(context.Window, 'readinto', counted):
+                status, page, codes = here(home, sid=history.FORK)
+            elapsed = time.monotonic() - began
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        assert status == 0 and not codes, codes
+        assert page[1:] == canonical[1:]
+        assert max(reads) <= context.PREFIX_BUFFER_BYTES
+        # Two passes read the prefix forward; neither holds it.
+        assert sum(reads) >= 2 * parent.stat().st_size * 0.9
+        assert peak < parent.stat().st_size / 4, peak
+        print(f'  large parent {parent.stat().st_size / 2**20:.1f} MiB: page in {elapsed:.2f} s '
+              f'(traced), peak traced {peak / 2**20:.1f} MiB')
 
 
 def test_changed_sources_and_generation_are_refused():

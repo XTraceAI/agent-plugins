@@ -1853,7 +1853,8 @@ def main(argv=None) -> int:
                 from codex_context import read
                 import sys as context_sys
                 encoded = read(reader, path, revision, header, context_request, budget,
-                               context_sys.modules[__name__], history_groups.get(path))
+                               context_sys.modules[__name__], history_groups.get(path),
+                               references=history_references.get(path, ()))
                 budget.check()
                 try:
                     witness_root_held(reader, anchors)
