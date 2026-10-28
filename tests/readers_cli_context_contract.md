@@ -40,9 +40,12 @@ usage overlay twice: first with text removed to establish final IDs/order, then
 with only the selected bodies retained. One descriptor and captured length serve
 all passes. A fork's parent is opened once per pass through the identity
 discovery recorded and read forward, buffered, up to its captured length: every
-byte counts toward the same scan limit, each line toward the line limit, and the
-parent's bytes toward the source limit. A parent that shrinks, grows or is
-replaced while it is read refuses the page. Descriptor, source name, configured root and complete discovered
+byte counts toward the same scan limit and the parent's bytes toward the source
+limit. A parent line may be up to 64 MiB, because the parent can hold large tool
+outputs such as screenshots; it is held one line at a time, and the fork's own
+rows keep the 8 MiB line limit. The prefix lines each pass reads count with the
+fork's own rows toward the 200,000 row limit, as in the full read. A parent that
+shrinks, grows or is replaced while it is read refuses the page. Descriptor, source name, configured root and complete discovered
 source set are checked before output. No source snapshot or transcript cache is
 written. Limits remain finite: 256 MiB source (the fork and its parent together), 2 GiB cumulative replay, 32 full
 iterations, existing 8 MiB line/200,000 row/100,000 canonical record limits,

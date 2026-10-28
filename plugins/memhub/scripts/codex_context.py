@@ -30,6 +30,10 @@ CONTEXT_BEFORE = 12
 # Read-ahead for a fork's referenced prefix: a 100 MB prefix is about a hundred
 # reads, and the prefix is never held whole.
 PREFIX_BUFFER_BYTES = 1024 * 1024
+# One line of a fork's referenced prefix: the parent can hold large tool outputs
+# (screenshots); only its counters are read, one line at a time. The fork's own
+# rows keep the exact-detail line limit.
+MAX_PREFIX_LINE_BYTES = 64 * 1024 * 1024
 
 
 class ContextRefusal(ValueError):
@@ -98,20 +102,23 @@ class Prefix:
     """A referenced rollout read forward line by line, for its prefix counters.
 
     Buffered, so a long prefix is not one system call per byte. Every byte is
-    charged to the page's scan counter, each line is held to the line bound,
-    and the deadline is checked per line. Lines end at a newline only, as
+    charged to the page's scan counter, each line is held to the prefix line
+    bound and counted as a native row through ``count``, and the deadline is
+    checked per line. Lines end at a newline only, as
     ``codex_history.prefix_usage`` requires.
     """
-    def __init__(self, handle, length, charge, budget, api):
-        self.budget, self.api = budget, api
+    def __init__(self, handle, length, charge, count, budget, api):
+        self.count, self.budget, self.api = count, budget, api
         self.lines = io.BufferedReader(Window(handle, length, charge, budget, api),
                                        buffer_size=PREFIX_BUFFER_BYTES)
 
     def readline(self):
         self.budget.check()
-        raw = self.lines.readline(self.budget.max_line_bytes + 1)
-        if len(raw) > self.budget.max_line_bytes:
+        raw = self.lines.readline(MAX_PREFIX_LINE_BYTES + 1)
+        if len(raw) > MAX_PREFIX_LINE_BYTES:
             raise self.api.DetailLimit("detail_limit_line_bytes")
+        if raw:
+            self.count()
         return raw
 
 
@@ -123,6 +130,7 @@ class Rows:
         self.offsets = []
         handle.seek(0)
         offset = count = 0
+        self.count = 0
         with open_lines(Window(handle, length, self.charge, budget, api)) as lines:
             while offset < length:
                 budget.check()
@@ -133,6 +141,7 @@ class Rows:
                 if not raw:
                     raise api.SourceChanged("source shrank")
                 count += 1
+                self.count = count
                 if count > budget.max_native_rows:
                     raise api.DetailLimit("detail_limit_native_rows")
                 try:
@@ -268,14 +277,26 @@ def read(reader, path, revision, header, request, budget, api, group=None, refer
             with api.regular_source(source, api.revision_identity(source_revision, source),
                                     buffered=False) as (prefix, seen):
                 budget.charge_file(source, seen)
-                yield Prefix(prefix, seen.st_size, rows.charge, budget, api)
+                yield Prefix(prefix, seen.st_size, rows.charge, count_row, budget, api)
                 after = os.fstat(prefix.fileno())
                 if api.identity(after) != api.identity(seen) or api.file_stamp(after) != api.file_stamp(seen):
                     raise api.SourceChanged("referenced history changed")
 
+        # Native rows one pass reads: the fork's own and its referenced prefix
+        # lines, as the whole read counts them. Each pass starts again.
+        pass_rows = rows.count
+
+        def count_row():
+            nonlocal pass_rows
+            pass_rows += 1
+            if pass_rows > budget.max_native_rows:
+                raise api.DetailLimit("detail_limit_native_rows")
+
         start = end = target = None
         positions = {}
         def normalize(selected):
+            nonlocal pass_rows
+            pass_rows = rows.count
             bodies = 0
             retained = []
             ownership = RetainedOwnership(api, budget, lambda uuid: uuid in selected and

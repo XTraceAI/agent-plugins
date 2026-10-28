@@ -33,7 +33,7 @@ With Python 3.10 or newer on a POSIX host:
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=plugins/memhub/scripts:tests python3 tests/readers_cli_context_test.py
 ```
 
-The 29 tests check canonical record parity, paginated usage reconciliation, exact
+The 31 tests check canonical record parity, paginated usage reconciliation, exact
 anchors and navigation, forked sessions (parity, own usage, parent refusals and a
 large parent), source changes, newline framing, malformed late records, resource
 bounds and pre-retention ownership checks. All source data is synthetic;

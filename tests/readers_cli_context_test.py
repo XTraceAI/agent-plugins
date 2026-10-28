@@ -239,7 +239,7 @@ def test_fork_pages_match_full_exact_detail_and_count_only_own_usage():
 def test_fork_without_its_resolved_parent_prefix_returns_no_page():
     from readers import codex_history
     for mutation in ('missing', 'unresolved', 'truncated', 'appended-during-read',
-                     'shrunk-during-read', 'source-cap', 'line-cap'):
+                     'shrunk-during-read', 'source-cap', 'line-cap', 'row-cap'):
         with tempfile.TemporaryDirectory() as td:
             home = Path(td)
             parent, fork = forked(home, parent_pairs=2, pad='p' * 5000 if mutation == 'line-cap' else '')
@@ -275,7 +275,10 @@ def test_fork_without_its_resolved_parent_prefix_returns_no_page():
                 patches.append(patch.object(context, 'MAX_SOURCE_BYTES',
                                             fork.stat().st_size + parent.stat().st_size - 1))
             if mutation == 'line-cap':
-                patches.append(patch.object(readers_cli, 'DETAIL_MAX_LINE_BYTES', 4096))
+                patches.append(patch.object(context, 'MAX_PREFIX_LINE_BYTES', 4096))
+            elif mutation == 'row-cap':
+                # The fork's own 4 rows plus 3, below its 10 prefix lines.
+                patches.append(patch.object(readers_cli, 'DETAIL_MAX_NATIVE_ROWS', 4 + 3))
             with contextlib.ExitStack() as stack:
                 for item in patches:
                     stack.enter_context(item)
@@ -284,10 +287,58 @@ def test_fork_without_its_resolved_parent_prefix_returns_no_page():
             expected = {'missing': 'discovery_incomplete', 'unresolved': 'detail_prerequisite_unsupported',
                         'truncated': 'session_unreadable', 'appended-during-read': 'source_changed',
                         'shrunk-during-read': 'source_changed', 'source-cap': 'detail_limit_source_bytes',
-                        'line-cap': 'detail_limit_line_bytes'}[mutation]
+                        'line-cap': 'detail_limit_line_bytes',
+                        'row-cap': 'detail_limit_native_rows'}[mutation]
             assert expected in codes, (mutation, codes)
             # The change or the line limit was met while the prefix was read.
             assert fired or mutation not in ('appended-during-read', 'shrunk-during-read', 'line-cap')
+
+
+def test_fork_prefix_lines_have_their_own_size_cap_and_share_the_row_limit():
+    """Caps patched down in proportion: 8 MiB rows -> 4 KiB, 64 MiB prefix lines -> 32 KiB."""
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        # A parent prefix line over the fork's line cap but under the prefix cap.
+        parent, fork = forked(home, parent_pairs=2, pad='p' * 5000)
+        assert len(fork.read_text().splitlines()) == 4
+        export, canonical = cli.run(home, 'codex', '--session', history.FORK)
+        assert export.returncode == 0, export.stderr
+        # The fork's 4 rows and the 10 prefix lines each pass reads fit exactly.
+        with patch.object(readers_cli, 'DETAIL_MAX_LINE_BYTES', 4096), \
+                patch.object(context, 'MAX_PREFIX_LINE_BYTES', 32 * 1024), \
+                patch.object(readers_cli, 'DETAIL_MAX_NATIVE_ROWS', 4 + 10):
+            status, page, codes = here(home, sid=history.FORK)
+        assert status == 0 and not codes, codes
+        assert page[1:] == canonical[1:]
+
+
+def test_fork_parent_change_after_its_prefix_is_read_is_refused_by_the_page_reader():
+    """The page reader itself refuses, before the CLI's own final revision check."""
+    from readers import codex_history
+    with tempfile.TemporaryDirectory() as td:
+        home = Path(td)
+        parent, fork = forked(home, parent_pairs=2)
+        prefix_reads, raised = [], []
+        original_prefix, original_read = codex_history.prefix_usage, context.read
+        def prefix_usage(*args):
+            result = original_prefix(*args)
+            prefix_reads.append(True)
+            if len(prefix_reads) == 2:
+                # The final pass has read the prefix; the parent then changes.
+                seen = parent.stat()
+                os.utime(parent, ns=(seen.st_atime_ns, seen.st_mtime_ns + 10**9))
+            return result
+        def read(*args, **kwargs):
+            try:
+                return original_read(*args, **kwargs)
+            except Exception as error:
+                raised.append(error)
+                raise
+        with patch.object(codex_history, 'prefix_usage', prefix_usage), patch.object(context, 'read', read):
+            status, page, codes = here(home, sid=history.FORK)
+        assert status == 2 and not page and 'source_changed' in codes, codes
+        assert len(prefix_reads) == 2
+        assert len(raised) == 1 and isinstance(raised[0], readers_cli.SourceChanged), raised
 
 
 def test_fork_reads_a_large_parent_prefix_forward_without_holding_it():
