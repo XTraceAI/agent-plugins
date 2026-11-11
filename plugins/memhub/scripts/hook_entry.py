@@ -49,7 +49,13 @@ For every route it keeps the shell's exact semantics:
   reach Claude unchanged;
 * the exit status is the last lane's, or 0 when it was skipped — SessionEnd
   runs its two lanes in order and the first one's failure never stops the
-  second.
+  second;
+* with ``MEMHUB_HOOK_TRACE`` on, or in a remote session
+  (``CLAUDE_CODE_REMOTE=true``) unless that flag is off, each hook appends
+  one line to ``~/.cache/memhub-plugin/hook-trace.jsonl`` saying what it did
+  (claimed, skipped, which lane ran and its status) and whether a credential
+  is present — never the payload or the credential itself. Writing it can
+  never change a hook's outcome.
 
 Scripts are found next to this file, never through the environment.
 
@@ -117,6 +123,7 @@ import os
 import runpy
 import subprocess
 import sys
+import time
 import traceback
 from pathlib import Path
 from typing import Callable, NamedTuple, Optional, Tuple
@@ -216,10 +223,12 @@ ROUTES = {
     # mod serves its own error results in-process, so the same claim.
     ("PostToolUseFailure", "rulebook_hook"): _one(
         "ignore", "rulebook_hook.py", "post", claim="post", scope="call"),
-    # All four are needed: see docs/specs/pr-linking-plugin-spec.md §5.1.
+    # The first four are needed: see docs/specs/pr-linking-plugin-spec.md §5.1.
+    # `mcp__*__link_pr` is MemHub's own tool, the bug-origin lane (ENG-1268).
     ("PostToolUse", "pr_link_trigger"): _one(
         "ignore", "pr_link_trigger.py",
-        globs=("*gh*pr*", "*[Gg]it[Hh]ub*", "*api/v3*", "*repos/*pulls*"),
+        globs=("*gh*pr*", "*[Gg]it[Hh]ub*", "*api/v3*", "*repos/*pulls*",
+               "mcp__*__link_pr"),
         subject=_github_text),
 
     ("SessionStart", "capture_health"): _one("ignore", "capture_health.py"),
@@ -232,9 +241,18 @@ ROUTES = {
     # The person typed a command and the host expanded it: noted, so the
     # submit that follows is known to be a body, not their words (ENG-1235).
     ("UserPromptExpansion", "rulebook_hook"): _one("ignore", "rulebook_hook.py", "expansion"),
+    # Local rewind's before-prompt checkpoint (rewind/hooks.py). Synchronous on
+    # purpose: the snapshot must precede the model's first tool call. Opt-in;
+    # a disabled machine returns after one small settings read.
+    ("UserPromptSubmit", "rewind_checkpoint"): _one(
+        "ignore", "compare_session.py", "checkpoint", "--harness", "claude_code"),
     ("UserPromptSubmit", "brain_brief"): _one("ignore", "brain_brief.py", "prompt"),
     ("UserPromptSubmit", "rulebook_hook"): _one(
         "ignore", "rulebook_hook.py", "prompt", claim="prompt"),
+    # The advisory a `reply` rule left at the last Stop (rulebook_reply.py).
+    # Never claimed: the mod has no reply lane, so nothing else delivers it.
+    ("UserPromptSubmit", "rulebook_reply"): _one(
+        "ignore", "rulebook_reply.py", "deliver", scope="always"),
 
     ("Stop", "flush_turn"): _one(
         "capture", "flush_turn.py", prefilter="turn_flush_prefilter.py",
@@ -251,6 +269,14 @@ ROUTES = {
     ("Stop", "rulebook_hook"): _one(
         "ignore", "rulebook_hook.py", "flush", isolated=True, scope="always"),
     ("Stop", "harness_stop"): _one("ignore", "harness_stop.py", "stop", harness=True),
+    # The `reply` rules: synchronous, since a gate blocks this Stop. Judged per
+    # call by the session's checkout inside rulebook_hook, as the pre lane is.
+    ("Stop", "rulebook_reply"): _one("ignore", "rulebook_hook.py", "reply", scope="call"),
+    # Synchronous: it may block the stop while a file a shell command wrote is
+    # quarantined (rulebook_quarantine.py). Local state only, so the allowlist
+    # never stops it — a violation exists only where a call lane opened one.
+    ("Stop", "rulebook_quarantine"): _one(
+        "ignore", "rulebook_quarantine.py", "stop", scope="always"),
 
     # One handler, two lanes, in order: Claude Code runs an event's handlers
     # in parallel, and the fire flush can only link rows capture has stored.
@@ -411,22 +437,93 @@ def _spawn(command: Tuple[str, ...], raw: bytes) -> int:
     return 128 - code if code < 0 else code  # a signal, as the shell reports it
 
 
+# The hook trace: one JSON line per hook call saying what the dispatcher did
+# with it, for measuring which hooks a host really fires (a Cowork cloud
+# session first). On when ``MEMHUB_HOOK_TRACE`` is an on spelling or the
+# session is remote (``CLAUDE_CODE_REMOTE=true``); an off spelling turns it off
+# even there. It never records the payload or a credential's value, only
+# whether one is present, and a failure to write it never touches the hook.
+def tracing(environ) -> bool:
+    flag = environ.get("MEMHUB_HOOK_TRACE", "").strip(_FLAG_WS).lower()
+    if flag in _FLAG_OFF:
+        return False
+    return flag in _FLAG_ON or (
+        environ.get("CLAUDE_CODE_REMOTE", "").strip(_FLAG_WS).lower() == "true")
+
+
+def trace_path(environ) -> Path:
+    base = environ.get("XDG_CACHE_HOME") or str(Path.home() / ".cache")
+    return Path(base) / "memhub-plugin" / "hook-trace.jsonl"
+
+
+def _credential(environ) -> str:
+    """Where a MemHub credential would come from: env, stored or none.
+
+    ``env`` is whatever ``_memhub_auth.explicit_token`` accepts, so the
+    directory build (which reads no credential from the environment) answers
+    as its hooks would."""
+    try:
+        import _memhub_auth
+        if _memhub_auth.explicit_token():
+            return "env"
+    except Exception:
+        pass
+    config = Path(environ.get("MEMHUB_CONFIG_DIR")
+                  or Path.home() / ".config" / "memhub-plugin")
+    try:
+        if any(config.glob("pak-*.json")) or any(config.glob("tokens-*.json")):
+            return "stored"
+    except OSError:
+        pass
+    return "none"
+
+
+def _trace(event: str, name: str, raw: bytes, environ,
+           steps: list, status: int) -> None:
+    payload = _payload(raw.rstrip(b"\n"))
+    get = payload.get if isinstance(payload, dict) else (lambda _k: None)
+    row = {"ts": round(time.time(), 3), "event": event, "name": name,
+           "session_id": get("session_id"), "tool": get("tool_name"),
+           "steps": steps, "status": status,
+           "credential": _credential(environ),
+           "entrypoint": environ.get("CLAUDE_CODE_ENTRYPOINT")}
+    path = trace_path(environ)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as out:
+        out.write(json.dumps(row) + "\n")
+
+
 def dispatch(event: str, name: str, raw: bytes, environ=None) -> int:
     env = os.environ if environ is None else environ
+    steps: list = []
+    status = _dispatch(event, name, raw, env, steps)
+    if tracing(env):
+        try:
+            _trace(event, name, raw, env, steps, status)
+        except Exception:
+            pass
+    return status
+
+
+def _dispatch(event: str, name: str, raw: bytes, env, steps: list) -> int:
     route = ROUTES[(event, name)]
     if route.harness and not harness_enabled(env):
+        steps.append("harness-off")
         return 0
     raw = raw.rstrip(b"\n")
     payload = _payload(raw)
     if _claimed(route.claim, payload, env):
+        steps.append("claimed-by-mod")
         return 0
     if route.globs and not payload_matches(
             route.subject(payload) if route.subject else (), route.globs):
+        steps.append("glob-miss")
         return 0
     if not env.get("CLAUDE_PLUGIN_ROOT"):
         if route.loud_root:
             print("[memhub-flush] CLAUDE_PLUGIN_ROOT unset; cannot locate "
                   "flush scripts, skipping", file=sys.stderr)
+        steps.append("no-plugin-root")
         return 0
     # The repository allowlist, asked once per hook and only when a lane
     # needs it: a ``session`` lane in a dormant session is skipped silently,
@@ -444,12 +541,16 @@ def dispatch(event: str, name: str, raw: bytes, environ=None) -> int:
                     if note:
                         print(note)
                         _flush()
+                steps.append(f"{lane.run[0]}:dormant")
                 continue
         if not _guard(lane.guard, event, raw, payload):
+            steps.append(f"{lane.run[0]}:guard-skip")
             continue
         if lane.prefilter and _run((lane.prefilter,), raw) != 0:
+            steps.append(f"{lane.run[0]}:prefilter-skip")
             continue
         status = _run(lane.run, raw, lane.isolated)
+        steps.append(f"{lane.run[0]}:ran:{status}")
     return status
 
 

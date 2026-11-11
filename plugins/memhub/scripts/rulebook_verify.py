@@ -48,11 +48,45 @@ file; `--agent-main false` runs the case as a subagent:
   --silent 'bash:cat src/service.py | head -50' \
   --silent 'bash:cat src/service.py' --agent-main false
 
+A `given.session` condition reads the session, not the repo. Give its facts
+with `--context-tokens`, `--idle-seconds`, `--turn-tool-calls` and
+`--repeat-count` (how many times the rule has matched this session, THIS
+match included), or per case as the same names in a `--cases` object. A fact
+not given is unknown and the condition does not hold — as on a host whose
+transcript cannot answer it:
+
+  --fires  '{"case": "git status", "context_tokens": 320000}' (in --cases) \
+  --silent 'git status' --context-tokens 120000
+
 For a `prompt` rule a case is the whole prompt text, harness wrappers
 included — the hook matches what UserPromptSubmit carries, unstripped:
 
   --fires  '<task-notification>ci finished</task-notification>' \
   --silent 'what does this loop do?'
+
+For a `reply` rule a case is the agent's final reply text, optionally after
+the shell commands its turn ran, joined by ` >> `: `ok:<cmd>` succeeded,
+`red:<cmd>` failed, `ran:<cmd>` has no result yet. The case fires when the
+claim matches the reply (quoted and code-fenced text excluded) and no `ok:` or
+`ran:` command matched evidence_command_rx:
+
+  --fires  'Done, PR merged and tests pass.' \
+  --silent 'ok:gh pr view 12 --json state >> PR merged.' \
+  --fires  'red:pytest -q >> Fixed, tests pass.' \
+  --silent 'I have not run `pytest` yet, so I cannot say "tests pass".'
+
+A GATE-mode `edit` rule can also be verified as the QUARANTINE it opens when
+a shell command writes the file in a way the command line does not show
+(`python fix.py`): a sequence ending in a door (`door:<command>`, which fires
+when the command is blocked) or `stop` (fires when the agent's Stop would be
+blocked). `wrote:<path>::<content>` is a shell-written file, `fixed:` the same
+file edited to new content, `deleted:<path>` its removal; paths are relative
+to a throwaway checkout:
+
+  --fires  'wrote:app/keys.py::API_KEY = "sk-1" >> door:git commit -am wip'
+  --silent 'wrote:app/keys.py::API_KEY = "sk-1" >> fixed:app/keys.py::API_KEY = env() >> door:git push'
+  --silent "wrote:app/keys.py::API_KEY = 'sk-1' >> door:RULEBOOK_OVERRIDE='fixture' git commit -m x"
+  --fires  'wrote:app/keys.py::API_KEY = "sk-1" >> stop'
 
 An `ordering` rule is verified as a SEQUENCE of steps joined by ` >> `, ending
 in the gated call; the case fires when that call is gated:
@@ -60,6 +94,15 @@ in the gated call; the case fires when that call is gated:
   --fires  'edit:src/a.py >> gate:git push'
   --silent 'edit:src/a.py >> ok:pytest tests/ >> gate:git push'
   --fires  'edit:src/a.py >> red:pytest tests/ >> gate:git push'
+
+A command-armed rule (`armed_by_events: ["command"]`) is armed by an `ok:`
+step that runs `armed_by_command_rx`; a `red:` one arms nothing, and a gate
+step that itself runs the arming command first is gated:
+
+  --fires  'ok:git mv a.py b.py >> gate:git push'
+  --silent 'red:git mv a.py b.py >> gate:git push'
+  --silent 'ok:git mv a.py b.py >> ok:pytest -q >> gate:git push'
+  --fires  'gate:git mv a.py b.py && git push'
 
 Stdlib only; no network; no server concepts.
 """
@@ -77,7 +120,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import rulebook_hook as H  # noqa: E402  (path set above so the engine is importable)
 
 _FIXTURE_KEYS = ("branch", "diff_paths", "diff_lines", "dirty", "user_said",
-                 "file_lines", "agent_main", "cwd")
+                 "file_lines", "agent_main", "cwd",
+                 "context_tokens", "idle_seconds", "turn_tool_calls", "repeat_count")
+_SESSION_FACTS = ("context_tokens", "idle_seconds", "turn_tool_calls")
 
 
 # `create_rule` takes the matcher nested; the hook reads a flat row. Build the
@@ -121,13 +166,18 @@ def _probes(fixture: dict) -> "H.Probes":
            "user_turns": list(fixture["user_said"]) if "user_said" in fixture else None,
            "agent_main": fixture.get("agent_main", True),
            "base": None}
+    # given.session: rulebook_session.holds reads `session` and `repeat_count`
+    pre["session"] = {k: fixture.get(k) for k in _SESSION_FACTS}
+    if "repeat_count" in fixture:
+        pre["repeat_count"] = fixture["repeat_count"]
     return H.Probes("", pre["branch"], fixture=pre)
 
 
 def _ordering_fires(hook_rule: dict, raw: str) -> bool:
     """Replay `step >> step >> gate:cmd` through the real OrderingEngine in a
     throwaway state dir. Steps: `edit:<path>`, `ok:<cmd>` (green receipt),
-    `red:<cmd>` (red receipt), `session` (the SessionStart arming),
+    `red:<cmd>` (red receipt; `ok:`/`red:` also arm or not a command-armed
+    rule), `session` (the SessionStart arming),
     `prompt:<what the person typed>` (the UserPromptSubmit arming),
     `gate:<cmd>` (the gated pre-call). The case fires when the LAST gate step
     is gated.
@@ -160,8 +210,10 @@ def _ordering_fires(hook_rule: dict, raw: str) -> bool:
                     outcome = eng.feed(rule, hook_phase="post", tool="Edit", file_path=arg,
                                        armed=armed)
                 elif kind in ("ok", "red"):
+                    # `ran` too: a command-armed rule arms only on a call
+                    # that did not fail, so `red:git mv a b` arms nothing.
                     outcome = eng.feed(rule, hook_phase="post", tool="Bash", cmd=arg,
-                                       ok=(kind == "ok"), armed=armed)
+                                       ok=(kind == "ok"), armed=armed, ran=(kind == "ok"))
                     if outcome == "discharged":
                         armed = None        # what main() does on a discharge
                 elif kind in ("session", "prompt"):
@@ -212,6 +264,77 @@ def _ordering_fires(hook_rule: dict, raw: str) -> bool:
     return outcome == "fired"
 
 
+def _quarantine_fires(hook_rule: dict, raw: str) -> bool:
+    """Replay `wrote:/fixed:/deleted: >> … >> door:<cmd>|stop` through the
+    real quarantine code (`rulebook_quarantine`: open, re-check, door, the
+    override that closes one) over files written to a throwaway checkout.
+    The case fires when its LAST door is blocked, or its last `stop` would be."""
+    import rulebook_quarantine as Q  # noqa: PLC0415 — beside this file
+    if hook_rule.get("mode") != "gate":
+        raise ValueError("only a GATE-mode edit rule quarantines a file; this rule advises")
+    h = vars(H)
+    rule = dict(hook_rule, id=hook_rule.get("id") or "candidate")
+    steps = [x.strip() for x in raw.split(">>") if x.strip()]
+    saved = H.BASE
+    outcome = False
+    with tempfile.TemporaryDirectory() as td:
+        H.BASE = os.path.join(td, "state")
+        try:
+            root = os.path.join(td, "checkout")
+            os.makedirs(os.path.join(root, ".git"))
+            with open(os.path.join(root, ".git", "HEAD"), "w", encoding="utf-8") as f:
+                f.write("ref: refs/heads/main\n")
+            repo = H.repo_info(root)[0]
+            st = {"quarantine": {}}
+            kw = dict(rules=[rule], repo=repo, root=root, cmd_root=root)
+            for step in steps:
+                kind, _, arg = step.partition(":")
+                kind = kind.strip()
+                path, _, content = arg.partition("::")
+                path = os.path.join(root, path.strip().lstrip("/"))
+                if kind in ("wrote", "fixed"):
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(content)
+                if kind == "wrote":
+                    # The post lane's fire pass, then the quarantine's own call.
+                    fired = [dict(rule)] if H.evaluate(rule, hook_phase="pre", tool="Write",
+                                                         file_path=path, body=content) else []
+                    ev = {"tool": "Write", "fp": path, "via": "bash", "root": root, "new": True}
+                    Q.on_call(h, st, mode="post", tool="Bash", cmd="", events=[ev], fired=fired,
+                              fired_on={rule["id"]: ev}, label=None, reason=None, **kw)
+                elif kind == "fixed":
+                    Q.on_call(h, st, mode="post", tool="Edit", cmd="",
+                              events=[{"tool": "Edit", "fp": path, "via": None}], fired=[],
+                              fired_on={}, label=None, reason=None, **kw)
+                elif kind == "deleted":
+                    if os.path.exists(path):
+                        os.unlink(path)
+                elif kind == "door":
+                    cmd, label, reason = arg, None, None
+                    found = H.find_override(cmd)
+                    if found:
+                        reason = found[0]
+                        cmd = H.strip_override(cmd, found)
+                        label, reason = H.split_named_override(reason)
+                    gates = Q.on_call(h, st, mode="pre", tool="Bash", cmd=cmd, events=[], fired=[],
+                                      fired_on={}, label=label, reason=reason, **kw)
+                    # main()'s override pass: an unnamed reason, or one naming
+                    # this rule, excuses the gate the door raised.
+                    excused = reason is not None and (label is None or label in (
+                        str(rule["id"]).lower(), str(rule.get("_label") or "").lower()))
+                    outcome = bool(gates) and not excused
+                elif kind == "stop" and not arg:
+                    outcome = any(Q.recheck(h, rec, repo, root, [rule])
+                                  for rec in st["quarantine"].values())
+                else:
+                    raise ValueError("unknown quarantine step %r (wrote: | fixed: | deleted: | "
+                                     "door: | stop)" % step)
+        finally:
+            H.BASE = saved
+    return outcome
+
+
 def _read_fires(hook_rule: dict, raw: str, fixture: dict) -> bool:
     """`read:<path>[@<offset>,<limit>|@<limit>]` is the Read tool; `bash:<cmd>`
     goes through `bash_reads`, the parser the hook runs on a shell command,
@@ -242,8 +365,30 @@ def _read_fires(hook_rule: dict, raw: str, fixture: dict) -> bool:
         and H.given_ok(hook_rule, probes, read=facts)
 
 
+def _reply_fires(hook_rule: dict, raw: str, fixture: dict) -> bool:
+    """`[ok:|red:|ran:<cmd> >> …] <reply text>` through the reply lane's own
+    matcher (rulebook_reply.fires) and the hook's `given_ok`. The last step is
+    the reply; an optional `reply:` prefix on it is dropped."""
+    import rulebook_reply as R  # noqa: PLC0415 — beside this file
+    steps = [p.strip() for p in raw.split(" >> ")]
+    reply, commands = steps[-1], []
+    if reply.startswith("reply:"):
+        reply = reply[len("reply:"):].strip()
+    for step in steps[:-1]:
+        kind, sep, cmd = step.partition(":")
+        if not sep or kind.strip() not in ("ok", "red", "ran"):
+            raise ValueError("a reply case's step is ok:<cmd>, red:<cmd> or ran:<cmd>, "
+                             "and the reply text comes last (got %r)" % step)
+        commands.append({"cmd": cmd.strip(),
+                         "ok": {"ok": True, "red": False, "ran": None}[kind.strip()]})
+    return bool(R.fires(hook_rule, reply, commands, H.executes, H.shell_only)) \
+        and H.given_ok(hook_rule, _probes(fixture))
+
+
 def _fires(hook_rule: dict, raw: str, fixture: dict | None = None) -> bool:
     on = hook_rule.get("on")
+    if on == "reply":
+        return _reply_fires(hook_rule, raw, fixture or {})
     if on == "ordering":
         return _ordering_fires(hook_rule, raw)
     if on == "read":
@@ -252,6 +397,8 @@ def _fires(hook_rule: dict, raw: str, fixture: dict | None = None) -> bool:
         # The case IS the prompt, wrappers and all — `::` in it is prose.
         return bool(H.evaluate(hook_rule, hook_phase="prompt", tool="UserPromptSubmit",
                                prompt=raw)) and H.given_ok(hook_rule, _probes(fixture or {}))
+    if on == "edit" and raw.lstrip().startswith(("wrote:", "fixed:", "deleted:")):
+        return _quarantine_fires(hook_rule, raw)
     path, content = _split_case(raw)
     if on in ("edit", "write", "write_stdlib"):
         hit = H.evaluate(hook_rule, hook_phase="pre", tool="Edit",
@@ -537,6 +684,14 @@ def main() -> int:
     fx.add_argument("--agent-main", type=_bool, metavar="BOOL",
                     help="read rules: false runs the case inside a subagent (default true)")
     fx.add_argument("--cwd", help="read rules: where a 'bash:' case's relative paths resolve")
+    fx.add_argument("--context-tokens", type=int, metavar="N",
+                    help="given.session: tokens the model was sent on the latest response")
+    fx.add_argument("--idle-seconds", type=int, metavar="N",
+                    help="given.session: quiet before the latest response, in seconds")
+    fx.add_argument("--turn-tool-calls", type=int, metavar="N",
+                    help="given.session: tool calls this turn, the checked one included")
+    fx.add_argument("--repeat-count", type=int, metavar="N",
+                    help="given.session: times the rule matched this session, this match included")
     args = ap.parse_args()
 
     raw = args.rule
@@ -566,6 +721,9 @@ def main() -> int:
         fixture["agent_main"] = args.agent_main
     if args.cwd is not None:
         fixture["cwd"] = args.cwd
+    for k in _SESSION_FACTS + ("repeat_count",):
+        if getattr(args, k) is not None:
+            fixture[k] = getattr(args, k)
 
     fires, silent = list(args.fires), list(args.silent)
     if args.cases:

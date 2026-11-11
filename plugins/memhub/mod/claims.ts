@@ -60,7 +60,14 @@
 import type { LaneName } from '../types'
 import type { Env, Io } from './ctx'
 
+/**
+ * The Rulebook's lanes: what a book that cannot load, refresh or is paused for
+ * an upgrade gives back. The drafter needs no book, so it stays claimed
+ * through those; the remote switch gives back ALL_LANES.
+ */
 export const LANES: readonly LaneName[] = ['pre', 'post', 'prompt', 'session']
+/** Every lane the mod can claim, in the order the variable lists them. */
+export const ALL_LANES: readonly LaneName[] = [...LANES, 'drafter']
 export const FELL_BACK = 'MemHub rules: fell back to the command hooks'
 /** Failures a lane survives in a session; the next one releases it. */
 const MAX_FAILURES = 2
@@ -135,7 +142,7 @@ export class Claims {
   }
 
   list(): LaneName[] {
-    return LANES.filter(l => this.claimed.has(l))
+    return ALL_LANES.filter(l => this.claimed.has(l))
   }
 
   /**
@@ -160,7 +167,7 @@ export class Claims {
     }
   }
 
-  /** Give lanes back to Python for the rest of the session. */
+  /** Give lanes back to Python for the rest of the session (the Rulebook's, unless named). */
   async release(lanes: readonly LaneName[] = LANES): Promise<void> {
     for (const l of lanes) {
       this.claimed.delete(l)

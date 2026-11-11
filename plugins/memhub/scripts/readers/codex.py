@@ -43,13 +43,15 @@ from __future__ import annotations
 import glob
 import datetime
 import json
+import os
 import re
 import sys
 import uuid as _uuid
 from collections import deque
 from pathlib import Path
 from .strict_json import loads as load_json
-from .jsonl import open_lines, readline_bytes
+from .jsonl import ZSTD_SUFFIX, logical_size, open_lines, read_bytes, readline_bytes
+from . import codex_limits
 from typing import Any
 
 # The readers are imported both as a package and, by some callers, with
@@ -64,11 +66,21 @@ from session_title import normalize_title  # noqa: E402
 
 HOST = "codex"
 
-# Not $CODEX_HOME: this module has never read that variable, and
-# `sessions_root()` is a containment boundary for payload-supplied
-# paths, so widening it is a separate change with its own review.
-_CODEX_DIR = Path.home() / ".codex"
+# $CODEX_HOME when the host sets it, as Codex itself and the hook bridge do;
+# else ~/.codex. `sessions_root()` is the containment boundary for
+# payload-supplied paths, so the boundary follows the store the host actually
+# writes: with CODEX_HOME elsewhere the flusher used to read an empty
+# ~/.codex and capture nothing. The variable comes from the host's own
+# environment, never from a hook payload.
+def _codex_dir() -> Path:
+    configured = os.environ.get("CODEX_HOME", "").strip()
+    return Path(configured).expanduser() if configured else Path.home() / ".codex"
+
+
+_CODEX_DIR = _codex_dir()
 _SESSIONS = _CODEX_DIR / "sessions"
+# Codex moves threads the person archived here, same layout and name.
+_ARCHIVED = _CODEX_DIR / "archived_sessions"
 # Sidecar index of every thread Codex has named: one
 # {"id", "thread_name", "updated_at"} object per line. Strictly more complete
 # than the rollouts — a Codex Desktop session can be named here while its own
@@ -111,7 +123,9 @@ _AGENTS_XML_BLOCK_RE = re.compile(
     re.S,
 )
 
-# Codex rollout files are named rollout-<ISO-timestamp>-<uuid>.jsonl.
+# Codex rollout files are named rollout-<ISO-timestamp>-<uuid>.jsonl, and
+# rollout-<ISO-timestamp>-<uuid>.jsonl.zst once Codex compressed them.
+ROLLOUT_GLOBS = ("rollout-*.jsonl", "rollout-*.jsonl.zst")
 _ROLLOUT_UUID_RE = re.compile(
     r"-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$")
@@ -162,7 +176,8 @@ def load_rollout(path, *, strict: bool = False) -> list[dict]:
     records: list[dict] = []
     errors = "strict" if strict else "replace"
     # Split bytes first: Unicode separators inside JSON strings are content.
-    for encoded in Path(path).read_bytes().splitlines(keepends=True):
+    # read_bytes decompresses a .jsonl.zst (recognised by its zstd magic).
+    for encoded in read_bytes(path).splitlines(keepends=True):
         raw = encoded.decode("utf-8", errors=errors)
         line = raw.strip(" \t\r\n") if strict else raw.strip()
         if not line:
@@ -365,7 +380,77 @@ def _usage_delta(current: dict[str, int], previous: dict[str, int] | None
     }
 
 
-def _merge_usage(record: dict, usage: dict[str, int]) -> None:
+_MAX_PROMPT_TOKENS = 2**31 - 1
+_MAX_SERVICE_TIER = 32
+
+
+def _count(value: Any, upper: int | None = None) -> int | None:
+    """A non-negative int token count (bools rejected), else None."""
+    if type(value) is int and value >= 0 and (upper is None or value <= upper):
+        return value
+    return None
+
+
+def _reasoning_total(info: Any) -> int | None:
+    """Cumulative ``reasoning_output_tokens`` of a token_count, else None.
+
+    Read beside ``_usage_total`` rather than through it, so the four-key
+    validation that ``codex_usage.apply`` relies on is unchanged."""
+    if not isinstance(info, dict):
+        return None
+    total = info.get("total_token_usage")
+    return _count(total.get("reasoning_output_tokens")) if isinstance(total, dict) else None
+
+
+def _prompt_tokens(info: Any) -> int | None:
+    """The single-request prompt size (``last_token_usage.input_tokens``).
+
+    Codex ``input_tokens`` includes cached tokens, so this is the context the
+    last request actually carried. A cumulative delta can span several
+    requests; the backend sizes the long-context price tier by this instead
+    of the summed prompt."""
+    if not isinstance(info, dict):
+        return None
+    last = info.get("last_token_usage")
+    return _count(last.get("input_tokens"), _MAX_PROMPT_TOKENS) if isinstance(last, dict) else None
+
+
+def _service_tier(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip() and len(value) <= _MAX_SERVICE_TIER:
+        return value
+    return None
+
+
+def _usage_detail(usage: dict, info: Any, reasoning: int | None,
+                  previous_reasoning: int | None, service_tier: str | None) -> None:
+    """Add the per-request detail that rides beside the four token counts.
+
+    Claude's own field names (``output_tokens_details.thinking_tokens``), so an
+    older backend that reads only the four counts ignores them and a newer one
+    stores them with the rest of the usage detail. Never raises: a malformed
+    field is simply left out."""
+    try:
+        if reasoning is not None and previous_reasoning is not None \
+                and reasoning >= previous_reasoning:
+            thinking = reasoning - previous_reasoning
+            if thinking > 0:
+                usage["output_tokens_details"] = {"thinking_tokens": thinking}
+        prompt = _prompt_tokens(info)
+        if prompt is not None:
+            usage["prompt_tokens"] = prompt
+        if service_tier is not None:
+            usage["service_tier"] = service_tier
+    except Exception:  # noqa: BLE001 — detail is optional; the counts are not
+        pass
+
+
+def _merge_usage(record: dict, usage: dict) -> None:
+    """Fold one usage delta into a record's usage.
+
+    Token counts add. ``prompt_tokens`` is a size, not a count, so it keeps
+    the largest request. Text (``service_tier``) is set, the last one winning.
+    A nested dict of counts (``output_tokens_details``) adds one level deep.
+    A value whose type does not match what is already there is skipped."""
     message = record.get("message")
     if not isinstance(message, dict):
         return
@@ -374,7 +459,32 @@ def _merge_usage(record: dict, usage: dict[str, int]) -> None:
         target = {}
         message["usage"] = target
     for key, value in usage.items():
-        target[key] = target.get(key, 0) + value
+        current = target.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            if current is None:
+                target[key] = value
+            elif type(current) is not int:
+                continue
+            elif key == "prompt_tokens":
+                target[key] = max(current, value)
+            else:
+                target[key] = current + value
+        elif isinstance(value, str):
+            if current is None or isinstance(current, str):
+                target[key] = value
+        elif isinstance(value, dict):
+            if current is None:
+                current = target[key] = {}
+            elif not isinstance(current, dict):
+                continue
+            for sub, count in value.items():
+                if type(count) is not int:
+                    continue
+                before = current.get(sub, 0)
+                if type(before) is int:
+                    current[sub] = before + count
 
 
 def _one_line(name: str) -> str | None:
@@ -545,12 +655,43 @@ def _title(rollout: list[dict], session_id: str | None = None, *, strict=False, 
     return normalize_title(first_user or last_complete)
 
 
+def agent_envelope_text(payload: dict) -> str:
+    """The plaintext of an ``agent_message`` item: its ``input_text`` parts,
+    joined. Encrypted parts are never decoded or carried."""
+    parts = payload.get("content") if isinstance(payload, dict) else None
+    if not isinstance(parts, list):
+        return ""
+    texts = [p.get("text") for p in parts
+             if isinstance(p, dict) and p.get("type") == "input_text"
+             and isinstance(p.get("text"), str)]
+    return "\n".join(texts).strip()
+
+
+def envelope_type(text: str) -> str | None:
+    """``NEW_TASK`` / ``FINAL_ANSWER`` / ``MESSAGE`` from an envelope's first line."""
+    first = (text or "").split("\n", 1)[0]
+    if first.startswith("Message Type:"):
+        return first[len("Message Type:"):].strip() or None
+    return None
+
+
+def envelope_payload(text: str) -> str:
+    """The envelope's payload with the ``Message Type / Task name / Sender``
+    headers stripped; empty when the payload was encrypted or absent."""
+    marker = "Payload:"
+    if envelope_type(text) is None or marker not in text:
+        return ""
+    return text.split(marker, 1)[1].strip()
+
+
 def rollout_to_claude_records(rollout: list[dict], *, strict=False, title_index=None,
                              identity_namespace=None, initial_usage_total=None,
                              usage_baseline_unknown=False, record_sources=None, usage_targets=None) -> tuple[list[dict], dict]:
     """Return ``(claude_records, meta)``.
 
-    ``meta`` = ``{session_id, cwd, model, originator, cli_version, title}``.
+    ``meta`` = ``{session_id, cwd, model, originator, cli_version, title,
+    account_limits}`` — ``account_limits`` is the last ``rate_limits`` snapshot,
+    allowlisted by ``codex_limits``, or None.
     ``claude_records`` are Claude-Code-shaped and carry ``cwd`` so
     ``import_session._namespace_from_records`` can resolve the repo. Platform,
     model, session, and cwd provenance live in structured metadata instead of a
@@ -567,6 +708,12 @@ def rollout_to_claude_records(rollout: list[dict], *, strict=False, title_index=
     if strict and sm.get("cli_version") is not None and not isinstance(sm["cli_version"], str):
         raise ValueError("Codex CLI version must be text or null")
     cwd = sm.get("cwd") if isinstance(sm.get("cwd"), str) else None
+    # Forwarded as Claude Code's top-level ``gitBranch``, the key the server's
+    # ``branches_from_records`` reads for every host (MemHub-Backend
+    # pr-weight-success-spec.md §7.2). Session-level: Codex records the branch
+    # once, in the header. ``commit_hash`` is not forwarded; nothing reads it.
+    git = sm.get("git")
+    branch = _record_branch(git.get("branch")) if isinstance(git, dict) else None
     model = None
     for r in rollout:
         if not isinstance(r, dict):  # see _rollout_thread_name
@@ -612,6 +759,8 @@ def rollout_to_claude_records(rollout: list[dict], *, strict=False, title_index=
             record_sources[id(record)] = idx
         if cwd:
             record["cwd"] = cwd
+        if branch:
+            record["gitBranch"] = branch
         # The server's agentic parser SKIPS records without a ``uuid`` (it is
         # the per-record replay-dedup key) and lifts ``event_date`` from
         # ``timestamp`` — records missing them import as nothing, silently.
@@ -643,9 +792,39 @@ def rollout_to_claude_records(rollout: list[dict], *, strict=False, title_index=
         record = {"type": "user", "message": {"role": "user", "content": content}}
         if cwd:
             record["cwd"] = cwd
+        if branch:
+            record["gitBranch"] = branch
         record["uuid"] = str(_uuid.uuid5(
             _uuid.NAMESPACE_URL,
             f"memhub:codex:{sid_key}:recovered-user:{source_index}",
+        ))
+        if ts_holder["ts"]:
+            record["timestamp"] = ts_holder["ts"]
+        if record_sources is not None:
+            record_sources[id(record)] = source_index
+        return record
+
+    # This thread's address among its team of agents: a child's header names
+    # it (``/root/alpha``); the person's own thread is ``/root``.
+    link = spawn_link(sm)
+    own_path = (sm.get("agent_path") if isinstance(sm.get("agent_path"), str)
+                else (link or {}).get("agent_path") or "/root")
+
+    def agent_message(text: str, source_index: int) -> dict:
+        """An inter-agent envelope addressed to this thread, as a user turn.
+
+        Never consumes a legacy output index: rollouts captured before these
+        envelopes were read keep every acknowledged record identity, and the
+        new rows land beside them under their own source-indexed namespace
+        (the ``recovered_user`` rule)."""
+        record = {"type": "user", "message": {"role": "user", "content": text}}
+        if cwd:
+            record["cwd"] = cwd
+        if branch:
+            record["gitBranch"] = branch
+        record["uuid"] = str(_uuid.uuid5(
+            _uuid.NAMESPACE_URL,
+            f"memhub:codex:{sid_key}:agent-message:{source_index}",
         ))
         if ts_holder["ts"]:
             record["timestamp"] = ts_holder["ts"]
@@ -664,6 +843,16 @@ def rollout_to_claude_records(rollout: list[dict], *, strict=False, title_index=
 
     last_assistant: dict | None = None
     previous_usage_total: dict[str, int] | None = initial_usage_total
+    # Moves in lockstep with ``previous_usage_total``. A fresh rollout starts
+    # from zero; a continuation's inherited reasoning total is unknown, so its
+    # first delta carries no thinking count rather than an invented one.
+    previous_reasoning: int | None = (
+        0 if initial_usage_total is None and not usage_baseline_unknown else None)
+    service_tier: str | None = None
+    # The newest rate-limit object seen, by reference; parsed once after the
+    # loop by ``codex_limits`` so a reshaped object cannot disturb the walk.
+    last_rate_limits: Any = None
+    last_rate_limits_ts: Any = None
 
     def append_assistant(block: dict) -> None:
         nonlocal last_assistant
@@ -688,27 +877,51 @@ def rollout_to_claude_records(rollout: list[dict], *, strict=False, title_index=
 
     for idx, r in enumerate(rollout):
         pl = r.get("payload")
+        if isinstance(pl, dict):
+            # The service tier the following requests run on. Codex has written
+            # it on ``thread_settings_applied`` events; a ``turn_context`` that
+            # carries one is honoured too. Stored with usage, never priced here.
+            # A key that is present resets the tier, even to None (a cleared
+            # tier must not linger); an absent key keeps the previous one.
+            if r.get("type") == "turn_context":
+                if "service_tier" in pl:
+                    service_tier = _service_tier(pl.get("service_tier"))
+            elif (r.get("type") == "event_msg"
+                    and pl.get("type") == "thread_settings_applied"
+                    and isinstance(pl.get("thread_settings"), dict)):
+                if "service_tier" in pl["thread_settings"]:
+                    service_tier = _service_tier(pl["thread_settings"].get("service_tier"))
         if (r.get("type") == "event_msg" and isinstance(pl, dict)
                 and pl.get("type") == "token_count"):
             observe_timestamp(r.get("timestamp"))
+            # Before any ``continue``: a rate-limit-only update has ``info: null``.
+            if isinstance(pl.get("rate_limits"), dict):
+                last_rate_limits = pl["rate_limits"]
+                last_rate_limits_ts = r.get("timestamp")
             info = pl.get("info")
             total = _usage_total(
                 info.get("total_token_usage") if isinstance(info, dict) else None
             )
             if total is not None:
+                reasoning = _reasoning_total(info)
                 if usage_baseline_unknown:
                     # A referenced history without a usable cumulative snapshot
                     # cannot supply this first delta. Establish a baseline only.
                     previous_usage_total = total
+                    previous_reasoning = reasoning
                     usage_baseline_unknown = False
                     continue
                 usage = _usage_delta(total, previous_usage_total)
+                if usage:
+                    _usage_detail(usage, info, reasoning, previous_reasoning,
+                                  service_tier)
                 # A regressing/malformed cumulative snapshot is ignored and
                 # does not poison the baseline for later valid snapshots.
                 if (previous_usage_total is None
                         or all(total[k] >= previous_usage_total[k]
                                for k in _USAGE_KEYS)):
                     previous_usage_total = total
+                    previous_reasoning = reasoning
                 if usage:
                     if last_assistant is not None:
                         _merge_usage(last_assistant, usage)
@@ -774,6 +987,19 @@ def rollout_to_claude_records(rollout: list[dict], *, strict=False, title_index=
             elif role == "assistant":
                 append_assistant({"type": "text", "text": text})
 
+        elif pt == "agent_message":
+            # Multi-agent v2 envelopes ("Message Type: NEW_TASK|FINAL_ANSWER|
+            # MESSAGE / Task name / Sender / Payload:"). Only the plaintext
+            # ``input_text`` parts are read; ``encrypted_content`` is opaque
+            # and stays out. A message this thread SENT is already its own
+            # spawn/send tool call, so only one addressed TO it becomes a turn:
+            # a child's task, or a parent's report from a child (the envelope
+            # names its sender).
+            text = agent_envelope_text(pl)
+            if text and pl.get("recipient") == own_path and (
+                    envelope_payload(text) or envelope_type(text) == "NEW_TASK"):
+                out.append(agent_message(text, idx))
+
         elif pt == "reasoning":
             value = pl.get("summary")
             summary = _text_of(value, strict=strict and value is not None).strip()
@@ -809,22 +1035,120 @@ def rollout_to_claude_records(rollout: list[dict], *, strict=False, title_index=
                 "content": output,
             }]))
 
+    # Outside the walk and outside ``codex_usage.apply``; ``snapshot_from``
+    # never raises, in strict mode too, so a reshaped object costs only itself.
+    meta["account_limits"] = codex_limits.snapshot_from(
+        last_rate_limits, last_rate_limits_ts)
     return out, meta
 
 
+def _rollout_stem(path) -> str:
+    """The file name without ``.jsonl`` / ``.jsonl.zst``."""
+    name = Path(path).name
+    if name.endswith(ZSTD_SUFFIX):
+        name = name[: -len(ZSTD_SUFFIX)]
+    return name[: -len(".jsonl")] if name.endswith(".jsonl") else Path(name).stem
+
+
+def is_rollout_name(name: str) -> bool:
+    return name.startswith("rollout-") and name.endswith((".jsonl", ".jsonl" + ZSTD_SUFFIX))
+
+
 def rollout_uuid(path) -> str | None:
-    """The trailing session UUID of a rollout filename, or None if it doesn't
-    match the ``rollout-<ts>-<uuid>`` pattern."""
-    m = _ROLLOUT_UUID_RE.search(Path(path).stem)
+    """The trailing session UUID of a rollout filename (``.jsonl`` or
+    ``.jsonl.zst``), or None if it doesn't match ``rollout-<ts>-<uuid>``."""
+    m = _ROLLOUT_UUID_RE.search(_rollout_stem(path))
     return m.group(1) if m else None
 
 
-def _rollout_files(on_error=None) -> list[Path]:
-    if on_error is not None:
-        from .discovery import paths
-        return paths(_SESSIONS, ("**", "rollout-*.jsonl"), on_error)
-    return [Path(f) for f in glob.glob(str(_SESSIONS / "**" / "rollout-*.jsonl"),
-                                       recursive=True)]
+def rollout_size(path) -> int:
+    """The growth watermark's size: decompressed for a ``.jsonl.zst``, so the
+    compression of a rollout is not a shrink (and not a full re-send)."""
+    return logical_size(path)
+
+
+def existing_rollout(path: Path) -> Path | None:
+    """``path`` if it is a file, else its compressed sibling: a hook or the
+    state DB can still name ``rollout-X.jsonl`` after Codex compressed it to
+    ``rollout-X.jsonl.zst``. None when neither exists."""
+    path = Path(path)
+    if path.is_file():
+        return path
+    if path.name.endswith(".jsonl"):
+        packed = path.with_name(path.name + ZSTD_SUFFIX)
+        if packed.is_file():
+            return packed
+    return None
+
+
+def _prefer_plain(files) -> list[Path]:
+    """One path per rollout name: the live ``.jsonl`` wins over a ``.zst``
+    copy of the same rollout (seen while Codex is compressing it)."""
+    chosen: dict[str, Path] = {}
+    for f in files:
+        f = Path(f)
+        key = str(f.parent / _rollout_stem(f))
+        if key not in chosen or not f.name.endswith(ZSTD_SUFFIX):
+            chosen[key] = f
+    return list(chosen.values())
+
+
+def _rollout_files(on_error=None, roots=None) -> list[Path]:
+    roots = [_SESSIONS] if roots is None else roots
+    found: list[Path] = []
+    for root in roots:
+        for pattern in ROLLOUT_GLOBS:
+            if on_error is not None:
+                from .discovery import paths
+                found.extend(paths(root, ("**", pattern), on_error))
+            else:
+                found.extend(Path(f) for f in glob.glob(str(root / "**" / pattern),
+                                                        recursive=True))
+    return _prefer_plain(found)
+
+
+def rollout_index(include_archived: bool = True) -> dict[str, Path]:
+    """``{session uuid: rollout path}`` over the store (and the archive), the
+    plain ``.jsonl`` preferred. Agent discovery uses it to find children by id
+    without one glob per child."""
+    roots = [_SESSIONS] + ([_ARCHIVED] if include_archived and _ARCHIVED.is_dir() else [])
+    index: dict[str, Path] = {}
+    for f in _rollout_files(roots=roots):
+        sid = rollout_uuid(f)
+        if sid and (sid not in index or index[sid].name.endswith(ZSTD_SUFFIX)):
+            index[sid] = f
+    return index
+
+
+# A thread Codex spawned for a person's thread names its parent in the header:
+# ``source.subagent.thread_spawn`` for a multi-agent child, ``source.subagent
+# == "review"`` (with a top-level ``parent_thread_id``) for a /review thread.
+# codex-rs protocol.rs ``SubAgentSource``: Review | Compact | ThreadSpawn{..}
+# | MemoryConsolidation | Other(String).
+def spawn_link(meta: dict) -> dict | None:
+    """``{"kind": "thread_spawn"|"review", "parent": <thread id>, ...}`` for a
+    child thread's header payload, else None (a person's thread, or a kind of
+    Codex thread that is not an agent of anyone)."""
+    if not isinstance(meta, dict):
+        return None
+    source = meta.get("source")
+    sub = source.get("subagent") if isinstance(source, dict) else None
+    if isinstance(sub, dict) and isinstance(sub.get("thread_spawn"), dict):
+        spawn = sub["thread_spawn"]
+        parent = spawn.get("parent_thread_id")
+        if isinstance(parent, str) and parent:
+            depth = spawn.get("depth")
+            return {"kind": "thread_spawn", "parent": parent,
+                    "depth": depth if type(depth) is int else None,
+                    "agent_path": spawn.get("agent_path") if isinstance(spawn.get("agent_path"), str) else None,
+                    "nickname": spawn.get("agent_nickname") if isinstance(spawn.get("agent_nickname"), str) else None,
+                    "role": spawn.get("agent_role") if isinstance(spawn.get("agent_role"), str) else None}
+    if sub == "review":
+        parent = meta.get("parent_thread_id")
+        if isinstance(parent, str) and parent:
+            return {"kind": "review", "parent": parent, "depth": 1,
+                    "agent_path": None, "nickname": None, "role": None}
+    return None
 
 
 # `session_meta` is the rollout's first record in every layout observed; a few
@@ -864,6 +1188,16 @@ def _session_header(path, *, strict: bool = True) -> dict:
             if payload or (strict and record.get("type") == "session_meta"):
                 return record
     return {}
+
+
+def _record_branch(value) -> str | None:
+    """The branch a record carries as ``gitBranch``: a non-blank string,
+    stripped, at most 255 characters — otherwise none. A truncated name would
+    be a different branch, so an over-long one is dropped, not cut."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value if value and len(value) <= 255 else None
 
 
 def _metadata_from_header(header: dict, *, strict: bool = True) -> dict:
@@ -947,6 +1281,9 @@ def locate(ref: str) -> tuple[Path | None, str]:
     if p.is_file():
         return p, ""
     if "/" in ref and ref != "latest":
+        packed = existing_rollout(p)
+        if packed is not None:
+            return packed, ""
         return None, f"rollout file not found: {p}"
     files = _rollout_files()
     if not files:
@@ -956,7 +1293,7 @@ def locate(ref: str) -> tuple[Path | None, str]:
     # Match the session UUID exactly — a partial/fragment id does NOT match (it
     # would risk selecting the wrong session and folding-forward the wrong
     # conversation's gist). Ambiguity is an error, never a largest-file guess.
-    sid = ref.removesuffix(".jsonl")
+    sid = ref.removesuffix(ZSTD_SUFFIX).removesuffix(".jsonl")
     hits = [f for f in files if rollout_uuid(f) == sid]
     if not hits:
         return None, (f"no Codex rollout with session UUID {sid!r} under "

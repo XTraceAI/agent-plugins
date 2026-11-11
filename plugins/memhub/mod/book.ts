@@ -9,7 +9,7 @@
 // and `_norm_rules` (to_hook_rule per row, first id wins). Replaces the
 // detached `fetch` child `maybe_refresh` spawns (W4).
 
-import type { Claims, StatusLine } from './claims'
+import { ALL_LANES, type Claims, type StatusLine } from './claims'
 import type { Ctx, Io } from './ctx'
 import { lastJson, MOD_CLI } from './ctx'
 import type { Engine, HookRule } from './engine'
@@ -40,6 +40,15 @@ const REFRESH_FAILURES_SHOWN = 3
  * urllib takes a different road than `$.http.fetch`, would refresh it.
  */
 export const RELEASE_AFTER_FAILURES = 5
+/**
+ * A refresh that starts longer than this after the last failure is not "in a
+ * row": the machine slept in between. A sleeping Mac wakes for a few seconds
+ * every ~15 minutes with no network (maintenance DarkWake), and without this
+ * one failed tick per wake added up to RELEASE_AFTER_FAILURES overnight and
+ * released the lanes for the rest of the session. Measured from the last
+ * failure to the next attempt's START, so a fetch that hangs still counts.
+ */
+export const SLEEP_GAP_MS = 3 * REFRESH_MS
 /** rulebook_hook.py `REFRESH_AFTER_S` (60 s): Python refreshes a book older than this. */
 export const PYTHON_REFRESH_AFTER_MS = 60_000
 
@@ -192,6 +201,8 @@ export class Book {
   private timer: { cancel(): void } | undefined
   private inFlight = false
   private failures = 0
+  /** When the last failed refresh ended (epoch ms); see SLEEP_GAP_MS. */
+  private lastFailedAt: number | undefined
   private stopped = false
   /** When the book the engine holds was last known current (epoch ms). */
   private freshAt: number | undefined
@@ -263,10 +274,11 @@ export class Book {
   async refresh(): Promise<RefreshOutcome> {
     if (this.inFlight || this.stopped || !this.repo || !this.path) return 'skipped'
     this.inFlight = true
+    const startedAt = await this.io.now()
     try {
       return await this.fetchOnce(true)
     } catch (err) {
-      await this.failed(err)
+      await this.failed(err, startedAt)
       return 'failed'
     } finally {
       this.inFlight = false
@@ -355,13 +367,17 @@ export class Book {
    * forever and the judge fails the same way, while Python's own fetch is not
    * subject to that policy. A network blip is retried; after
    * RELEASE_AFTER_FAILURES in a row with a book older than Python's staleness
-   * window, the lanes go back to Python too.
+   * window, the lanes go back to Python too. Failures separated by more than
+   * SLEEP_GAP_MS are not in a row: the count starts again.
    */
-  private async failed(err: unknown): Promise<void> {
+  private async failed(err: unknown, startedAt: number): Promise<void> {
     if (isFetchRefused(err)) return this.giveUp(FETCH_REFUSED)
+    const now = await this.io.now()
+    if (this.lastFailedAt !== undefined && startedAt - this.lastFailedAt > SLEEP_GAP_MS) this.failures = 0
+    this.lastFailedAt = now
     this.failures += 1
     if (this.failures >= RELEASE_AFTER_FAILURES) {
-      const age = this.freshAt === undefined ? Infinity : (await this.io.now()) - this.freshAt
+      const age = this.freshAt === undefined ? Infinity : now - this.freshAt
       if (age > PYTHON_REFRESH_AFTER_MS) return this.giveUp(REFRESH_GAVE_UP)
     }
     if (this.failures >= REFRESH_FAILURES_SHOWN) {
@@ -539,7 +555,7 @@ export class RemoteSwitch {
     // A failed write already serves nothing and tries to unset the variable
     // (claims.ts `writeFailed`); the variable's lease lapses within LEASE_S
     // if even that failed. Said in the debug log, never on screen.
-    await this.claims.release().catch(err => {
+    await this.claims.release(ALL_LANES).catch(err => {
       this.io.debug(`MemHub rules: remote switch release failed — ${err instanceof Error ? err.message : String(err)}`)
     })
   }

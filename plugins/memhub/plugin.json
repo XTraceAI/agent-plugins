@@ -1,8 +1,8 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "memhub",
-  "description": "MemHub team memory for coding agents. Your sessions are saved to your memory automatically, your team keeps a shared brain of specs and docs, team rules warn or block the agent at the moment they apply (Claude Code and Codex; shell commands and file reads on Cursor), and MCP tools let the agent search and save team memory.",
-  "version": "0.133.0",
+  "description": "MemHub team memory for coding agents. Your sessions are saved to your memory automatically, your team keeps a shared brain of specs and docs, team rules warn or block the agent at the moment they apply (Claude Code and Codex; shell commands, file reads, edits and command results on Cursor), and MCP tools let the agent search and save team memory.",
+  "version": "0.151.0",
   "license": "Apache-2.0",
   "author": {
     "name": "XTrace",

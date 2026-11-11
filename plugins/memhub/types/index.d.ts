@@ -26,8 +26,12 @@ export type ProposalNote = {
   at: number
 }
 
-/** Which Rulebook lanes the mod serves this session (spec §3.3). */
-export type LaneName = 'pre' | 'post' | 'prompt' | 'session'
+/**
+ * Which lanes the mod serves this session (spec §3.3): the four Rulebook
+ * lanes, and `drafter` — the harness's rule-drafting fork, spawned by the mod
+ * (mod/drafter.ts) instead of handed to the agent by the Stop's line.
+ */
+export type LaneName = 'pre' | 'post' | 'prompt' | 'session' | 'drafter'
 
 declare module 'claude-code' {
   interface PluginState {

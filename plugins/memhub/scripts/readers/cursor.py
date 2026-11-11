@@ -85,6 +85,17 @@ _LEADING_TAG_RE = re.compile(r"^<([A-Za-z_][\w-]*)(?:\s[^>]*)?>.*?</\1>\s*", re.
 _TIMESTAMP_RE = re.compile(
     r"<timestamp>([A-Za-z]+, [A-Za-z]+ \d{1,2}, \d{4}, "
     r"\d{1,2}:\d{2} [AP]M) \(UTC([+-]\d{1,2})(?::(\d{2}))?\)</timestamp>")
+_UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+                      r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+# A background sub-agent finishing reaches its parent as a user turn: in the
+# store, a ``<system_notification>`` whose ``<task>`` says ``kind: subagent``,
+# followed by Cursor's own canned ``<user_query>``; in the hook JSONL, the
+# canned query alone (cursor-agent 2026.10). Neither is the person speaking.
+_NOTIFICATION_RE = re.compile(
+    r"<system_notification>\s*(.*?)\s*</system_notification>", re.S)
+_SUBAGENT_TASK_RE = re.compile(r"^kind:\s*subagent\s*$", re.M)
+_FOLLOWUP_PROMPT = ("Perform any necessary follow-up actions in response to "
+                    "the subagent completion above.")
 
 
 def _clean_user_text(text: str) -> str | None:
@@ -101,6 +112,34 @@ def _clean_user_text(text: str) -> str | None:
             break
         t = stripped
     return t or None
+
+
+def _subagent_notification(text: str, ask: str) -> str | None:
+    """The record text for a sub-agent's completion notice, or None when the
+    turn is a real prompt. Rewritten as Claude Code's own
+    ``<task-notification>`` so every reader that already skips automated
+    turns (titles, session checks, rule moments) skips this one too."""
+    match = _NOTIFICATION_RE.search(text or "")
+    if match and _SUBAGENT_TASK_RE.search(match.group(1)):
+        body = match.group(1)
+    elif ask.startswith(_FOLLOWUP_PROMPT):
+        body = ask
+    else:
+        return None
+    return f"<task-notification>\n{body}\n</task-notification>"
+
+
+def _unwrap_dynamic(name, args):
+    """Cursor's ``CallDynamicTool{namespace: cursor, toolName: Task,
+    arguments}`` is how a session spawns a sub-agent; the call is a ``Task``
+    with ``arguments`` as its input, and is stored as one so a spawn reads
+    the same on every host. The call id is untouched: a sub-agent names it
+    byte for byte (``subagentInfo.toolCallId``)."""
+    if (name == "CallDynamicTool" and isinstance(args, dict)
+            and args.get("namespace") == "cursor" and args.get("toolName") == "Task"):
+        inner = args.get("arguments")
+        return "Task", inner if isinstance(inner, dict) else {}
+    return name, args
 
 
 def _text_of(content) -> str:
@@ -178,6 +217,49 @@ def _read_meta_json(session_dir: Path, *, strict=False, text=None) -> dict | Non
         return None
 
 
+def store_meta(db_path: Path) -> dict:
+    """The store's own metadata row (``meta`` key ``0``: ``agentId``,
+    ``createdAt``, ``latestRootBlobId`` and, for a sub-agent,
+    ``subagentInfo{parentAgentId, rootParentAgentId, toolCallId, typeName}``),
+    or {} when it cannot be read. cursor-agent writes it as hex-encoded JSON.
+    ``blobEncryptionKey`` is dropped here so no caller can carry it further."""
+    try:
+        con = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro",
+                              uri=True, timeout=3.0)
+    except (sqlite3.Error, OSError, ValueError):
+        return {}
+    try:
+        rows = con.execute("SELECT value FROM meta").fetchall()
+    except sqlite3.Error:
+        return {}
+    finally:
+        con.close()
+    for (value,) in rows:
+        try:
+            if isinstance(value, (bytes, bytearray)):
+                value = bytes(value).decode("utf-8")
+            if re.fullmatch(r"(?:[0-9a-fA-F]{2})+", value or ""):
+                value = bytes.fromhex(value).decode("utf-8")
+            meta = json.loads(value)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(meta, dict) and meta.get("agentId"):
+            meta.pop("blobEncryptionKey", None)
+            return meta
+    return {}
+
+
+def subagent_info(session_dir: Path) -> dict | None:
+    """A cursor-agent sub-agent's ``subagentInfo``, or None for a session of
+    the person's own. Only a store with NO ``meta.json`` can be a sub-agent
+    (every root has one), so the common case costs one stat."""
+    session_dir = Path(session_dir)
+    if (session_dir / "meta.json").exists() or not (session_dir / "store.db").is_file():
+        return None
+    info = store_meta(session_dir / "store.db").get("subagentInfo")
+    return info if isinstance(info, dict) else None
+
+
 def _session_dirs() -> list[Path]:
     return [p.parent for p in _CHATS.glob("*/*/store.db")]
 
@@ -219,6 +301,12 @@ def list_sessions(limit: int | None = 20, *, on_error=None, include_representati
             on_error(FileNotFoundError("Cursor session stores are unavailable"))
         stores = [path.parent for path in paths(_CHATS, ("*", "*", "store.db"), on_error)] if _CHATS in roots else []
         transcripts = paths(_PROJECTS, ("*", "agent-transcripts", "*", "*.jsonl"), on_error) if _PROJECTS in roots else []
+    # A sub-agent's store is a sibling dir with no meta.json; it is captured
+    # with its root session, never offered as one of its own (nor is its
+    # flat hook transcript).
+    children = {d.name for d in stores if subagent_info(d) is not None}
+    stores = [d for d in stores if d.name not in children]
+    transcripts = [p for p in transcripts if p.stem not in children]
     for d in stores:
         if on_error is not None:
             # Discovery uses filesystem observations. Bad session metadata is
@@ -606,9 +694,20 @@ def _model_of(obj) -> str | None:
     return (po.get("cursor") or {}).get("modelName") if isinstance(po, dict) else None
 
 
+def _record_branch(value) -> str | None:
+    """The branch a record carries as ``gitBranch``: a non-blank string,
+    stripped, at most 255 characters — otherwise none. A truncated name would
+    be a different branch, so an over-long one is dropped, not cut."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value if value and len(value) <= 255 else None
+
+
 def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
                   session_id: str, cwd: str | None, model_hint: str | None,
-                  created_ts: str | None, strict: bool = False) -> tuple[list[dict], dict]:
+                  created_ts: str | None, strict: bool = False,
+                  git_branch: str | None = None) -> tuple[list[dict], dict]:
     """Transform either native source after it has yielded ordered messages.
 
     Each message's ``ts`` is a clock the artifact carries FOR IT (or None —
@@ -622,9 +721,17 @@ def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
         # Recovered measurements must not shift existing record or tool IDs.
         return len(out) - usage_only_count
 
+    # Forwarded as Claude Code's top-level ``gitBranch``, the key the server's
+    # ``branches_from_records`` reads for every host (MemHub-Backend
+    # pr-weight-success-spec.md §7.2). Only a store.db session's meta.json
+    # names one; a hook transcript has none.
+    branch = _record_branch(git_branch)
+
     def rec(record: dict) -> dict:
         if cwd:
             record["cwd"] = cwd
+        if branch:
+            record["gitBranch"] = branch
         # uuid is the server's per-record replay-dedup key — records without
         # one are SKIPPED by the agentic parser (imported as nothing).
         # Deterministic over (session, output index) so re-flushes fold.
@@ -671,8 +778,16 @@ def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
             continue  # Cursor's harness prompt — noise
 
         if role == "user":
-            ask = _clean_user_text(_text_of(content))
-            if ask:
+            raw = _text_of(content)
+            ask = _clean_user_text(raw)
+            # Only a turn that already yielded a record may become a notice:
+            # one record either way keeps every later record's uuid in place.
+            notice = _subagent_notification(raw, ask) if ask else None
+            if notice:
+                record = user(notice)
+                record["isMeta"] = True
+                out.append(record)
+            elif ask:
                 out.append(user(ask))
                 if title is None:
                     # Cursor exposes no host-generated name anywhere in its
@@ -707,11 +822,13 @@ def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
                         emitted.append(record)
                 elif bt in ("tool-call", "tool_use"):
                     args = b.get("args") if bt == "tool-call" else b.get("input")
+                    name, args = _unwrap_dynamic(
+                        b.get("toolName") or b.get("name") or "tool", args)
                     record = assistant({
                         "type": "tool_use",
                         "id": (b.get("toolCallId") or b.get("id") or
                                f"cursor-call-{legacy_index()}"),
-                        "name": b.get("toolName") or b.get("name") or "tool",
+                        "name": name,
                         "input": args if isinstance(args, dict) else {"input": args},
                     }, block_model)
                     out.append(record)
@@ -746,7 +863,47 @@ def _canonicalize(dated_messages: list[tuple[dict, str | None]], *,
 
     meta = {"session_id": session_id, "cwd": cwd, "model": model,
             "title": title, "host": HOST}
-    return out, meta
+    return _results_after_calls(out), meta
+
+
+def _result_id(record: dict) -> str | None:
+    content = (record.get("message") or {}).get("content")
+    if (record.get("type") == "user" and isinstance(content, list) and content
+            and isinstance(content[0], dict) and content[0].get("type") == "tool_result"):
+        return content[0].get("tool_use_id")
+    return None
+
+
+def _results_after_calls(records: list[dict]) -> list[dict]:
+    """Move a tool result that precedes its own tool call to just after it.
+
+    A store whose root cannot be walked is read in blob insertion order, and
+    there a result can land before the call that produced it (seen on
+    cursor-agent 2026.10). Each record keeps its uuid and timestamp — they
+    travel with the content — so only the order changes, and a session whose
+    order was already right is returned untouched."""
+    called: dict[str, int] = {}
+    for index, record in enumerate(records):
+        if record.get("type") != "assistant":
+            continue
+        for block in record["message"].get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                called.setdefault(block.get("id"), index)
+    early: dict[int, list[dict]] = {}
+    kept: list[tuple[int, dict]] = []
+    for index, record in enumerate(records):
+        call_index = called.get(_result_id(record), -1)
+        if call_index > index:
+            early.setdefault(call_index, []).append(record)
+        else:
+            kept.append((index, record))
+    if not early:
+        return records
+    ordered: list[dict] = []
+    for index, record in kept:
+        ordered.append(record)
+        ordered.extend(early.pop(index, ()))
+    return ordered
 
 
 _MAX_TRANSCRIPT_LINE_BYTES = 8 * 1024 * 1024
@@ -827,7 +984,21 @@ def to_canonical(path, *, session_id: str | None = None,
             created_ts=created_ts, strict=strict)
 
     session_dir = source.parent
-    mj = _read_meta_json(session_dir, strict=strict) or {}
+    created_ts = None
+    if strict or (session_dir / "meta.json").exists():
+        mj = _read_meta_json(session_dir, strict=strict) or {}
+    else:
+        # A cursor-agent sub-agent: a sibling store with no meta.json, whose
+        # own meta row names its root. The root's meta.json supplies the
+        # schema version and cwd; the banner's clock is the child's own
+        # creation time.
+        mj = {}
+        info = store_meta(source)
+        sub = info.get("subagentInfo") if isinstance(info, dict) else None
+        root = sub.get("rootParentAgentId") if isinstance(sub, dict) else None
+        if isinstance(root, str) and _UUID_RE.fullmatch(root):
+            mj = _read_meta_json(session_dir.parent / root) or {}
+            created_ts = _iso_ms(info.get("createdAt"))
     version = mj.get("schemaVersion")
     if type(version) is not int or version != _SCHEMA_VERSION:
         raise ValueError(
@@ -843,7 +1014,8 @@ def to_canonical(path, *, session_id: str | None = None,
                 for message, node_ts in _load_messages(source, strict=strict)]
     return _canonicalize(
         messages, session_id=session_dir.name, cwd=store_cwd,
-        model_hint=None, created_ts=_created_at(mj, strict=strict), strict=strict)
+        model_hint=None, created_ts=created_ts or _created_at(mj, strict=strict),
+        strict=strict, git_branch=mj.get("gitBranch"))
 
 
 def session_metadata(path, *, meta_text: str | None = None,

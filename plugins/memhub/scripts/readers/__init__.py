@@ -48,7 +48,7 @@ def sniff(ref: str) -> str | None:
         return None
     p = Path(ref).expanduser()
     name = p.name
-    if name.startswith("rollout-") and name.endswith(".jsonl"):
+    if codex.is_rollout_name(name):
         return codex.HOST
     parts = p.parts
     if name == "store.db" or ".cursor" in parts:

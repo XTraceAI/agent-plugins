@@ -41,16 +41,32 @@
         "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/cursor_capture.cmd\" sessionEnd"
       }
     ],
+    "subagentStart": [
+      {
+        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/cursor_capture.cmd\" subagentStart"
+      }
+    ],
+    "subagentStop": [
+      {
+        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/cursor_capture.cmd\" subagentStop"
+      }
+    ],
     "preToolUse": [
       {
-        "matcher": "Read|Task",
+        "matcher": "Read|Task|Write|Edit|StrReplace|MultiEdit|search_replace",
         "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/cursor_capture.cmd\" preToolUse"
       }
     ],
     "postToolUse": [
       {
-        "matcher": "Task",
+        "matcher": "Task|Shell|Write|Edit|StrReplace|MultiEdit|search_replace",
         "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/cursor_capture.cmd\" postToolUse"
+      }
+    ],
+    "postToolUseFailure": [
+      {
+        "matcher": "Shell",
+        "command": "\"${CURSOR_PLUGIN_ROOT}/hooks/cursor_capture.cmd\" postToolUseFailure"
       }
     ],
     "beforeReadFile": [

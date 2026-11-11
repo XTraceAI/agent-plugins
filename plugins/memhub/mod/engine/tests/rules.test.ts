@@ -67,6 +67,7 @@ const feedEvent = (e: Dict): FeedEvent => ({
   filePath: (e.file_path as string) ?? '',
   ok: (e.ok as boolean | null) ?? null,
   armed: (e.armed as string | null) ?? null,
+  ran: (e.ran as boolean | null) ?? null,
 })
 
 /** Python's ordering_feed helper, in TS. Throws "waiting" when shell.ts is the stub. */

@@ -105,6 +105,57 @@ def _call_text(name, tool_input):
     return f"{name}: {' '.join(what.split())}"
 
 
+_CODEX_CALLS = ("function_call", "custom_tool_call", "local_shell_call")
+_CODEX_RESULTS = ("function_call_output", "custom_tool_call_output")
+
+
+def _codex_text(content):
+    if isinstance(content, str):
+        return content
+    return "\n".join(str(b.get("text") or "") for b in content or [] if isinstance(b, dict))
+
+
+def _codex_record(hx, p, groups, kept, redact):
+    """One Codex rollout `response_item`, read newest first like a Claude
+    record: the person's prompt ends the walk (the turn, as `_read` returns
+    it); an agent message, call or result is one group. Returns the turn or the
+    new `kept` count."""
+    if not isinstance(p, dict):
+        return kept
+    pt, role = p.get("type"), p.get("role")
+    if pt == "message" and role == "user":
+        try:
+            import rulebook_moments  # noqa: PLC0415 — beside this file
+            text = (rulebook_moments.codex_prompt(p) or "").strip()
+        except Exception:
+            text = ""
+        if not text or hx.is_harness_text(text):
+            return kept                        # injected context, not the person
+        person = _cut(text, PERSON_CHARS, redact)
+        turn = [{"kind": "person", "text": person}] if person else []
+        for entries in reversed(groups):
+            turn.extend(entries)
+        tid = p.get("id")
+        return {"turn_id": tid if isinstance(tid, str) else "",
+                "person_request": person, "turn": turn[-MAX_ENTRIES:]}
+    if kept >= MAX_ENTRIES:
+        return kept
+    entries = []
+    if pt == "message" and role == "assistant":
+        _add(entries, "agent", _codex_text(p.get("content")).strip(), AGENT_CHARS, redact)
+    elif pt in _CODEX_CALLS:
+        what = p.get("input") or p.get("arguments") or p.get("action") or ""
+        what = what if isinstance(what, str) else json.dumps(what, default=str)
+        _add(entries, "call", f"{p.get('name') or pt}: {' '.join(what.split())}", CALL_CHARS, redact)
+    elif pt in _CODEX_RESULTS:
+        body = _codex_text(p.get("output"))
+        _add(entries, "result", " | ".join(body[:RESULT_CHARS * _SLACK].splitlines()),
+             RESULT_CHARS, redact)
+    if entries:
+        groups.append(entries)
+    return kept + len(entries)
+
+
 def _lines(path):
     """The transcript's lines, or its tail's. A cut first line is dropped."""
     size = os.path.getsize(path)
@@ -149,6 +200,12 @@ def _read(hx, lines, redact):
         if not isinstance(rec, dict):
             continue
         kind = rec.get("type")
+        if kind == "response_item":                  # a Codex rollout
+            got = _codex_record(hx, rec.get("payload"), groups, kept, redact)
+            if isinstance(got, dict):
+                return got
+            kept = got
+            continue
         if kind == "attachment":
             att = rec.get("attachment")
             if (isinstance(att, dict) and att.get("type") == "hook_additional_context"

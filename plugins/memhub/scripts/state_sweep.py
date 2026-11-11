@@ -40,10 +40,18 @@ go at any age:
 A lock file goes only while the sweep holds its lock, and only when the file
 it guards is gone: every locker re-checks after acquiring that it locked the
 file now at the path (`portable_lock.still_at`), so deleting one cannot let
-two holders in. codexflush/ and cursorflush/ are left alone — Cursor's state
-pins first-seen timestamps that a later import re-applies — and so is the
-rulebook's fire ledger, which the flush lane uploads and rotates itself, under
-its own locks (`rulebook_ledger.rotate`).
+two holders in. codexflush/ and cursorflush/ session state is left alone —
+Cursor's state pins first-seen timestamps that a later import re-applies — and
+so is the rulebook's fire ledger, which the flush lane uploads and rotates
+itself, under its own locks (`rulebook_ledger.rotate`). Only their agent sent
+caches go:
+
+  {codexflush,cursorflush}/<id>.agents
+                                     which agents of a session already landed
+                                     (agent_capture); goes once nothing of
+                                     that session was written for
+                                     `MAX_AGE_DAYS`. Losing one only re-sends
+                                     its agents, which the server dedups
 
 Fails open and silent, like every hook path. `--dry-run` prints what it would
 delete; `--force` ignores the once-a-day marker.
@@ -180,6 +188,16 @@ def sweep(now: float | None = None, dry: bool = False) -> list[Path]:
             for f in files:
                 if f.suffix == ".lock":
                     _unlink_lock(f, dry, gone)
+
+    # Codex and Cursor agent sent caches, with their session going idle
+    for host in ("codexflush", "cursorflush"):
+        d = state_root() / host
+        for cache in sorted(d.glob("*.agents")) if d.is_dir() else []:
+            sid = cache.name[:-len(".agents")]
+            files = [cache, *(p for p in d.glob(f"{sid}.*")
+                              if p.suffix != ".lock" and p != cache)]
+            if min(_age_days(f, now) for f in files) > MAX_AGE_DAYS:
+                _unlink(cache, dry, gone)
 
     # markdown capture bookkeeping and the pointer cache
     for pattern in ("mdcapture/memhub-md-capture-*.json",

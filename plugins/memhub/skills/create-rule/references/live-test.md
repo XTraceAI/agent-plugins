@@ -69,6 +69,13 @@ rule. Step 4b is mandatory, so that reads as "the rule never fired" and blocks
 filing a perfectly good rule. Verified: detached → `given_ok` returns False for
 `branch_rx: "^(main|master)$"`; on a named branch it evaluates normally.
 
+**When the rule asks about the session, most of it cannot be staged.** A
+`given.session` `context_tokens_gt`, `idle_seconds_gt` or `turn_tool_calls_gt`
+needs a context, a pause or a turn a short sub-agent never reaches; report that
+predicate as **unexercised** and treat the run as §4b.6 (ask before filing). A
+`repeat_count_gt` can be staged: have the sub-agent repeat the matching call
+past the count.
+
 **When the rule asks about the branch, name the branch to match.** Read the
 candidate's `given.repo.branch_rx`; the isolated branch is `worktree-agent-…`,
 so have the sub-agent's first call also `git checkout -b <matching-name>`
@@ -252,8 +259,9 @@ cannot be used here) and judge:
 
 - did the fire land where it could actually change what the agent did, or after
   the fact;
-- did the sub-agent disclose it as `📏 Rule fired: …` — this is also the
-  end-to-end check on fire disclosure;
+- for a gate, did the sub-agent disclose the block as `⛔️ Rule fired: …`; an
+  advisory fire is shown to nobody and announced by nobody, so the ledger row
+  above is its only trace unless the sub-agent credits the rule in a sentence;
 - did the fire change the behaviour, or did the agent acknowledge and proceed.
 
 State these as **observations with the evidence quoted**, and be explicit that

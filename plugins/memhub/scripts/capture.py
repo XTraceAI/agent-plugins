@@ -30,7 +30,12 @@ way the capture client sends it — for callers that need to name this session t
 the server and have no other way to learn it (`/memhub:link-pr`). It matches on
 the session's own working directory rather than trusting "newest .jsonl by
 mtime", and it REFUSES rather than guesses: two live sessions in one worktree
-is real, and picking the newer one would silently link the wrong one.
+is real, and picking the newer one would silently link the wrong one. When the
+host names its own session in the environment (``CLAUDE_CODE_SESSION_ID`` on
+Claude Code, ``CODEX_THREAD_ID`` on Codex) that id is exact and wins; both set
+at once is a nested session that cannot say which it is, so the cwd match
+decides. ``running_conversation_id`` is the same answer for callers that only
+want an id or nothing — ``save_artifact.py`` stamps it as ``session_id``.
 
 Every subcommand is stdlib-only and runs under bare python3; ``import`` runs
 ``import_session.py`` with the same interpreter that runs this script.
@@ -55,6 +60,7 @@ import pr_link  # noqa: E402
 import readers  # noqa: E402
 from redact import redact_text  # noqa: E402
 from readers import claude as claude_reader  # noqa: E402
+from readers import codex as codex_reader  # noqa: E402
 
 _IMPORT_SESSION = Path(__file__).resolve().parent / "import_session.py"
 
@@ -153,7 +159,60 @@ def _describe(row: dict, now: float) -> str:
             f"  {age}s ago  {row['cwd']}")
 
 
+# The host's own name for the running session, set in every shell it spawns.
+# Cursor exposes none to the agent's shell, so it always goes by the cwd match.
+_SESSION_ENV = (("claude", "CLAUDE_CODE_SESSION_ID"), ("codex", "CODEX_THREAD_ID"))
+
+
+def _env_session(env=None, host: str = "auto") -> dict | None:
+    """``{"host", "session_id"}`` from the host's own env var, or None.
+
+    Exactly one host must name a session: a Codex run inside Claude Code (or
+    the reverse) inherits the parent's variable beside its own, and nothing in
+    the environment says which one is running — the cwd match decides then.
+    """
+    env = os.environ if env is None else env
+    named = [(h, env.get(var, "").strip()) for h, var in _SESSION_ENV
+             if host in ("auto", h) and env.get(var, "").strip()]
+    if len(named) != 1:
+        return None
+    return {"host": named[0][0], "session_id": named[0][1]}
+
+
+def running_conversation_id(env=None, cwd: str | None = None,
+                            max_age_s: float = 1800.0) -> str | None:
+    """The running session's conversation id, or None when it is not certain.
+
+    The same answer as ``current`` with no refusal to report: an ambiguous or
+    missing session is None, so a caller that only decorates a write with it
+    (``save_artifact.py``'s ``session_id``) degrades to an unlinked save.
+    """
+    hit = _env_session(env) if cwd is None else None
+    if hit:
+        return pr_link.conversation_id_for(hit["host"], hit["session_id"])
+    target = _real(cwd or os.getcwd())
+    if target is None:
+        return None
+    now = time.time()
+    rows = _candidates(list(readers.READERS), target, max_age_s, now)
+    if not rows or len({r["host"] for r in rows}) > 1:
+        return None
+    if any(rows[0]["mtime"] - (r["mtime"] or 0) <= _TIE_WINDOW_S for r in rows[1:]):
+        return None
+    return pr_link.conversation_id_for(rows[0]["host"], rows[0]["session_id"])
+
+
 def cmd_current(args) -> int:
+    hit = None if args.cwd else _env_session(host=args.host)
+    if hit:
+        conv_id = pr_link.conversation_id_for(hit["host"], hit["session_id"])
+        if args.json:
+            print(json.dumps({"conversation_id": conv_id, "session_id": hit["session_id"],
+                              "host": hit["host"], "source": "env"}))
+        else:
+            print(conv_id)
+            print(hit["host"])
+        return 0
     now = time.time()
     target = _real(args.cwd or os.getcwd())
     if target is None:
@@ -274,11 +333,42 @@ def _session_sid(meta: dict, path: Path) -> str:
     return path.parent.name if path.name == "store.db" else path.stem
 
 
+def codex_child_refusal(path: Path) -> str | None:
+    """Why a Codex rollout must not be imported on its own, or None.
+
+    A sub-agent's rollout (a ``thread_spawn`` child or a /review thread) is
+    part of its root's session: the live hook sends it as
+    ``codex-<root>/agent-<child>``, linked to ``codex-<root>``. Imported by
+    itself it would land as a separate ``codex-<child>`` session — the
+    duplicate agent capture exists to prevent."""
+    try:
+        meta = codex_reader._session_meta([codex_reader._session_header(path, strict=False)])
+    except (OSError, ValueError):
+        return None
+    link = codex_reader.spawn_link(meta)
+    if link is None:
+        return None
+    root = link["parent"]
+    try:
+        import codex_agents  # noqa: PLC0415 — beside this file
+        root = codex_agents.child_root(path) or root
+    except Exception:  # noqa: BLE001 — the immediate parent still names it
+        pass
+    return (f"{path} is a sub-agent of codex-{root} ({link['kind']}); "
+            f"import that session instead (live capture sends its agents with it; "
+            f"importing an agent on its own is not supported)")
+
+
 def cmd_import(args) -> int:
     r, path, err = _resolve(args)
     if r is None:
         print(f"ERROR: {err}", file=sys.stderr)
         return 2
+    if r.HOST == codex_reader.HOST:
+        refusal = codex_child_refusal(path)
+        if refusal:
+            print(f"ERROR: {refusal}", file=sys.stderr)
+            return 2
 
     passthrough: list[str] = []
     if args.title:

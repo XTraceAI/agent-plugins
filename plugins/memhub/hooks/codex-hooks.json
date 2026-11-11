@@ -29,7 +29,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|Bash|shell|local_shell|exec_command|shell_command|mcp__.*[Gg]it[Hh]ub.*__.*)$",
+        "matcher": "^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|Bash|shell|local_shell|exec_command|shell_command|mcp__.*[Gg]it[Hh]ub.*__.*|mcp__.+__link_pr)$",
         "hooks": [
           {
             "type": "command",

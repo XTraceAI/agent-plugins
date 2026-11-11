@@ -1,5 +1,5 @@
 {
-  "description": "MemHub compatibility hooks for Codex releases without plugin-bundled hook loading.",
+  "description": "MemHub hooks for Codex. Codex 0.163 removed plugin-bundled hook loading, so these user-level hooks are the only MemHub hooks Codex runs.",
   "hooks": {
     "SessionStart": [
       {
@@ -10,6 +10,19 @@
             "command": "python3 \"${CODEX_HOME:-$HOME/.codex}/memhub_hook_bridge.py\" dispatch SessionStart",
             "commandWindows": "py -3 \"%CODEX_HOME%\\memhub_hook_bridge.py\" dispatch SessionStart",
             "statusMessage": "MemHub: orienting this session"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 8,
+            "command": "python3 \"${CODEX_HOME:-$HOME/.codex}/memhub_hook_bridge.py\" dispatch UserPromptSubmit",
+            "commandWindows": "py -3 \"%CODEX_HOME%\\memhub_hook_bridge.py\" dispatch UserPromptSubmit",
+            "statusMessage": "MemHub: checking team rules"
           }
         ]
       }
@@ -50,6 +63,19 @@
             "timeout": 30,
             "command": "python3 \"${CODEX_HOME:-$HOME/.codex}/memhub_hook_bridge.py\" dispatch Stop",
             "commandWindows": "py -3 \"%CODEX_HOME%\\memhub_hook_bridge.py\" dispatch Stop"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 3,
+            "command": "python3 \"${CODEX_HOME:-$HOME/.codex}/memhub_hook_bridge.py\" dispatch SessionEnd",
+            "commandWindows": "py -3 \"%CODEX_HOME%\\memhub_hook_bridge.py\" dispatch SessionEnd",
+            "statusMessage": "MemHub: closing the session"
           }
         ]
       }

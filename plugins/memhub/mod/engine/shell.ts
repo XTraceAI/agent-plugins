@@ -36,6 +36,7 @@
 //     The caller runs `command_root`/`repo_info` on a non-null answer.
 //   * `redact_identities` reads this machine's home: `redactIdentities(text, home)`.
 
+import { redactSecrets as redactSecretsPorted } from '../redact'
 import { pyExec, pyFinditer, pyMatch } from './py'
 import { pyCompile, pySearch } from './pyre'
 
@@ -993,9 +994,10 @@ const HOME_DIR_RX = new RegExp(
 const EMAIL_RX = new RegExp(`[${W_BODY}.+\\-]+@[${W_BODY}\\-]+(?:\\.[${W_BODY}\\-]+)+`, 'gu')
 const jsEscape = (s: string): string => s.replace(/[.*+?^${}()|[\]\\/-]/g, '\\$&')
 
-/** redact.redact_text(text): MemHub keys (`mhk_`/`xtk_`), prefix kept. */
+/** redact.redact_text(text): the server's credential rules (`redact_secrets`,
+ *  ported in ../redact.ts), a vendor prefix kept as a breadcrumb. */
 export function redactText(text: string): string {
-  return text.replace(MEMHUB_KEY_RX, '$1<redacted>')
+  return redactSecretsPorted(text)
 }
 
 /** redact.redact_identities(text): home directories to `~`, e-mail
@@ -1131,6 +1133,25 @@ export function expandPath(token: unknown, here: string, env: Env): string {
     t = join(here, t)
   }
   return normpath(t)
+}
+
+/** Every segment of `shell` (already shell-only), split outside quotes on
+ *  any separator, as [separator before it, segment] ('' before the first),
+ *  blank segments dropped — rulebook_moments._pieces. */
+export function allSegments(shell: string): [string, string][] {
+  const blank = blankQuoted(shell)
+  const map = u2c(blank)
+  const cps = Array.from(shell)
+  const out: [string, string][] = []
+  let pos = 0
+  let sep = ''
+  for (const m of blank.matchAll(SEPARATOR_RX)) {
+    out.push([sep, cps.slice(pos, map[m.index!]).join('')])
+    pos = map[m.index! + m[0].length]!
+    sep = m[0]
+  }
+  out.push([sep, cps.slice(pos).join('')])
+  return out.filter(([, p]) => pyStrip(p) !== '')
 }
 
 /** `_call_segments(cmd)`: [separator before, segment] split outside quotes. */

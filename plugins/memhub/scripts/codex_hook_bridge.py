@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stable user-hook trampoline for Codex releases without plugin hooks.
+"""Stable user-hook trampoline: the only MemHub hooks Codex runs (0.163 removed plugin hooks).
 
 The onboard skill (``setup_codex_hooks.py install``) copies this file to ``$CODEX_HOME/memhub_hook_bridge.py``.
 User-level hooks can then survive plugin upgrades: this trampoline resolves the
@@ -27,7 +27,7 @@ _EDIT_TOOLS = {"Edit", "MultiEdit", "Write", "NotebookEdit", "apply_patch"}
 _SHELL_TOOLS = {"Bash", "shell", "local_shell", "exec_command", "shell_command"}
 _ARTIFACT_TIMEOUT_S = 7
 _PR_LINK_TIMEOUT_S = 15
-# SessionStart runs three children in parallel under one 8 s handler budget.
+# SessionStart runs four children in parallel under one 8 s handler budget.
 # Each is stdlib-only and network-free on its synchronous path (the rulebook
 # lane's one blocking fetch is capped at SESSION_FETCH_TIMEOUT_S = 1 s and
 # only happens on a stale book); the budgets below are ceilings, not costs.
@@ -43,6 +43,11 @@ _HEALTH_TIMEOUT_S = 5  # compatibility + bounded release lookup, inside the 8s h
 # shell and edit tools only, because widening it costs the user a re-trust of
 # a file already in ~/.codex/hooks.json.
 _GITHUB_MCP_RX = re.compile(r"(?i)^mcp__.*github.*__")
+# MemHub's own `link_pr`: a `pr_type="fix"` link earns the bug-origin
+# instruction (MemHub-Backend pr-weight-success-spec.md §7.1). Same anchor as
+# `pr_link.is_memhub_link_pr`; only the bundled manifest routes it here, the
+# compatibility bridge is not widened for the same re-trust reason as above.
+_MEMHUB_LINK_PR_RX = re.compile(r"^mcp__.+__link_pr$")
 
 
 # OBSERVED, not reasoned about: `codex plugin add` (Codex 0.154.0, local path
@@ -154,6 +159,27 @@ def resolve_plugin_root() -> Path | None:
                 return root
 
     codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    # Onboard records the selected install. Follow its cache across upgrades;
+    # never silently switch backend if that install has disappeared.
+    try:
+        settings = json.loads((codex_home / "memhub_hook_bridge.settings.json").read_text(encoding="utf-8"))
+        root = Path(settings["plugin_root"]).expanduser()
+        if settings.get("plugin_cache_dir"):
+            versions = [p for p in Path(settings["plugin_cache_dir"]).expanduser().glob("*")
+                        if (p / "scripts" / "codex_flush.py").is_file()]
+            if not versions:
+                return None
+            root = max(versions, key=_version_key)
+        if (root / "scripts" / "codex_flush.py").is_file():
+            cli = settings.get("codex_cli")
+            if cli and Path(cli).is_file():
+                os.environ["MEMHUB_CODEX_CLI"] = cli
+            return root
+        return None
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
     cache = codex_home / "plugins" / "cache"
     for marketplace, plugin in _KNOWN_INSTALLS:
         versions = [
@@ -281,9 +307,10 @@ def _dispatch_post(root: Path, payload: bytes, hook: dict) -> None:
     jobs = [lambda: _rulebook_result(root, payload, "post")]
     if tool in _EDIT_TOOLS:
         jobs.append(lambda: _artifact_sync_result(root, payload))
-    # The MCP branch needs no byte scan — the tool NAME is the filter.
+    # The MCP branches need no byte scan — the tool NAME is the filter.
     if (tool in _SHELL_TOOLS and _may_touch_github(hook)) or (
-            isinstance(tool, str) and _GITHUB_MCP_RX.match(tool)):
+            isinstance(tool, str) and (_GITHUB_MCP_RX.match(tool)
+                                       or _MEMHUB_LINK_PR_RX.match(tool))):
         jobs.append(lambda: _pr_link_result(root, payload))
     if tool in _SHELL_TOOLS:
         _fail_open_job(lambda: _detach_flush(root, payload, "PostToolUse"))
@@ -323,7 +350,7 @@ def _rulebook_result(root: Path, payload: bytes, mode: str) -> subprocess.Comple
     # reported under the bare uuid can never be joined to it (ENG-1075).
     return _run(root, "rulebook_hook.py", _rulebook_payload(payload),
                 "codex-pre" if mode == "pre" else mode, "--host", "codex",
-                timeout=_SESSION_TIMEOUT_S if mode == "session" else 7)
+                timeout=_SESSION_TIMEOUT_S if mode in ("session", "prompt") else 7)
 
 
 def _merge_results(results, event: str) -> None:
@@ -372,10 +399,37 @@ def _dispatch(root: Path, payload: bytes, event: str) -> None:
                          timeout=_SESSION_TIMEOUT_S),
             lambda: _run(root, "capture_health.py", payload, "--host", "codex",
                          "--plugin-root", str(root), timeout=_HEALTH_TIMEOUT_S),
+            lambda: _run(root, "harness_stop.py", payload, "relay", timeout=_SESSION_TIMEOUT_S),
         ]
-        with ThreadPoolExecutor(max_workers=3) as executor:
+        with ThreadPoolExecutor(max_workers=4) as executor:
             results = list(executor.map(_fail_open_job, jobs))
         _merge_results(results, event)
+    elif event == "UserPromptSubmit":
+        # Claude's three UserPromptSubmit lanes, as its manifest runs them:
+        # `prompt` rules and prompt-armed ordering, the advisory a `reply` rule
+        # left at the last Stop, and the brain brief. Codex 0.163's input
+        # carries `prompt`; its output takes additionalContext + systemMessage.
+        jobs = [
+            # Shares the synchronous hook budget; native execution waits for it.
+            lambda: _run(root, "compare_session.py", payload, "checkpoint", timeout=4),
+            lambda: _rulebook_result(root, payload, "prompt"),
+            lambda: _run(root, "rulebook_reply.py", payload, "deliver", "--host", "codex",
+                         timeout=_SESSION_TIMEOUT_S),
+            lambda: _run(root, "brain_brief.py", payload, "prompt",
+                         timeout=_SESSION_TIMEOUT_S),
+            # What a background rule drafter filed since the last prompt.
+            lambda: _run(root, "harness_stop.py", payload, "relay", timeout=_SESSION_TIMEOUT_S),
+        ]
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            results = list(executor.map(_fail_open_job, jobs))
+        _merge_results(results, event)
+    elif event == "SessionEnd":
+        # The session's last `flush final`: closes the last turn's fires with a
+        # `session_end` event, as Claude's SessionEnd route does. Codex caps a
+        # SessionEnd hook at 3 s (and reports a longer timeout as an error), so
+        # the upload runs detached and outlives the hook.
+        _fail_open_job(lambda: _detach_script(root, payload, "rulebook_hook.py", "flush",
+                                              "final", "--host", "codex"))
     elif event == "PreToolUse":
         # The rulebook is the only PreToolUse lane. It still goes through
         # _fail_open_job + _merge_results so a crash or an unparseable
@@ -386,18 +440,83 @@ def _dispatch(root: Path, payload: bytes, event: str) -> None:
         _dispatch_post(root, payload, hook)
     elif event == "Stop":
         _detach_flush(root, payload, "Stop")
+        # Classification and drafting are informational work. Neither should
+        # hold up the user's turn or publish a flag-time notification.
+        sensor_payload = dict(hook)
+        try:
+            sensor_payload["memhub_transcript_bytes"] = Path(hook["transcript_path"]).stat().st_size
+        except (OSError, KeyError, TypeError):
+            pass
+        _fail_open_job(lambda: _detach_script(
+            root, json.dumps(sensor_payload).encode(), "harness_stop.py", "stop", "--host", "codex"))
+        # The `reply` rules (rulebook_reply.py), BEFORE the flush below so a
+        # fire they record ships with this Stop. Only a Stop's own fields are
+        # relayed: a block decision with its reason, and the person's line.
+        answers = [_stop_doc(_fail_open_job(lambda: _rulebook_result(root, payload, "reply")))]
         # --host codex here too. The flush lane used to only SHIP rows that
         # already carried their host, so it needed none; #240 made it also
         # CREATE the turn_end/session_end events, and without this they are
         # namespaced `claude` while this session's fires are namespaced
         # `codex` — observed live, and the server folds by (org, session_id),
         # so every one of them folded into nothing.
-        _fail_open_job(lambda: _run(root, "rulebook_hook.py", payload,
-                                    "flush", "final", "--host", "codex",
-                                    timeout=7))
+        # The remaining policy lanes retain their synchronous Stop behavior.
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            executor.submit(_fail_open_job, lambda: _run(
+                root, "rulebook_hook.py", payload, "flush", "final", "--host", "codex",
+                timeout=7))
+            quarantine = executor.submit(_fail_open_job, lambda: _run(
+                root, "rulebook_quarantine.py", payload, "stop", "--host", "codex", timeout=7))
+        # A file a shell command wrote that a gate rule matched afterwards is
+        # quarantined (rulebook_quarantine.py): its answer — `decision: block`
+        # with a reason, or a `systemMessage` — is the bridge's only Stop
+        # output, so it is relayed as is. Codex 0.160's Stop input carries
+        # `stop_hook_active` and `turn_id` (both required in its
+        # stop.command.input schema), and its output takes `decision: block`
+        # + reason — read from the binary's strings, not from a live run.
+        # `turn_id` is the quarantine's turn key here (a rollout transcript
+        # has no Claude Code turn records), so a Stop blocks once per turn
+        # even if `stop_hook_active` never arrives.
+        answers.append(_stop_doc(quarantine.result()))
+        # Codex reads ONE JSON answer from a Stop hook: every lane folds into it.
+        out = {}
+        reasons = [a["reason"] for a in answers if a.get("decision") == "block"]
+        if reasons:
+            out.update(decision="block", reason="\n\n".join(reasons))
+        notes = [a["systemMessage"] for a in answers if a.get("systemMessage")]
+        if notes:
+            out["systemMessage"] = "\n".join(notes)
+        if out:
+            print(json.dumps(out))
+
+
+def _stop_doc(result: subprocess.CompletedProcess | None) -> dict:
+    """A Stop lane's own fields — a block with its reason, the person's line —
+    or {} for no answer or one that is not a JSON object."""
+    if result is None:
+        return {}
+    if isinstance(result.stderr, bytes) and result.stderr:
+        sys.stderr.buffer.write(result.stderr)
+    try:
+        doc = json.loads(result.stdout or b"{}")
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(doc, dict):
+        return {}
+    out = {}
+    if doc.get("decision") == "block" and isinstance(doc.get("reason"), str) and doc["reason"]:
+        out.update(decision="block", reason=doc["reason"])
+    if isinstance(doc.get("systemMessage"), str) and doc["systemMessage"]:
+        out["systemMessage"] = doc["systemMessage"]
+    return out
 
 
 def _detach_flush(root: Path, payload: bytes, event: str) -> None:
+    _detach_script(root, payload, "codex_flush.py", event)
+
+
+def _detach_script(root: Path, payload: bytes, script: str, *args: str) -> None:
+    """Run a plugin script in its own session, fed `payload` from a temp file
+    the child removes, and return at once."""
     handle = tempfile.NamedTemporaryFile(
         prefix="memhub-codex-hook-", suffix=".json", delete=False
     )
@@ -405,9 +524,9 @@ def _detach_flush(root: Path, payload: bytes, event: str) -> None:
         handle.write(payload)
         handle.close()
         wrapper = (
-            "import os,subprocess,sys; p=sys.argv[3]; "
+            "import os,subprocess,sys; p=sys.argv[-1]; "
             "f=open(p,'rb'); "
-            "subprocess.run([sys.executable,sys.argv[1],sys.argv[2]],stdin=f,"
+            "subprocess.run([sys.executable,*sys.argv[1:-1]],stdin=f,"
             "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
             "f.close(); os.unlink(p)"
         )
@@ -426,7 +545,7 @@ def _detach_flush(root: Path, payload: bytes, event: str) -> None:
             kwargs["start_new_session"] = True
         subprocess.Popen(
             [sys.executable, "-c", wrapper,
-             str(root / "scripts" / "codex_flush.py"), event, handle.name],
+             str(root / "scripts" / script), *args, handle.name],
             **kwargs,
         )
     except Exception:

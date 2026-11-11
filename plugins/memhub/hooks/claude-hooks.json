@@ -80,7 +80,7 @@
         ]
       },
       {
-        "matcher": "^(Bash|mcp__.*[Gg]it[Hh]ub.*__.*)$",
+        "matcher": "^(Bash|mcp__.*[Gg]it[Hh]ub.*__.*|mcp__.+__link_pr)$",
         "hooks": [
           {
             "type": "command",
@@ -155,6 +155,15 @@
         "hooks": [
           {
             "type": "command",
+            "timeout": 5,
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/hook_entry.py\" UserPromptSubmit rewind_checkpoint"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
             "timeout": 8,
             "statusMessage": "MemHub: delivering pending branch memory pointers",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/hook_entry.py\" UserPromptSubmit brain_brief"
@@ -168,6 +177,15 @@
             "timeout": 5,
             "statusMessage": "MemHub: arming team rules on this prompt",
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/hook_entry.py\" UserPromptSubmit rulebook_hook"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 5,
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/hook_entry.py\" UserPromptSubmit rulebook_reply"
           }
         ]
       }
@@ -215,6 +233,24 @@
             "type": "command",
             "timeout": 10,
             "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/hook_entry.py\" Stop harness_stop"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/hook_entry.py\" Stop rulebook_reply"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 5,
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/hook_entry.py\" Stop rulebook_quarantine"
           }
         ]
       }

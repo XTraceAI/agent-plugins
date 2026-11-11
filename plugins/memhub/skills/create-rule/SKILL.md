@@ -130,9 +130,7 @@ add `"requires_prior_rx": "<X>"` to the body — the line then shows
 people who already complied, so use the `ordering` shape (step 3) or make it
 `session_context`. The row's `rule_evidence` is step 5's `evidence` (Read
 `${CLAUDE_PLUGIN_ROOT}/skills/create-rule/references/labels.md`). If N is 0 across
-all hosts, say so before filing — insurance, not lift. The example scores
-`applies-in 0/855`: insurance; the rule it replaces scores 66/855, nagging
-people's own force-pushes. For many rules from sessions, use
+all hosts, say so before filing — insurance, not lift. For many rules from sessions, use
 `/memhub:start-rulebook`.
 
 ### 2. Duplicate check — by eye now, deterministically in step 5
@@ -152,22 +150,24 @@ text to vary. Keep the reply: step 5 checks it deterministically.
 twin you must not re-file, the default view hides retired rules, and step 5's
 script skips them too — this read is the only check that sees them. `limit` is
 200 at most; on `has_more`, ask again with `offset` and concatenate `rules`
-first, or the comparison silently misses whatever fell off the first page.
+first, or the comparison misses whatever fell off the first page.
 
 ### 3. Draft the rule — one delivery, one engine block
 
 | the rule is… | `delivery` | engine block |
 |---|---|---|
 | a Bash command with a checkable form | `agent_hook` | `matcher: {event: "bash", command_rx, command_not_rx?, warn_once_per}` |
-| an edit/write to certain paths or content — by the Edit/Write tools OR by a Bash command that writes it (heredoc, `write_text()`, `sed -i`; one the command shows can gate, others only advise) | `agent_hook` | `matcher: {event: "edit", path_rx, path_not_rx?, content_rx?, content_not_rx?}` — `content_not_rx` exempts the complied-with form |
+| an edit/write to certain paths or content — by the Edit/Write tools OR by a Bash command that writes it (heredoc, `write_text()`, `sed -i`; one the command shows can gate, others quarantine) | `agent_hook` | `matcher: {event: "edit", path_rx, path_not_rx?, content_rx?, content_not_rx?}` — `content_not_rx` exempts the complied-with form |
 | a failing or noteworthy tool output | `agent_hook` | `matcher: {event: "output", content_rx, command_rx?, content_not_rx?}` |
 | a file about to be read into the agent's context — the Read tool, OR a `cat`/`head`/`tail`/`less`/`more`/`sed` on a path in a Bash command (not piped, not redirected; `cd`-relative paths resolve) | `agent_hook` | `matcher: {event: "read", path_rx?, path_not_rx?, command_not_rx?, given: {file: {lines_gt}, agent: {main}}}` — needs `path_rx` or `given.file`, or it fires on every file |
 | "run X after edits, before Y" | `agent_hook` | `ordering: {required_command_rx, gated_command_rx, armed_by_events, path_rx?, min_edits, display_name}` — `path_rx` limits which edits arm it |
-| "run X once a session, before Y" — X is not owed to an edit, it is owed to the session (`git fetch` before reading `origin/*`) | `agent_hook` | the same `ordering` block with `armed_by_events: ["session"]`: armed at session start, discharged by one green X, and re-armed for the next session |
-| "when the person asks about Z, do X before answering" (probe staging before answering a staging question) | `agent_hook` | the same `ordering` block with `armed_by_events: ["prompt"]` **and** `armed_by_rx` — the pattern the prompt must match. Without `armed_by_rx` the rule arms on nothing; only what a person TYPED arms it, never a slash command's body or a loop wake-up |
-| when a wake-up or background notification arrives — a `/loop` tick, a monitor event, a `<task-notification>` — and the rule is about what the agent says next | `agent_hook` | `matcher: {event: "prompt", prompt_rx, prompt_not_rx?, warn_once_per}` + `min_hook_version: "0.99.0"`. Matched against the RAW prompt, harness wrappers included (`<command-message>loop</command-message>`, `<task-notification>`, `<<autonomous-loop`). **Advise only** — the prompt is already sent, so there is nothing to block and the server refuses `mode: "gate"`. `given` takes `agent` and `repo` only |
+| "run X once a session, before Y" — X is owed to the session, not an edit (`git fetch` before reading `origin/*`) | `agent_hook` | the same `ordering` block with `armed_by_events: ["session"]`: armed at session start, discharged by one green X |
+| "when the person asks about Z, do X before answering" (probe staging before answering) | `agent_hook` | the same `ordering` block with `armed_by_events: ["prompt"]` **and** `armed_by_rx` — the pattern the prompt must match. Without `armed_by_rx` the rule arms on nothing; only what a person TYPED arms it, never a slash command's body or a loop wake-up |
+| "after command X, run Y before Z" (`git mv` → tests before `git push`) | `agent_hook` | the same `ordering` block with `armed_by_events: ["command"]` **and** `armed_by_command_rx`; a failed X arms nothing |
+| when a wake-up or background notification arrives — a `/loop` tick, a monitor event, a `<task-notification>` — and the rule is about what the agent says next | `agent_hook` | `matcher: {event: "prompt", prompt_rx, prompt_not_rx?, warn_once_per}` + `min_hook_version: "0.99.0"`. Matched against the RAW prompt, harness wrappers included (`<command-message>loop</command-message>`, `<task-notification>`, `<<autonomous-loop`). **Advise only** — the prompt is already sent, so there is nothing to block and the server refuses `mode: "gate"`. `given` takes `agent`, `repo`, `session` |
+| a claim in the agent's FINAL reply ("merged", "tests pass") a command of the turn must back | `agent_hook` | `matcher: {event: "reply", reply_rx, evidence_command_rx?}` + 0.137.0 |
 | applies when a file / symbol / command is in play, but the form isn't checkable | `anchor_recall` | `anchors: [identifiers]` — matched whole, case-sensitive, in the command or path (so never `spec`, `pytest` or text with spaces); the judge decides fit |
-| worldview with no trigger at all | `session_context` | none — at session start the hook shows at most 15 such notes in about 3,300 characters, shared across every book that binds the person (at 400-character statements that is about 8); prefer a checkable shape when one exists, because advice shown in-flight is acted on far more often than advice shown at session start |
+| worldview with no trigger at all | `session_context` | none — at session start the hook shows at most 15 such notes in about 3,300 characters, shared across every book that binds the person; prefer a checkable shape when one exists, because advice shown in-flight is acted on far more often than advice shown at session start |
 
 Plus on every rule:
 - `title` — short, imperative, under 60 characters (200 max).
@@ -183,8 +183,9 @@ Plus on every rule:
 - `categories` — zero or more; see labels.md (step 1b).
 
 **A rule that needs a newer hook.** The server sets `min_hook_version` where
-the shape implies one (0.54.0 for a session- or prompt-armed ordering, 0.88.0
-for a pattern over 400 characters, 0.99.0 for a prompt matcher) and refuses a
+the shape implies one (session/prompt-armed ordering 0.54.0, a pattern over
+400 chars 0.88.0, a prompt matcher 0.99.0; command-armed ordering,
+`given.session` and a reply matcher 0.137.0) and refuses a
 lower value; pass it only for another newer key. An older hook runs the rule
 (or a key it does not know) as ADVICE, never a gate, and says so once per
 session.
@@ -192,15 +193,14 @@ session.
 **Advise, or stop the command?** A rule advises by default. `mode: "gate"`
 denies the matching call — only when the user's own words ask for a block
 ("stop me", "don't let me"), and it **stops everyone the rule applies to**.
-Before drafting a gate, or a `given` block (branch, diff, what the user said,
-file size, main agent vs subagent), Read
+Before drafting a gate, a `given` block (branch, diff, what the user said,
+file size, main agent vs subagent, session) or a `reply` rule, Read
 `${CLAUDE_PLUGIN_ROOT}/skills/create-rule/references/gate-and-given.md`.
 
 **Also say what the rule PREVENTS.** `predicts_rx` (a `matcher` key) is a
 pattern over tool output naming the failure the rule exists to stop — the
-example's `\(forced update\)`, a traceback, a 409. It lets a fire be scored as
-a catch, not a nag; write it now, while the war story is fresh; skip it when
-the violation prints nothing.
+example's `\(forced update\)`, a traceback, a 409. It scores a fire as a
+catch, not a nag; write it now; skip it when the violation prints nothing.
 
 **Matcher-authoring rules:**
 - **A heredoc body is not the command.** Bash rules match the shell text before
@@ -228,9 +228,8 @@ the violation prints nothing.
   where each occurrence matters (force-push). `file` behaves as `session`.
 - **Never anchor a `command_rx` with `^`.** Real commands arrive chained and
   prefixed: `cd .. && gh pr create`, `(cd pkg && git push)`, `env CI=1 pytest`.
-  A pattern anchored at the start of the string matches none of them, and the
-  rule fires for some people and not others — the worst failure: it looks
-  like the rule working. Don't
+  A `^`-anchored pattern matches none of them, so the rule fires for some
+  people and not others — and looks like it works. Don't
   anchor at command position either — `(?:^|[;&|(]\s*)` still misses
   `env CI=1 git push` and fires inside `Bash(git push:*)`. Use a word boundary
   (`\bgit\s+push\b`) and let the quoted-span `command_not_rx` handle mentions.
@@ -302,10 +301,11 @@ that needs `given.repo.branch_rx` (gate-and-given.md).
 (The verifier and the replay ignore `when` / `do` / `why` / `when_not`.)
 
 Other shapes take other case syntax — a `read` rule (`read:<path>`,
-`bash:<command>`, `--file-lines`), an `edit` rule (`path::content`), a `given`
+`bash:<command>`, `--file-lines`), an `edit` rule (`path::content`; `wrote:` for a gate), a `given`
 block (`--branch`, `--diff-path`, `--user-said`, `--cases`), an `ordering`
-rule (steps joined by ` >> `, armed by `session` / `prompt:` / `edit:`), an
-`event: "output"` rule (`command::output`), an `event: "prompt"` matcher. For any of those, Read `${CLAUDE_PLUGIN_ROOT}/skills/create-rule/references/verify-recipes.md` for the exact form.
+rule (steps joined by ` >> `, armed by `session` / `prompt:` / `edit:` /
+`ok:<cmd>`), an
+`event: "output"` rule (`command::output`), a `prompt` or `reply` matcher, a gate `edit` rule's quarantine. For any of those, Read `${CLAUDE_PLUGIN_ROOT}/skills/create-rule/references/verify-recipes.md` for the exact form.
 
 It exits non-zero until every case behaves. **Do not file a rule while it
 exits non-zero, and show the table to the user.** What each line means:
@@ -420,29 +420,10 @@ rule, `mode: "gate"` if the user asked for a rule that stops the command, and
 A replacement (`supersedes_rule_id`) stays in the scope of the rule it
 replaces, so send it without `scope`. No `author` when a person asked for the rule
 (`nomination` included): they wrote it, and an unset author reads as the
-owner — only a harness draft passes `author="xtrace"`. Read the reply:
-
-- `unchanged: true` → the rule is already in the book (a retried call);
-  nothing new is filed, though differing `when` / `do` / `why` / `when_not`
-  and `evidence` are written onto the existing row. On a retry, reuse the
-  first filing's `source_ref` byte for byte (only an `@<sha>` and a `#…` tail
-  are ignored), or name its `rule_id` in `supersedes_rule_id`.
-- **Refused as a duplicate** (`This rulebook already has a rule with the same
-  title|trigger: "<title>" (rule_id <id>, <status>)`) → nothing was written.
-  If it is the same rule, file again with `supersedes_rule_id: <id>`; if it is
-  a different rule, retitle it (same title) or tell the user (same trigger).
-- `status: "proposed"` + `supersedes_rule_id` → filed as a replacement for
-  the rule you named; it retires that rule when a reviewer activates it.
-- `status: "proposed"` with no `supersedes_rule_id` → new, awaiting review.
-- `category_invalid` / `evidence_invalid` → labels.md, *Refused*.
-- A scope refusal (`This organisation's plan doesn't include workspaces…`,
-  `That workspace is locked…`, `No workspace with that id…`, `That's the
-  organisation's main workspace…`) → nothing was written. Tell the user in
-  one line and file again with the scope step 0 rule 3 or 4 gives. `A replacement stays in the
-  same scope…` → file it again without `scope`. `A personal rulebook only
-  takes its owner's own rules…` → the rule you meant to replace is someone
-  else's personal rule: tell the user, and file it only as a new rule (no
-  `supersedes_rule_id`) if they want one.
+owner — only a harness draft passes `author="xtrace"`. Read the reply with
+`${CLAUDE_PLUGIN_ROOT}/skills/create-rule/references/filing-replies.md`: what each
+answer (`unchanged`, a duplicate or scope refusal, a replacement) means and
+what to do next.
 
 **A rule that replaces another inherits what it does not name.** With
 `supersedes_rule_id`, any of `when` / `when_not` / `do` / `why` you leave out
@@ -493,4 +474,8 @@ to. Name any `cross_book` collision here too, under **Conflicts to resolve**.
 For a gate, add: once activated it stops that command for everyone it applies
 to, and each of them can still run it with `RULEBOOK_OVERRIDE='<why>'` in
 front (an edit gate takes a `rulebook-override[<rule>]: <why>` marker in the
-content instead).
+content instead). A `reply` gate blocks no command: it holds the agent's Stop,
+once a turn, until the claim is backed or retracted.
+A gate `edit` rule that matches a file only after a shell command wrote it
+blocks `git commit`, `git push`, `gh pr create` and the Stop until the file
+is fixed (gate-and-given.md, quarantine).

@@ -19,6 +19,7 @@ PLUGIN_ROOT = SCRIPT_DIR.parent
 BRIDGE_SOURCE = PLUGIN_ROOT / "references" / "codex-hooks-bridge.json"
 RUNNER_SOURCE = SCRIPT_DIR / "codex_hook_bridge.py"
 _RUNNER_NAME = "memhub_hook_bridge.py"
+_SETTINGS_NAME = "memhub_hook_bridge.settings.json"
 # Where the bridge's lanes leave files: codex_flush's per-session state, locks
 # and log, capture_health's per-session marker, and the trampoline's own
 # breadcrumb (codex_hook_bridge._STATE_DIR). Codex runs a user hook only after
@@ -195,6 +196,21 @@ def _handler_actions(doc: dict) -> Counter:
     return actions
 
 
+def _record_selection(home: Path) -> bool:
+    """Remember the package onboard selected, keeping any explicit CLI pin."""
+    path = home / _SETTINGS_NAME
+    previous = _load_json(path)
+    selected = dict(previous, plugin_root=str(PLUGIN_ROOT))
+    selected.pop("plugin_cache_dir", None)
+    # .../plugins/cache/<marketplace>/<plugin>/<version>
+    if PLUGIN_ROOT.parent.parent.parent.name == "cache":
+        selected["plugin_cache_dir"] = str(PLUGIN_ROOT.parent)
+    if selected == previous:
+        return False
+    _write_atomic(path, selected)
+    return True
+
+
 def install(home: Path) -> tuple[bool, int, Path | None]:
     hooks_path = home / "hooks.json"
     runner_path = home / _RUNNER_NAME
@@ -211,6 +227,10 @@ def install(home: Path) -> tuple[bool, int, Path | None]:
     # missing or stale bridge.
     if runner_changed:
         _copy_runner(runner_path)
+    # The mark names the plugin whose runner is in place: written with a copy,
+    # or when none was recorded, never just because an install ran.
+    if _plugin_version() and (runner_changed or not _read_mark(home)):
+        _write_mark(home, _plugin_version())
     if changed and hooks_path.exists() and merged != current:
         fd, backup_name = tempfile.mkstemp(
             prefix=f"hooks.json.memhub-backup-{time.strftime('%Y%m%d-%H%M%S')}-",
@@ -222,7 +242,93 @@ def install(home: Path) -> tuple[bool, int, Path | None]:
     if merged != current:
         old_mode = stat.S_IMODE(hooks_path.stat().st_mode) if hooks_path.exists() else 0o600
         _write_atomic(hooks_path, merged, old_mode)
-    return changed, _handler_count(bridge), backup
+    # A failed runner/hook write must not switch an existing bridge's backend.
+    selection_changed = _record_selection(home)
+    return changed or selection_changed, _handler_count(bridge), backup
+
+
+_VERSION_NAME = "memhub_hook_bridge.version"
+
+
+def _plugin_version() -> tuple[int, ...]:
+    for manifest in (PLUGIN_ROOT / ".codex-plugin" / "plugin.json", PLUGIN_ROOT / "plugin.json"):
+        try:
+            raw = str(json.loads(manifest.read_text(encoding="utf-8")).get("version") or "")
+            return tuple(int(p) for p in raw.split(".")[:3])
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+    return ()
+
+
+def _read_mark(home: Path) -> tuple[int, ...]:
+    try:
+        raw = (home / _VERSION_NAME).read_text(encoding="utf-8").strip()
+        return tuple(int(p) for p in raw.split(".")[:3])
+    except (OSError, ValueError):
+        return ()
+
+
+def _write_mark(home: Path, version: tuple[int, ...]) -> None:
+    """Atomically: a concurrent session start reading a half-written mark
+    would take it for "no mark" and let an older plugin through."""
+    mark = home / _VERSION_NAME
+    fd, tmp = tempfile.mkstemp(prefix=f".{mark.name}.", dir=home)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(".".join(map(str, version)))
+        os.replace(tmp, mark)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+def upkeep(home: Path) -> str | None:
+    """Session-start upkeep of an installed bridge (capture_health runs it on
+    Codex). Codex 0.163 loads no plugin hooks, so the copied runner is the only
+    MemHub code Codex starts, and nothing else ever updated it: a plugin
+    upgrade left every install on its first runner — no reply or quarantine
+    Stop lane on a 0.137 plugin, seen live.
+
+    The runner is refreshed in place only when this plugin is NEWER than the
+    one that last wrote it (`memhub_hook_bridge.version`), or no plugin
+    recorded one. Prod and staging installs share the file: a strict "newer"
+    keeps two installs of one version, or an older one, from rewriting each
+    other's copy on every session start. Codex trusts a handler by its
+    hooks.json entry, not by the script it names (a changed runner ran
+    without a new review, live), so a refresh needs no re-trust. A handler
+    this plugin added since the install is NOT written: that one needs the
+    person's review, so it is only reported.
+
+    Returns a line for the person, or None. Never raises."""
+    try:
+        current = _load_json(home / "hooks.json")
+    except Exception:  # noqa: BLE001 — upkeep never fails a session start
+        return None
+    if not _handler_count(current):
+        return None                             # never installed: onboard's to offer
+    ours, theirs = _plugin_version(), _read_mark(home)
+    if not ours or (theirs and ours < theirs):
+        return None                             # a newer plugin owns this install
+    try:
+        runner = home / _RUNNER_NAME
+        if (not theirs or ours > theirs) and (
+                not runner.exists() or runner.read_bytes() != RUNNER_SOURCE.read_bytes()):
+            _copy_runner(runner)
+            _write_mark(home, ours)
+        if not (home / _SETTINGS_NAME).exists():
+            _record_selection(home)
+    except Exception:  # noqa: BLE001 — a failed refresh still reports below
+        pass
+    try:
+        bridge = _bridge_for_home(_load_json(BRIDGE_SOURCE), home)
+        missing = set(_handler_actions(bridge)) - set(_handler_actions(current))
+    except Exception:  # noqa: BLE001
+        return None
+    if not missing:
+        return None
+    events = ", ".join(sorted({event for event, *_ in missing}))
+    return (f"MemHub: this Codex install lacks newer MemHub hooks ({events}), so "
+            f"some team rules cannot run. Run {_onboard_command()} again, then "
+            f"trust the new MemHub handlers in /hooks.")
 
 
 def uninstall(home: Path) -> bool:
@@ -230,7 +336,7 @@ def uninstall(home: Path) -> bool:
     runner_path = home / _RUNNER_NAME
     current = _load_json(hooks_path)
     cleaned = remove_hooks(current)
-    changed = cleaned != current or runner_path.exists()
+    changed = cleaned != current or runner_path.exists() or (home / _SETTINGS_NAME).exists()
     if cleaned != current:
         # `remove` must be a true inverse of `install`. On a machine that had no
         # hooks.json, writing `{"hooks": {}}` leaves a file the user never had —
@@ -242,6 +348,8 @@ def uninstall(home: Path) -> bool:
             old_mode = stat.S_IMODE(hooks_path.stat().st_mode) if hooks_path.exists() else 0o600
             _write_atomic(hooks_path, cleaned, old_mode)
     runner_path.unlink(missing_ok=True)
+    (home / _VERSION_NAME).unlink(missing_ok=True)
+    (home / _SETTINGS_NAME).unlink(missing_ok=True)
     return changed
 
 

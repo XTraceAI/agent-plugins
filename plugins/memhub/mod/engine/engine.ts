@@ -57,6 +57,14 @@
 //     non-error result as exit 0: a deliberate divergence. The lane vectors
 //     pin it: `ordering-gate-receipt-without-exit-code` stays blocked in the
 //     Python and is allowed here (tests/lanes.test.ts, MOD_DIVERGES);
+//   * a session with an open QUARANTINE (rulebook_quarantine.py: a gate-mode
+//     edit rule matched a file a Bash command had already written) hands
+//     every Bash call, and every edit of a quarantined file, to Python
+//     (QuarantineHandoff, both halves, like a foreign repo): the door checks,
+//     the re-checks and the override that closes one are Python's alone. The
+//     mod only OPENS one, in its post lane, through rulebook_mod_state.py. The
+//     session's dedup state is not re-read after such a hand-off, so an
+//     advisory Python fired meanwhile can fire once more here;
 //   * any other exception is Python's `except BaseException: rc = 0`: the call
 //     gets nothing (no gate, no advice), and this call's state changes are
 //     dropped, as an unsaved Python state file drops them.
@@ -110,12 +118,19 @@ export const ADVISE_FEEDBACK_HINT =
   "`RULEBOOK_OVERRIDE='[<label>] <why>' <command>` — so the reason is recorded against " +
   'that rule instead of silence._'
 
+/** rulebook_hook.py `CREDIT_NOTE`, byte for byte: an advisory fire is shown to nobody. */
+export const CREDIT_NOTE =
+  '_These are not shown to the user and need no announcement. If following one changes ' +
+  'what you do — you do something the user did not ask for, or hold back from something ' +
+  'they asked for — one plain sentence saying it was a team rule from the MemHub Rulebook ' +
+  'tells them why._'
+
 export const SESSION_PREAMBLE =
   "These are your team's engineering rules — standing instructions from your teammates, " +
   "carrying the same weight as this repo's CLAUDE.md. Follow them as you would CLAUDE.md: " +
-  'they are how this team works, not suggestions to weigh. When one fires, you MUST disclose ' +
-  'it to the user on its own line, exactly `📏 Rule fired: <the rule, in 20 words or fewer>`, ' +
-  'before anything else in that reply.'
+  'they are how this team works, not suggestions to weigh. They need no announcement: when ' +
+  'following one changes what you do, one plain sentence saying it was a team rule from the ' +
+  'MemHub Rulebook tells the user why.'
 
 /** A call in a checkout of another repo than the book's: Python serves it. */
 export class ForeignRepoError extends Error {
@@ -124,6 +139,24 @@ export class ForeignRepoError extends Error {
     this.name = 'ForeignRepoError'
   }
 }
+
+/**
+ * The session has a file in quarantine (rulebook_quarantine.py): Python
+ * serves this call whole, as for a foreign repo, since only it decides a door,
+ * re-checks a file and closes a violation on an override.
+ */
+export class QuarantineHandoff extends ForeignRepoError {
+  constructor(open: number) {
+    super('', '')
+    this.message = `${open} file(s) in quarantine: Python serves this call`
+    this.name = 'QuarantineHandoff'
+  }
+}
+
+/** rulebook_quarantine.OPEN_MSG, verbatim: the detail a quarantining fire carries. */
+export const QUARANTINE_OPEN_MSG =
+  'this file is now QUARANTINED — committing, pushing, opening a PR and ending ' +
+  'the turn are blocked until it no longer matches this rule'
 
 /** The book holds a rule pyre cannot run: the lane must be Python's. */
 export class UnportableRuleError extends Error {
@@ -304,6 +337,8 @@ type Ev = {
   read: Dict | null
   /** The worktree a synthetic edit's file is in, when not the call's. */
   root?: string
+  /** A post-lane synthetic edit: the file is new (untracked / added), not modified. */
+  new?: boolean
 }
 
 type Ctx = {
@@ -330,6 +365,8 @@ class RulebookEngine implements Engine {
   private loaded = false
   private unportable: string[] = []
   private sessions = new Map<string, SessionState>()
+  /** quarantined(): the session file's open quarantine files, as of its (mtime, size). */
+  private quarantineSeen = new Map<string, { mtimeMs: number; size: number; files: string[] }>()
   private repos: Repos
 
   constructor(private io: EngineIO) {
@@ -340,7 +377,8 @@ class RulebookEngine implements Engine {
     this.rules = rules.map((r) => ({ ...r }))
     this.repo = meta.repo
     this.loaded = true
-    this.unportable = rules.filter((r) => truthy(r._unportable) && r.on !== 'session').map((r) => r.id)
+    // A `reply` rule runs only in Python's Stop lane (rulebook_reply.py), never here.
+    this.unportable = rules.filter((r) => truthy(r._unportable) && r.on !== 'session' && r.on !== 'reply').map((r) => r.id)
   }
 
   // ── shared plumbing ──────────────────────────────────────────────────────
@@ -529,13 +567,16 @@ class RulebookEngine implements Engine {
     })
     const ok = ev.resp !== null ? bashOk(ev.resp, rule.mode === 'gate') : null
     const armedArg = typeof armed === 'string' ? armed : armed === undefined ? null : (armed as string | null)
-    const local = engine.feed(rule, { hookPhase: ev.order_phase, tool: ev.tool, cmd: ev.cmd, filePath: ev.fp, ok, armed: armedArg })
+    // `ran`: the lenient answer — a command-armed rule arms on a call that did
+    // not fail (rulebook_moments.command_arms), whatever the rule's mode.
+    const ran = ev.resp !== null ? bashOk(ev.resp, false) : null
+    const local = engine.feed(rule, { hookPhase: ev.order_phase, tool: ev.tool, cmd: ev.cmd, filePath: ev.fp, ok, armed: armedArg, ran })
     if (!wrote) return local
     delete rule._gate_msg
     delete rule._legacy_fires
     const r = await this.io.state([{
       op: 'feed', root, rule: this.rules.find((x) => x.id === rule.id) ?? rule, hook_phase: ev.order_phase, tool: ev.tool,
-      cmd: ev.cmd, file_path: ev.fp, ok, armed: armedArg,
+      cmd: ev.cmd, file_path: ev.fp, ok, armed: armedArg, ran,
     }], cwd)
     cache.delete(path)
     const got = r?.[0]
@@ -718,6 +759,7 @@ class RulebookEngine implements Engine {
     if (!info) throw new ForeignRepoError('', this.repo)
     if (e.tool === 'Bash') await this.foreignTargets(e.cwd, typeof inp.command === 'string' ? inp.command : '', vars)
     const base = await this.baseOf(info.root)
+    if (mode === 'pre') await this.quarantined(e, inp, base)
     const st = await this.state(e.sessionId, base)
     const saved = cloneState(st)
     try {
@@ -728,6 +770,40 @@ class RulebookEngine implements Engine {
       this.sessions.set(e.sessionId, saved)
       return { context: [], fires: [], ledger: [] }
     }
+  }
+
+  /**
+   * Throws QuarantineHandoff when the session has an open violation this call
+   * may touch. The violations live in the session file, which Python's lanes
+   * (a door's close, an override, a call Python served) and the mod's own
+   * `quarantine` op change; this engine never writes it otherwise. So the file
+   * is stat'ed per call and read and parsed only when its (mtime, size)
+   * changed since the last read: a session that never opened one costs a stat.
+   */
+  private async quarantined(e: CallEvent, inp: Dict, base: string): Promise<void> {
+    if (e.tool !== 'Bash' && !EDIT_TOOLS.includes(e.tool)) return
+    const path = join(base, 'state', sessionFileName(e.sessionId))
+    const fst = await this.io.stat(path)
+    if (!fst || fst.kind !== 'file') {
+      this.quarantineSeen.delete(path)
+      return
+    }
+    let seen = this.quarantineSeen.get(path)
+    if (!seen || seen.mtimeMs !== fst.mtimeMs || seen.size !== fst.size) {
+      const text = await this.io.readText(path)
+      let doc: unknown
+      try {
+        doc = text === undefined ? undefined : JSON.parse(text)
+      } catch {
+        doc = undefined
+      }
+      const q = isDict(doc) && isDict(doc.quarantine) ? doc.quarantine : {}
+      seen = { mtimeMs: fst.mtimeMs, size: fst.size, files: Object.values(q).filter(isDict).map((v) => pyStr(v.file ?? '')) }
+      this.quarantineSeen.set(path, seen)
+    }
+    const files = seen.files
+    if (!files.length) return
+    if (e.tool === 'Bash' || files.includes(strOf(inp, 'file_path'))) throw new QuarantineHandoff(files.length)
   }
 
   private async callInner(
@@ -756,6 +832,7 @@ class RulebookEngine implements Engine {
     }
     const turns = this.turns()
     const probes = new Probes(io, probeRoot, probeBranch, cmdText, agentId, turns, cwd, env.baseBranch ?? '')
+    probes.call = { session, hookEvent: mode === 'pre' ? 'PreToolUse' : 'PostToolUse', toolUseId: ctx.tool_use_id ?? null }
 
     await this.refreshArmings(st, session, base, rules)
     const droppedArmings: string[] = []
@@ -850,7 +927,7 @@ class RulebookEngine implements Engine {
           for (const [path, isNew, wt] of await this.bashWrittenFiles(root, cmd, t0, also)) {
             const text = await this.readEditBody(path, isNew)
             if (text === null) continue
-            events.push({ tool: 'Write', phase: 'pre', order_phase: 'post', cmd: '', fp: path, body: text, rtext: '', resp: null, via: 'bash', read: null, root: wt })
+            events.push({ tool: 'Write', phase: 'pre', order_phase: 'post', cmd: '', fp: path, body: text, rtext: '', resp: null, via: 'bash', read: null, root: wt, new: isNew })
           }
         }
       }
@@ -968,7 +1045,7 @@ class RulebookEngine implements Engine {
           if (preWritten.some(([a, b]) => a === rid && b === realFp)) continue
         }
         let scope = has(r, 'fire_scope') ? r.fire_scope : 'session'
-        if (ephase === 'pre' && r.mode === 'gate' && (ev.via === null || ev.via === 'bash-read' || ev.via === 'bash-pre') &&
+        if (ephase === 'pre' && r.mode === 'gate' && (ev.via === null || ev.via === 'bash' || ev.via === 'bash-read' || ev.via === 'bash-pre') &&
             ((etool === 'Bash' && r.on === 'bash') || (EDIT_TOOLS.includes(etool) && r.on === 'edit') ||
               (READ_TOOLS.includes(etool) && r.on === 'read'))) {
           scope = 'call'
@@ -976,7 +1053,7 @@ class RulebookEngine implements Engine {
         if (typeof scope !== 'string') throw new TypeError("'NoneType' object has no attribute 'startswith'")
         const key = !scope.startsWith('branch') ? rid : `${rid}:${branch}`
         const matched = evaluate(r, { hookPhase: ephase, tool: etool, cmd: ecmd, filePath: efp, body: ebody, resultText: ev.rtext, added: ev.added ?? null }) &&
-          (await givenOk(r, probes, ev.read))
+          (await givenOk(r, probes, ev.read, [ecmd, efp]))
         if (scope !== 'call' && !scope.startsWith('counter') && st.fired.includes(key)) {
           if (matched) st.raw[rid] = (st.raw[rid] ?? 0) + 1
           continue
@@ -1038,6 +1115,19 @@ class RulebookEngine implements Engine {
       unfire(st, r, dedupKeys[r.id], marks, fresh.has(r.id))
     }
     firedNow = firedNow.filter((r) => !held.has(r.id))
+
+    // rulebook_quarantine.on_call, post: a gate edit rule's late match opens a
+    // violation (through the Python's lock) and says so on its line.
+    if (mode === 'post') {
+      const open: { rule_id: string; file: string; root: string; new: boolean }[] = []
+      for (const r of firedNow) {
+        const ev = firedOn.get(r.id)
+        if (r.mode !== 'gate' || r.on !== 'edit' || ev?.via !== 'bash') continue
+        open.push({ rule_id: pyStr(r.id), file: ev.fp, root: ev.root || '', new: ev.new ?? true })
+        r._gate_msg = QUARANTINE_OPEN_MSG
+      }
+      if (open.length) await io.state([{ op: 'quarantine', session, open }], cwd).catch(() => undefined)
+    }
 
     const dismiss = (d: ReadonlyMap<string, string>): [[string, string][], [string, number][]] => {
       const [resolved, ambiguous] = d.size ? resolveDismissals(rules, d) : [[], []]
@@ -1166,10 +1256,13 @@ class RulebookEngine implements Engine {
       }
       if (note) lines.push(note)
       const line = disclosureLine(r, blockedHere)
-      const f: Fire = { ruleId: r.id, label, line, mode: gateIds.has(r.id) ? 'gate' : 'advise', text }
+      // 'gate' is what the person is shown (act.ts): a gate that judged this call, or a
+      // fire that put a file in quarantine. Everything else is advice, shown to nobody.
+      const shownToPerson = gateIds.has(r.id) || r._gate_msg === QUARANTINE_OPEN_MSG
+      const f: Fire = { ruleId: r.id, label, line, mode: shownToPerson ? 'gate' : 'advise', text }
       out.fires.push(f)
     }
-    if (shown.some((r) => !gateIds.has(r.id))) lines.push(ADVISE_FEEDBACK_HINT)
+    if (shown.some((r) => !gateIds.has(r.id))) lines.push(ADVISE_FEEDBACK_HINT, CREDIT_NOTE)
     if (blocked) {
       const still = gates.filter((r) => !(r.id in overridden))
       let how: string
@@ -1289,6 +1382,7 @@ class RulebookEngine implements Engine {
     const env: EngineEnv = await this.io.env().catch(() => ({}))
     const ctx: Ctx = { session, agent_id: null, repo, branch, tool: 'UserPromptSubmit', worktree: worktreeKey(root) }
     const probes = new Probes(this.io, root, branch, '', null, this.turns(), cwd, env.baseBranch ?? '')
+    probes.call = { session, hookEvent: 'UserPromptSubmit', toolUseId: null }
     const fired: HookRule[] = []
     const dedupKeys: Record<string, string> = {}
     const marks: Marks = { fired: [...st.fired], counts: { ...st.counts }, spec_pending: { ...st.spec_pending } }
@@ -1323,7 +1417,7 @@ class RulebookEngine implements Engine {
       }
       out.fires.push({ ruleId: r.id, label, line: disclosureLine(r), mode: 'advise', text: pyStr(r.text) })
     }
-    lines.push(ADVISE_FEEDBACK_HINT)
+    lines.push(ADVISE_FEEDBACK_HINT, CREDIT_NOTE)
     out.context.push(lines.join('\n'))
     const firedAt = this.iso(this.nowUs())
     const raw: Record<string, unknown> = Object.fromEntries(sorted.map((r) => [r.id, st.raw[r.id] ?? null]))

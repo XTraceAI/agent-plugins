@@ -407,6 +407,13 @@ async def flush(session_id: str, cwd: str | None = None) -> None:
                     "tags": [TAG],
                     "rationale": f"auto-captured from session {session_id[:8]} ({p.name}); "
                                  f"re-save with save_artifact.py to publish",
+                    # The session that wrote it, so the draft shows on that
+                    # session's Contents tab. This hook runs only on Claude
+                    # Code, whose conversation id is the bare session id. A
+                    # draft saved before the session's first capture lands
+                    # unlinked (the reply's `note`); a later edit is a new
+                    # version and carries the link.
+                    "session_id": session_id,
                 }
                 if root is not None:
                     # Cache first; on a miss, resolve from the server

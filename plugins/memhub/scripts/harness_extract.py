@@ -194,8 +194,60 @@ def turns_from_transcript(path, start: int = 0, before: int = 0) -> list[dict]:
     return read_transcript(path, start, before)[0]
 
 
-def read_transcript(path, start: int = 0, before: int = 0) -> tuple[list[dict], str]:
-    """A Claude Code .jsonl → turns. A turn is one human message plus
+def _records(fh, name: str, start: int, byte_limit: int = 0):
+    """`(position, record)` for each record from `start` on. A Claude Code
+    transcript's position is the byte its line starts at. A Codex rollout
+    (`rollout-*.jsonl`) is first turned into the same Claude-shaped records
+    (readers.codex.rollout_to_claude_records, as capture does) and a record's
+    position is its index there: a resume point saved from one read means the
+    same record on the next."""
+    if name.startswith("rollout-"):
+        rows = []
+        consumed = 0
+        for raw in fh:
+            consumed += len(raw)
+            if byte_limit and consumed > byte_limit:
+                break
+            try:
+                row = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+        try:
+            from readers.codex import rollout_to_claude_records  # noqa: PLC0415
+            records, _ = rollout_to_claude_records(rows)
+        except Exception as exc:
+            # Zero turns judge nothing: say why, once per read, never silently.
+            try:
+                with open(log_path("stop.log"), "a", encoding="utf-8") as fh:
+                    fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} read {name[:60]}: "
+                             f"rollout not converted ({type(exc).__name__})\n")
+            except OSError:
+                pass
+            return
+        for i, rec in enumerate(records):
+            if i >= start and isinstance(rec, dict):
+                yield i, rec
+        return
+    if start > 0:
+        fh.seek(start)
+    pos = max(start, 0)
+    for raw in fh:
+        here, pos = pos, pos + len(raw)
+        line = raw.decode("utf-8", errors="replace").strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict):
+            yield here, rec
+
+
+def read_transcript(path, start: int = 0, before: int = 0, byte_limit: int = 0) -> tuple[list[dict], str]:
+    """A Claude Code .jsonl (or a Codex rollout, `_records`) → turns. A turn is one human message plus
     everything the agent did before the next one; tool results arrive as
     `user` records and belong to the turn in progress. Each turn carries
     `offset`, the byte its human message starts at, so a caller holding a
@@ -204,6 +256,9 @@ def read_transcript(path, start: int = 0, before: int = 0) -> tuple[list[dict], 
     `start` seeks to a byte where a human message begins and `before` is how
     many turns precede it, so a reader resuming from a cursor numbers turns
     exactly as a full read would.
+
+    `byte_limit` freezes a Codex rollout at a Stop boundary while a detached
+    classifier runs, even if the next user turn has already been appended.
 
     Also returns the uuid of the LAST prompt of any kind: the person's, a loop
     wakeup, a task notification. A Stop is the end of the turn that prompt
@@ -216,18 +271,7 @@ def read_transcript(path, start: int = 0, before: int = 0) -> tuple[list[dict], 
     names: dict[str, str] = {}
     inputs: dict[str, dict] = {}
     with open(path, "rb") as fh:
-        if start > 0:
-            fh.seek(start)
-        pos = max(start, 0)
-        for raw in fh:
-            start, pos = pos, pos + len(raw)
-            line = raw.decode("utf-8", errors="replace").strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except ValueError:
-                continue
+        for start, rec in _records(fh, os.path.basename(str(path)), start, byte_limit):
             kind = rec.get("type")
             content = (rec.get("message") or {}).get("content")
             att = rec.get("attachment") if kind == "attachment" else None

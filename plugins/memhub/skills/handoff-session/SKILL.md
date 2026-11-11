@@ -1,7 +1,7 @@
 ---
 description: Use when the user wants to hand their current work to one or more teammates so they can pick it up (e.g. "hand this off to Alice", "hand off this session to Bob", "pass this work to Carol and Dan", "share my context with Alice so she can continue", "write a handoff for Bob"). Writes a handoff brief — goal, current state, decisions, next steps, gotchas — into a shared agent brain the teammates search from their own agent. The same set of people always reuses one standing handoff brain, so the history between them stays in one place; a separate one-off brain only when asked. The session transcript itself is never shared.
 argument-hint: "<teammate>[, <teammate>...] [title...] [--new]"
-allowed-tools: 'Bash(git config user.name), Bash(git remote get-url origin), mcp__plugin_memhub_memhub__list_teammates, mcp__plugin_memhub-staging_memhub__list_teammates, mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub_memhub__list_agent_brain_access, mcp__plugin_memhub-staging_memhub__list_agent_brain_access, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub_memhub__save_artifact, mcp__plugin_memhub-staging_memhub__save_artifact, mcp__plugin_memhub_memhub__share_agent_brain, mcp__plugin_memhub-staging_memhub__share_agent_brain, mcp__plugin_memhub_memhub__list_orgs, mcp__plugin_memhub-staging_memhub__list_orgs'
+allowed-tools: 'Bash(git config user.name), Bash(git remote get-url origin), Bash(python3 "${CLAUDE_PLUGIN_ROOT}/scripts/capture.py" current *), mcp__plugin_memhub_memhub__list_teammates, mcp__plugin_memhub-staging_memhub__list_teammates, mcp__plugin_memhub_memhub__list_agent_brains, mcp__plugin_memhub-staging_memhub__list_agent_brains, mcp__plugin_memhub_memhub__list_agent_brain_access, mcp__plugin_memhub-staging_memhub__list_agent_brain_access, mcp__plugin_memhub_memhub__create_agent_brain, mcp__plugin_memhub-staging_memhub__create_agent_brain, mcp__plugin_memhub_memhub__save_artifact, mcp__plugin_memhub-staging_memhub__save_artifact, mcp__plugin_memhub_memhub__share_agent_brain, mcp__plugin_memhub-staging_memhub__share_agent_brain, mcp__plugin_memhub_memhub__list_orgs, mcp__plugin_memhub-staging_memhub__list_orgs'
 ---
 
 A handoff is one artifact: a brief you write from this conversation, uploaded
@@ -81,7 +81,15 @@ tool's schema offers it.
    `tags: ["handoff"]`, `topic: <the subject area of the work>` — an existing
    topic of the channel when one fits, a new one for a new area of work, else
    `"unsorted"`; a refusal lists the channel's topics
-   (`${CLAUDE_PLUGIN_ROOT}/references/topics.md`). A title already in the channel VERSIONS that brief —
+   (`${CLAUDE_PLUGIN_ROOT}/references/topics.md`), and `session_id: <this
+   session>` so the brief shows on this session's Contents tab in MemHub
+   Studio. Get it the way `/memhub:link-pr` does:
+   `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/capture.py" current --json` — on
+   exit 0 pass its `conversation_id` verbatim (bare on Claude Code,
+   `codex-…`/`cursor-…` elsewhere); on any other exit leave `session_id` out
+   and save anyway — never guess one, never hold the brief for it. A reply
+   `note` that the session is not captured yet means the brief saved
+   unlinked; say so in one line. A title already in the channel VERSIONS that brief —
    right for a follow-up on the same work, wrong for anything else, so make
    the title specific. First line: `From <you> to <teammate(s)>, <YYYY-MM-DD>`
    (plus `, repo <org>/<name>` in a repo). Then, tight:

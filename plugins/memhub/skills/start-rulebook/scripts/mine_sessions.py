@@ -482,9 +482,12 @@ def arming_lane(events):
     """Which lane arms this ordering rule — the miner's echo of `rulebook_hook.arms_on`.
     `session` wins over `prompt` for the same reason the engine's predicate does: a rule
     armed from session start is already armed when a prompt arrives. Anything else is the
-    edit family, which is also the engine's default for an absent `armed_by_events`."""
+    edit family, which is also the engine's default for an absent `armed_by_events` — or
+    `command` when a command arms it and no edit does (`armed_by_command_rx`, which
+    `replay_ordering` takes as `arm_rx`; an edit-and-command rule replays as `edit` with it)."""
     ev = [e for e in (events or []) if isinstance(e, str)]
-    return "session" if "session" in ev else "prompt" if "prompt" in ev else "edit"
+    return ("session" if "session" in ev else "prompt" if "prompt" in ev
+            else "command" if "command" in ev and not {"edit", "write"} & set(ev) else "edit")
 CONTEXT_KEYS = ("when", "when_not", "do", "why")   # what a candidate may say for the rule judge; carried to the row as `context`
 ANCHOR_CANDS = []   # rows that fire when a name comes up: --rule-file bodies carrying `anchors`; nothing is replayed for them
 bodies = []
@@ -541,7 +544,9 @@ for path, body in bodies:   # each joins the trigger it belongs to
         armed = arming_lane(o.get("armed_by_events"))
         if armed == "prompt" and not o.get("armed_by_rx"):   # `arms_on` arms a patternless prompt lane on nothing, so filing it would ship a rule that never fires
             print(f"[warn] --rule-file {path}: armed_by_events ['prompt'] needs armed_by_rx — the engine arms a patternless prompt lane on no prompt at all — skipped", file=sys.stderr); continue
-        ORDERING_CANDS.append({"title": body.get("title", path), "required_rx": o["required_command_rx"], "gated_rx": o["gated_command_rx"], "min_edits": min_edits, "armed_by": armed, "armed_by_rx": o.get("armed_by_rx"), **extra})   # noqa: E501 — one row per candidate
+        if "command" in (o.get("armed_by_events") or []) and not o.get("armed_by_command_rx"):
+            print(f"[warn] --rule-file {path}: armed_by_events ['command'] needs armed_by_command_rx — skipped", file=sys.stderr); continue
+        ORDERING_CANDS.append({"title": body.get("title", path), "required_rx": o["required_command_rx"], "gated_rx": o["gated_command_rx"], "min_edits": min_edits, "armed_by": armed, "armed_by_rx": o.get("armed_by_rx"), "armed_by_command_rx": o.get("armed_by_command_rx"), **extra})   # noqa: E501 — one row per candidate
     elif isinstance(body.get("anchors"), list) and body["anchors"]: ANCHOR_CANDS.append({"title": body.get("title", path), "anchors": body["anchors"], **extra})
     elif m.get("event") == "output": OUTPUT_CANDS.append({"title": body.get("title", path), "content_rx": m["content_rx"], **extra})
     elif m: RULE_CANDS.append({"title": body.get("title", path), "matcher": m, "requires_prior_rx": body.get("requires_prior_rx"), **extra})
@@ -720,14 +725,21 @@ def chain_receipt(shell, rx):
     return any(re.search(rx, seg) and "|" not in seg for seg in re.split(r"&&|\|\||;|\n", shell))
 
 
-def replay_ordering(required_rx, gated_rx, armed_by, min_edits=1):
+def replay_ordering(required_rx, gated_rx, armed_by, min_edits=1, arm_rx=None):
     """The obligation state machine over the corpus: how many sessions reached the gated
     command, and in how many of those the receipt was missing. Shared by the ORDERING
     candidates and by the rules already on, so a rule the book already carries is measured
-    the same way a proposal is."""
+    the same way a proposal is. `arm_rx` (a command-armed rule's `armed_by_command_rx`): a
+    call running it arms like an edit — read by the hook's own `command_arms`, and a call
+    that arms and runs the gated command at once is owed only when the hook's pre lane
+    (`arms_before_gate`) would gate it; offline the exit status is unknown, so a run counts."""
     T = V = Vany = 0; ex = []; ids = []
+    cspec = {"armed_by_events": ["command"], "armed_by_command_rx": arm_rx, "required_command_rx": required_rx,
+             "gated_command_rx": gated_rx} if arm_rx else None
+    ckw = {"executes": rh.executes, "receipt_segments": rh.receipt_segments, "unquoted": rh.unquoted,
+           "command_fires": rh.command_fires}
     for s_ in corpus:
-        edits = 0 if armed_by == "edit" else 1; receipt_ok = False; ran_any = False; gated = False; viol = False; violany = False
+        edits = 0 if armed_by in ("edit", "command") else 1; receipt_ok = False; ran_any = False; gated = False; viol = False; violany = False
         for cl in s_["calls"]:
             if cl["tool"] in EDIT:
                 if armed_by == "edit": edits += 1; receipt_ok = False; ran_any = False
@@ -735,15 +747,21 @@ def replay_ordering(required_rx, gated_rx, armed_by, min_edits=1):
             cmd = cl["cmd"]
             if not cmd: continue
             shell = rh.shell_only(cmd); last = rh.last_segment(shell) if hasattr(rh, "last_segment") else shell
+            pre = edits   # the count the PRE lane sees, before this call arms anything
+            armed_now = bool(cspec) and bool(rh._rm().command_arms(shell, cspec, **ckw))
+            if armed_now:
+                edits += 1; receipt_ok = False; ran_any = False
+            # armed only by this very call: owed only if it runs the gated command after the arming
+            same_call = armed_now and pre < min_edits and not rh._rm().arms_before_gate(shell, cspec, **ckw)
             if re.search(required_rx, shell): ran_any = True
-            ok = (re.search(required_rx, last) and "|" not in last) if armed_by == "edit" else chain_receipt(shell, required_rx)
+            ok = (re.search(required_rx, last) and "|" not in last) if armed_by in ("edit", "command") else chain_receipt(shell, required_rx)
             if ok: receipt_ok = True; edits = 0   # exit status unknown offline: an unpiped run counts as the receipt
             if re.search(gated_rx, shell) and not (armed_by == "session" and re.search(required_rx, shell)):
                 gated = True
-                if edits >= min_edits and not receipt_ok:
+                if edits >= min_edits and not receipt_ok and not same_call:
                     viol = True
                     if len(ex) < 3: ex.append(sample(s_, cmd))
-                if edits >= min_edits and not ran_any: violany = True
+                if edits >= min_edits and not ran_any and not same_call: violany = True
         if gated: T += 1; V += viol; Vany += violany
         if viol: ids.append(s_["id"])
     return {"gated": T, "violations": V, "no_run_at_all": Vany, "samples": ex, "fired_ids": ids}
@@ -833,12 +851,12 @@ for r in live:
     if on in ("bash", "edit", "write_stdlib", "result"): _jobs.append((replay_result, (hr,)) if on == "result" else (replay, (hr,)))
     elif on == "ordering" and isinstance(hr.get("ordering"), dict):
         o = hr["ordering"]; lane = arming_lane(o.get("armed_by_events") or ["edit"])
-        if lane != "prompt": _jobs.append((replay_ordering, (o.get("required_command_rx") or "", o.get("gated_command_rx") or "", lane, o.get("min_edits", 1))))
+        if lane != "prompt": _jobs.append((replay_ordering, (o.get("required_command_rx") or "", o.get("gated_command_rx") or "", lane, o.get("min_edits", 1), o.get("armed_by_command_rx"))))
 for c in RULE_CANDS:
     hr = hook_rule(c["title"], c["matcher"])
     if hr: _jobs.append((replay, (hr, c.get("requires_prior_rx"))))
 for c in ORDERING_CANDS:
-    if c["armed_by"] != "prompt": _jobs.append((replay_ordering, (c["required_rx"], c["gated_rx"], c["armed_by"], c.get("min_edits", 1))))
+    if c["armed_by"] != "prompt": _jobs.append((replay_ordering, (c["required_rx"], c["gated_rx"], c["armed_by"], c.get("min_edits", 1), c.get("armed_by_command_rx"))))
 _t_replay = time.time(); _prefetch(_jobs)
 print(f"\n=== RULES ALREADY ON — {len(live)} hook rules in your book, replayed over your {M} past sessions (one that never fired is a retire candidate)")
 for r in live:
@@ -854,7 +872,7 @@ for r in live:
             # Same reason as the unknown lanes below: a 0 here would read as a retire signal for a rule the engine does arm.
             print(f"  {r['title']:28s} not replayable offline (prompt-armed ordering) — no signal either way")
         else:
-            res = replay_ordering(o.get("required_command_rx") or "", o.get("gated_command_rx") or "", lane, o.get("min_edits", 1))
+            res = replay_ordering(o.get("required_command_rx") or "", o.get("gated_command_rx") or "", lane, o.get("min_edits", 1), o.get("armed_by_command_rx"))
             flag = "  <- never fired: retire candidate" if not res["violations"] else ""
             print(f"  {r['title']:28s} fired in {res['violations']} sessions, of the {res['gated']} that reached the gated command{flag}")
     else:
@@ -871,10 +889,11 @@ for c in RULE_CANDS:
     rows.append(add({"trigger": "before_action", "title": c["title"], "predicate": c["matcher"], "did": c.get("did"), "what": c.get("what"), "claude_md_rx": c.get("claude_md_rx"), "quote_rx": c.get("quote_rx"), "claude_md_given": c.get("claude_md_given"), "context_given": context_of(c), "categories": c.get("categories"), "ceiling": c.get("ceiling"), **({"source_ref": c["source_ref"]} if c.get("source_ref") else {}), **res}))
 for c in ORDERING_CANDS:
     unscored = c["armed_by"] == "prompt"   # the session and edit lanes replay; a prompt lane has nothing offline to arm it
-    _o = {"gated": 0, "violations": 0, "no_run_at_all": 0, "samples": [], "fired_ids": []} if unscored else replay_ordering(c["required_rx"], c["gated_rx"], c["armed_by"], c.get("min_edits", 1))
+    _o = {"gated": 0, "violations": 0, "no_run_at_all": 0, "samples": [], "fired_ids": []} if unscored else replay_ordering(c["required_rx"], c["gated_rx"], c["armed_by"], c.get("min_edits", 1), c.get("armed_by_command_rx"))
     T, V, Vany, ex, ids = _o["gated"], _o["violations"], _o["no_run_at_all"], _o["samples"], _o["fired_ids"]
-    pred = {"ordering": {"required_command_rx": c["required_rx"], "gated_command_rx": c["gated_rx"], "armed_by_events": [c["armed_by"]], "min_edits": c.get("min_edits", 1), "display_name": c["title"],
-                         **({"armed_by_rx": c["armed_by_rx"]} if c.get("armed_by_rx") else {})}}
+    pred = {"ordering": {"required_command_rx": c["required_rx"], "gated_command_rx": c["gated_rx"], "armed_by_events": [c["armed_by"]] + (["command"] if c.get("armed_by_command_rx") and c["armed_by"] != "command" else []), "min_edits": c.get("min_edits", 1), "display_name": c["title"],
+                         **({"armed_by_rx": c["armed_by_rx"]} if c.get("armed_by_rx") else {}),
+                         **({"armed_by_command_rx": c["armed_by_command_rx"]} if c.get("armed_by_command_rx") else {})}}
     breakdown = f"{Vany} never ran it, {V - Vany} ran it piped so its exit code was lost" if V else ""
     rows.append(add({"trigger": "before_action", "title": c["title"], "predicate": pred, "did": c.get("did"), "what": c.get("what"), "claude_md_rx": c.get("claude_md_rx"), "quote_rx": c.get("quote_rx"), "claude_md_given": c.get("claude_md_given"), "context_given": context_of(c), "categories": c.get("categories"), "ceiling": c.get("ceiling"),
                      "fired": {"gated": T, "violations": V, "no_run_at_all": Vany}, "fired_n": V, "fired_ids": ids, "real_misses": None, "breakdown": breakdown,

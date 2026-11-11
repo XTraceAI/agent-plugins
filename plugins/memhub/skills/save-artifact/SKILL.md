@@ -16,6 +16,9 @@ that would regenerate the whole document token by token. This is a terminal
 operation, like `cat`-ing a file. Content you compose in-session and that
 lives nowhere on disk (a handoff brief) is the other case:
 there, calling `save_artifact` directly is fine — nothing is being re-emitted.
+Pass `session_id` on that direct call too: the `conversation_id` that
+`python3 "${CLAUDE_PLUGIN_ROOT}/scripts/capture.py" current --json` prints on
+exit 0 (on any other exit, leave it out and save anyway).
 
 Arguments: `$ARGUMENTS`
 - First token = the path to the file to store (required). If invoked without a
@@ -58,6 +61,11 @@ Do exactly this:
    server when the cache is empty (the script prints which room it used) — so
    it lands where teammates search without any extra flag. A file outside any
    repo goes to personal memory unless you pass `--agent-brain-id`.
+
+   It also links the save to the session running it (`session  :` in its
+   output), so the artifact shows on this session's Contents tab in MemHub
+   Studio — no flag needed. When the running session is not certain, the
+   save goes ahead unlinked.
 
    Optional flags when relevant: `--agent-brain-id <id>` to override the
    destination brain (its org is worked out from the id; `--org-id <org>` is

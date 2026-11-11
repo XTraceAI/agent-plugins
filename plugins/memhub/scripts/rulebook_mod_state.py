@@ -8,7 +8,8 @@ machine and must be written under the same lock they use:
   * ``state/wt-<worktree_key>.json`` — the per-checkout ordering obligations
     (``OrderingEngine``), shared by every session of the checkout;
   * ``state/<session>.json`` — the session's ARMINGS (``armed``,
-    ``armed_version``, ``armed_once``), shared with the Python lanes of the
+    ``armed_version``, ``armed_once``) and its open quarantine violations
+    (``quarantine``, rulebook_quarantine.py), shared with the Python lanes of the
     same session (a lane the mod released mid-session is served by Python,
     which must see what the mod armed, and the other way round).
 
@@ -22,15 +23,21 @@ are replaced atomically, so a lockless read never sees a torn file.
 
 ops (each answered in order, one result per op):
 
-  {"op": "feed", "root", "rule", "hook_phase", "tool", "cmd", "file_path", "ok", "armed"}
+  {"op": "feed", "root", "rule", "hook_phase", "tool", "cmd", "file_path", "ok", "armed", "ran"}
       → {"outcome", "gate_msg", "legacy_fires"}   OrderingEngine(root).feed(...)
   {"op": "arm", "session", "event", "prompt", "rules", "repo", "gitdir"}
       → {"armed": [rule ids]}                     arm_obligations(...)
   {"op": "drop", "session", "rule_ids"}
       → {}                                        drop_arming + save_state (delta merge)
+  {"op": "quarantine", "session", "open": [{"rule_id", "file", "root", "new"}]}
+      → {"opened": [keys]}                         rulebook_quarantine.record + save_state
   {"op": "specs", "root", "spec_dir", "paths"}
       → {"active": [spec paths], "untouched": [[spec path, [paths]]]}
                                                   Probes.untouched_specs over `paths`
+  {"op": "session", "session", "rule", "hook_event_name", "tool_use_id", "agent_id", "ev"}
+      → {"holds": bool}                           rulebook_session.mod_holds: a
+                                                  `given.session` rule whose pattern and
+                                                  other conditions matched (counts a repeat)
 
 stdout: one JSON line ``{"results": [...]}``; a failed op is ``{"error": "..."}``.
 Exit 0 unless stdin is unusable (2).
@@ -51,7 +58,8 @@ def _feed(rh, op):
     rule = dict(op["rule"])
     outcome = rh.OrderingEngine(op["root"], "*").feed(
         rule, hook_phase=op["hook_phase"], tool=op["tool"], cmd=op.get("cmd") or "",
-        file_path=op.get("file_path") or "", ok=op.get("ok"), armed=op.get("armed"))
+        file_path=op.get("file_path") or "", ok=op.get("ok"), armed=op.get("armed"),
+        ran=op.get("ran"))
     return {"outcome": outcome, "gate_msg": rule.get("_gate_msg"),
             "legacy_fires": rule.get("_legacy_fires")}
 
@@ -72,6 +80,17 @@ def _drop(rh, op):
     return {}
 
 
+def _quarantine(rh, op):
+    import rulebook_quarantine as rq  # noqa: PLC0415 — beside this file
+    sp = rh.state_path(op["session"])
+    st = rh.load_state(sp)
+    before = rh.snapshot_arming(st)
+    opened = [rq.record(st, v["rule_id"], v["file"], v.get("root"), v.get("new", True))
+              for v in op.get("open") or []]
+    rh.save_state(sp, st, before=before)
+    return {"opened": opened}
+
+
 def _specs(rh, op):
     from spec_owns import load_specs_from_tree, owning_specs, spec_file_changed  # noqa: PLC0415
     root, spec_dir, paths = op["root"], op.get("spec_dir") or "docs/specs", list(op["paths"])
@@ -87,7 +106,11 @@ def _specs(rh, op):
     return {"active": sorted({s.path for s in specs}), "untouched": out}
 
 
-OPS = {"feed": _feed, "arm": _arm, "drop": _drop, "specs": _specs}
+def _session(rh, op):
+    return {"holds": rh._rs().mod_holds(op, base=rh._base(), probes_cls=rh.Probes)}
+
+
+OPS = {"feed": _feed, "arm": _arm, "drop": _drop, "specs": _specs, "session": _session, "quarantine": _quarantine}
 
 
 def main() -> int:

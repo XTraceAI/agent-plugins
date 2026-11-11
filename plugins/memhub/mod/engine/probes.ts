@@ -187,6 +187,37 @@ export class Probes {
     })
   }
 
+  /**
+   * The call `given.session` is asked about (Python's `probes.call`): set by
+   * the engine where it builds the Probes. Unset, `sessionHolds` is false.
+   */
+  call: { session: string; hookEvent: string; toolUseId: string | null } | null = null
+
+  /**
+   * `rulebook_session.holds` for one rule, answered by the Python through
+   * `rulebook_mod_state.py` (`mod_holds`): the facts live in the transcript
+   * file and a local repeat counter, neither of which the mod reads. Never
+   * memoized: a repeat counts per rule and per call. Asked only after the
+   * rule's pattern and every other `given` condition matched, so a book's
+   * other calls never pay for it. A failed answer is false (an unknown fact
+   * holds no predicate).
+   */
+  async sessionHolds(rule: Dict, ev: [string, string] | null): Promise<boolean> {
+    const c = this.call
+    const g = rule.given
+    if (!c || !isDict(g)) return false
+    try {
+      const r = await this.io.state([{
+        op: 'session', session: c.session, rule: { id: rule.id, given: { session: g.session } },
+        hook_event_name: c.hookEvent, tool_use_id: c.toolUseId, agent_id: this.agentId, ev,
+      }], this.cwd)
+      const got = r?.[0]
+      return isDict(got) && got.holds === true
+    } catch {
+      return false
+    }
+  }
+
   agentMain(): Promise<boolean | null> {
     return this.get('agent_main', async () => this.agentId === null)
   }
@@ -233,7 +264,9 @@ const block = (g: Dict, k: string): Dict => {
  * run). Throws where Python raises; the caller treats that as Python's
  * main() would (it propagates).
  */
-export async function givenOk(rule: Dict, probes: Probes, read: Dict | null = null): Promise<boolean> {
+export async function givenOk(
+  rule: Dict, probes: Probes, read: Dict | null = null, ev: [string, string] | null = null,
+): Promise<boolean> {
   const g = rule.given
   if (g === undefined || g === null || g === false || (isDict(g) && !Object.keys(g).length)) return true
   if (!isDict(g)) throw new TypeError("'given' is not a dict")
@@ -283,6 +316,8 @@ export async function givenOk(rule: Dict, probes: Probes, read: Dict | null = nu
     const said = turns.some((t) => pySearch(pyStr(v), t, 'i'))
     if ((k === 'said_rx' && !said) || (k === 'not_said_rx' && said)) return false
   }
+  // last: a repeat counts only a call all else matched (rulebook_hook given_ok)
+  if (Object.keys(block(g, 'session')).length) return probes.sessionHolds(rule, ev)
   return true
 }
 

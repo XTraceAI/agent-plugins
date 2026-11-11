@@ -299,7 +299,7 @@ describe('a pre hand-off', () => {
     expect(engine.calls.post).toHaveLength(1)
     expect(engine.calls.post[0]!.result).toEqual({ text: 'out', isError: undefined })
     expect(r).toEqual({ result: 'out', text: 'out', context: [`post advice`] })
-    expect(io.logs).toEqual([advice.line])
+    expect(io.logs).toEqual([]) // advice is the model's alone: nothing on the person's screen
   })
 
   test('a call in ANOTHER repo goes to Python whole — pre and post out of the claim during next — and is no failure', async () => {

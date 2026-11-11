@@ -191,15 +191,16 @@ their repository's name.
   only. Nothing asks when there is no file, outside a checkout, in a listed or
   declined repository, or while no one is signed in.
 
-The list applies to the Claude Code hooks and to every host's Rulebook check
-(`rulebook_hook.py`, which Codex and Cursor call too). Codex and Cursor's own
-capture paths do not read it yet.
+The list applies to the Claude Code hooks, to every host's Rulebook check
+(`rulebook_hook.py`, which Codex and Cursor call too) and to Cursor capture
+(`cursor_flush.py`): with a list, a Cursor session is captured only when its
+workspace is a listed checkout. Codex's own capture path does not read it yet.
 
 | Event (matcher) | Name | What it does | Sends data? |
 | --- | --- | --- | --- |
 | PreToolUse (`Bash`, `Edit`, `MultiEdit`, `Write`, `NotebookEdit`, `Read`) | `rulebook_hook pre` | Checks the call against your cached team rules. It can add an advisory or **deny** the call when a gate rule matches. It refreshes the rule cache in a detached background process once the cache is a minute old. | Yes, see [Rulebook](#rulebook) |
 | PreToolUse (`mcp__*__create_rule`) | `create_rule_origin` | Adds this session's id and the current turn to MemHub's `create_rule` call (not to a harness draft, which carries its own), so the rule records the session it was filed from. Never approves or blocks the call. | Yes, the session id and turn, inside the `create_rule` call |
-| PostToolUse (`Bash`) | `flush_session` | After a command that actually ran `git commit`, `gh pr create` or `gh pr merge`, uploads the transcript so far, then each agent the session spawned (`subagents/`) as its own conversation linked to it — never the MemHub harness fork or a plugin's own fork, and only to a server that accepts agents. Runs in the background. | Yes, the transcript and its agents' |
+| PostToolUse (`Bash`) | `flush_session` | After a command that actually ran `git commit`, `gh pr create` or `gh pr merge`, uploads the transcript so far, then each agent the session spawned (`subagents/`) or its dynamic workflows dispatched (`subagents/workflows/<run>/`) as its own conversation linked to it — never the MemHub harness fork or a plugin's own fork, and only to a server that accepts agents. A fork's copy of the response that spawned it is left out, so that response is counted once. To a server that accepts them, it also sends each workflow run's name, status, phases and agent roster (redacted; never the script, prompts or previews). Runs in the background. | Yes, the transcript, its agents' and its workflow runs' |
 | PostToolUse (`Edit`, `MultiEdit`, `Write`, `NotebookEdit`) | `artifact_sync_reminder` | If the edited file belongs to a spec in the repository (by spec frontmatter), reminds the agent once per session. | No |
 | PostToolUse (`Bash`) | `pr_babysit_trigger` | After a successful `gh pr create`, tells the agent to start a `/memhub:pr-babysit` loop on the new PR. | No |
 | PostToolUse (`Edit`, `MultiEdit`, `Write`, `Bash`) | `md_capture` | Records which Markdown files the session wrote, or for Bash the working directory, in a local state file, and touches a per-session activity marker. | No |
@@ -216,7 +217,7 @@ capture paths do not read it yet.
 | Stop | `md_capture_flush` | Saves qualifying Markdown files as draft artifacts. Runs in the background. See [Markdown capture](#markdown-capture). | Yes, file contents |
 | Stop | `rulebook_hook flush` | Uploads the rule-fire and rule-event logs. Once a day it also deletes stale local state. Runs in the background. | Yes, identifiers |
 | Stop | `harness_stop stop` | Unless `MEMHUB_HARNESS_EXTRACT` turns it off. | Yes, when on |
-| SessionEnd | `session_end` | Runs `flush_session.py` (re-sends the whole transcript as a backstop, then the session's agents as above), then `rulebook_hook flush final`. Runs in the background. | Yes, the transcript and its agents' |
+| SessionEnd | `session_end` | Runs `flush_session.py` (re-sends the whole transcript as a backstop, then the session's agents and workflow runs as above), then `rulebook_hook flush final`. Runs in the background. | Yes, the transcript, its agents' and its workflow runs' |
 
 ### Session capture
 
@@ -226,9 +227,28 @@ personal memory, never into a brain**. Each upload also carries the session's
 title, the repository name (the origin remote's basename) and any GitHub
 pull-request URLs that `gh pr create` printed in the session. Slash-command
 bookkeeping records are left out, and a tool result over 200,000 bytes is
-replaced by a note giving its size. Before upload, the plugin removes MemHub
-keys (`mhk_…`, `xtk_…`) from the records and the title. Nothing else is
-redacted. The server de-duplicates what it already has, so re-sending is safe.
+replaced by a note giving its size. Before upload, on your machine, the plugin
+redacts the records with the same rules MemHub's server applies at ingest
+(`scripts/redact.py`): vendor-prefixed keys (MemHub, Anthropic, OpenAI, GitHub,
+AWS, Slack, Stripe and others), JWTs, passwords inside connection URLs, PEM
+private keys, values assigned to secret-named variables, bare high-entropy
+tokens (Shannon entropy), standalone 32+ character hex tokens, and e-mail
+addresses, phone, card and US social security numbers. Record ids, tool-call
+ids, the working directory, the branch and image data are left alone. Titles,
+an agent's type, description and returned text, and captured documents get the
+credential rules only. It is pattern matching and can miss a secret or blank
+something harmless; the server's own pass is still behind it.
+
+In Claude Code the plugin's mod also takes credentials out of a **Bash
+command's output inside the session** (`mod/redact.ts`): the value is replaced
+with `<redacted>` before it reaches your screen, the model or the local
+transcript, and the model is told that happened. The command itself runs as
+written. This uses the credential rules only, so commit SHAs and addresses stay
+readable, and it covers Bash output only: a file read with the Read tool is
+shown as it is, so the agent never writes a `<redacted>` back into a file.
+`MEMHUB_SESSION_REDACT=0` turns the in-session part off. Codex and Cursor run
+no mod, so there only the upload is redacted. The
+server de-duplicates what it already has, so re-sending is safe.
 `MEMHUB_TURN_FLUSH=0` turns off per-turn capture. The commit/PR and SessionEnd
 uploads still run.
 
@@ -292,8 +312,13 @@ disable the plugin.
   fired rule ids. It goes through the same denylist redaction, which can miss
   things. Set `MEMHUB_RULEBOOK_JUDGE=0` to turn this off.
 
-Every rule that fires is shown to you as `📏 Rule fired: …`, or `⛔️` when a
-gate blocked the call. The agent is told to repeat the same line. A blocked
+Only a block is put on your screen: `⛔️ Rule fired: …` when a gate stopped a
+call (the agent repeats that line), and one line when the agent overrode a gate
+or a file went into quarantine. An advisory rule that fires is shown to nobody:
+it goes to the agent, which is told it needs no announcement and may say in a
+sentence that a team rule from the MemHub Rulebook changed what it did. Every
+fire is still recorded (the local ledger, and the transcript row the mod
+writes), so fire counts and the helped/cost judgement do not change. A blocked
 Bash call can be overridden with `RULEBOOK_OVERRIDE='<why>' <command>`, and a
 blocked edit with a `rulebook-override[<rule>]: <why>` line in the new
 content.
@@ -329,13 +354,29 @@ Unless `MEMHUB_HARNESS_EXTRACT` is set to something other than `1`, `on`,
 `true` or `yes` (`0` turns it off; unset or blank is on), each Stop rebuilds the previous turn from the transcript. It redacts that
 window (MemHub keys, home directories, e-mail addresses, command-line
 credentials) and sends it to `/v1/team/rulebook/harness/classify`. When the
-classifier signals a candidate rule, the agent is asked once to start a
-background fork of itself. The fork files a **proposed** rule with
-`create_rule`. Nothing is activated without a person. The local files, under
-`~/.config/memhub-plugin/harness/`, are `stop.log` (one line per Stop, with no
-prompt text), `offsets/` (where the next transcript read may start) and
-`judged/` (one empty file per judged turn, so a machine with both the
-`memhub` and `memhub-staging` installs judges each turn once).
+classifier signals a candidate rule, a background fork of the session drafts
+it. In an interactive Claude Code session the plugin's mod starts that fork
+itself (`mod/drafter.ts`, lane `drafter`): the Stop queues the moment, the mod
+spawns the fork when the turn ends, and you see nothing unless the fork files a
+rule, when one line says so. In a session an Agent SDK app hosts — Zed and the
+other editors that run Claude Code over ACP — every tool call of the turn is on
+screen and the mod starts no fork, so the Stop launches the drafter itself, as
+it does on Codex: a detached `claude -p --resume <session> --fork-session
+--no-session-persistence`, with the session's model and permission mode. You
+see nothing when a turn is flagged, and one notice line at a later Stop if it
+filed a rule (`MEMHUB_HARNESS_DETACHED_DRAFT=0` keeps the visible hand-off).
+Elsewhere — `claude -p`, a mod that is not
+loaded, a spawn the engine refuses, a detached drafter that cannot be started —
+the Stop instead asks the agent once, with
+one visible line, to start the fork with its Agent tool; a moment the mod
+queued but did not take is handed over that way at the next Stop. The fork
+files a **proposed** rule with `create_rule`. Nothing is activated without a
+person. The local files, under `~/.config/memhub-plugin/harness/`, are
+`stop.log` (one line per Stop, with no prompt text), `offsets/` (where the next
+transcript read may start), `judged/` (one empty file per judged turn, so a
+machine with both the `memhub` and `memhub-staging` installs judges each turn
+once) and `queue/<env>/` (moments waiting for the mod, removed once it starts
+their fork).
 `harnessDrafting: false` turns all of this off.
 
 ### Companion (Claude Code 2.1.287+)
@@ -384,6 +425,32 @@ with your access key (resolved once a session by
 The only processes it starts are `open` or `xdg-open`, to open a rule in
 MemHub Studio (`https://mem.xtrace.ai`) when you click it.
 
+### Agent message board (Claude Code 2.1.287+)
+
+A teammate's coding agent can send yours a message through a brain you both
+read (the `send_agent_message` MCP tool). The mod (`board/register.ts`,
+registered just before the companion) shows the oldest one for this checkout
+above the prompt — `📨 <sender> via <brain>: <first line>` — with **Run** and
+**Dismiss** (`r` / `d` once `ctrl+x tab` has focused the band). A message addressed to a repository shows only in sessions in
+that repository. Nothing shows where MemHub is inactive in the repository.
+
+**Run** asks MemHub to let this session take the message. If you have several
+sessions open, exactly one wins: the others say `taken by another session`.
+The winner sends the message to Claude as a prompt from the plugin, framed as
+a teammate's request rather than your own words, once the session is idle,
+and the usual permission prompts apply. **Dismiss** clears the message from
+every session. Nothing runs without a press.
+
+It talks to MemHub over Claude Code's HTTP client with your access key:
+
+- `GET /v2/agent-messages` when the session first draws its prompt and again
+  five seconds later, every minute after that, and when a turn ends, to list
+  unread messages addressed to you;
+- `POST /v2/agent-messages/<id>/claim` when you press Run, and every 45 s
+  while the prompt waits for the session to go idle;
+- `POST /v2/agent-messages/<id>/done` once the prompt has started, or when you
+  press Dismiss.
+
 ### Codex and Cursor
 
 This package also carries Codex and Cursor manifests (`.codex-plugin/`,
@@ -406,13 +473,64 @@ count comes from the slice Cursor is about to send to the model. A deny keeps
 that slice out of the model and puts the rule's words in `user_message`, the
 one field Cursor shows the agent on a deny. A read is judged only when the
 agent's own Read tool asked for that file; a file you attached is not
-judged. A Cursor subagent runs under its own conversation id, so
-`sessionStart` marks your conversation as the main one, and a `Task` call in
-flight marks any other conversation as its subagent, which `given.agent.main`
-rules leave alone. That state lives in `cursor/` under the rulebook
-directory. At `stop` and `sessionEnd` the rule fires are sent to MemHub, as
-the Stop hook does on the other hosts. Rules on edits do not run on Cursor:
-Cursor has no hook before an edit that the plugin uses.
+judged. A Cursor subagent runs under its own conversation id. In the Cursor
+IDE its tool hooks name the parent's `Task` call (`parent_tool_call_id`), which
+says exactly whose subagent it is; in cursor-agent, `sessionStart` marks your
+conversation as the main one and a `Task` call in flight marks any other
+conversation as its subagent. Either way `given.agent.main` rules leave it
+alone. That state lives in `cursor/` under the rulebook
+directory. An edit is judged at `preToolUse` (cursor-agent's `Write`, and
+the IDE's edit tools by the names in `cursor_rulebook.EDIT_TOOLS`); a deny
+keeps the file as it was. After a shell command or an edit, `postToolUse`
+runs the rules on what the command printed and its exit code, and the "run
+X before Y" rules, as on the other hosts; a command that may address GitHub
+also offers to link this session to its pull request, and an edit to a file
+a spec owns gets the spec reminder. At `sessionStart` the agent gets the
+session-start rules, the Rulebook's index and the repo's brain brief, as
+Claude Code's SessionStart gives them (cursor-agent fires no `sessionStart` on
+`--resume`). At `stop` and `sessionEnd` the rule fires are sent to MemHub, as
+the Stop hook does on the other hosts. Rules on prompts and replies do not
+run on Cursor yet.
+
+On Codex (the CLI and the desktop app, which share `$CODEX_HOME`, default
+`~/.codex`), `codex_flush.py` reads rollouts Codex has compressed
+(`rollout-*.jsonl.zst`) as well as plain ones, through Python 3.14's
+`compression.zstd` or the `zstd` command-line tool; with neither (macOS's
+`/usr/bin/python3` is 3.9) a compressed session is skipped and capture health
+says why. Messages one agent sends another (`agent_message`) are captured as
+turns when their text is plain; Codex encrypts a spawned agent's task, and
+that part is never sent. Each agent a Codex thread spawned
+(`spawn_agent`, multi-agent v2) and each `/review` thread is sent as its own
+conversation, `codex-<session>/agent-<agent>`, linked to the session, after
+the session's own upload is confirmed and only to a server that accepts
+agents: the agent's own turns (the parent history a forked agent starts with
+is left out), its role, its task name and nickname, the spawning call's id,
+its status (done, failed, stopped or running) and the start of its final
+answer, redacted. A Stop also re-checks agents that were still running, of
+this session and of up to three recent ones. An agent is never captured as a
+session of its own, and `capture.py import` refuses an agent's rollout.
+Guardian reviews and memory consolidation threads are not captured at all.
+`python3 scripts/capture_health.py --host codex --agents` lists, per session,
+how many agents were found, sent, still running, waiting and failed.
+
+Cursor capture sends each subagent a session spawned as its own conversation,
+`cursor-<session>/agent-<subagent>`, linked to the session, after the session
+itself was saved and only to a server that accepts agents
+(`scripts/cursor_agents.py`). In cursor-agent a subagent is a store with no
+`meta.json` beside the session's under `~/.cursor/chats/`, whose metadata names
+its parent and the call that spawned it; they are sent at the session's
+`sessionEnd`, nested ones too. In the Cursor IDE a subagent's transcript is
+under the session's, in `subagents/<id>.jsonl`; `subagentStop` sends it (and
+records which call spawned it), and the session's `stop` and next prompt pick
+up any that `subagentStop` missed, reading the spawning call from Cursor's
+`state.vscdb` without writing to it. Each carries its type, the `Task`'s
+description, its status (from the end of its own transcript: done, failed,
+stopped by you, or still running) and its last reply; the spawning call's id
+goes too when it is exact (never for a cursor-agent subagent of a session read
+from its transcript, whose call ids are made up). A subagent's own hooks never
+upload it as a session of its own, and `subagentStart` is answered and
+otherwise ignored. Which subagents already landed is kept in
+`cursorflush/<session>.agents`.
 
 ### Network destinations
 
@@ -462,6 +580,9 @@ calls to the GitHub API of its own. GitHub traffic comes only from `gh` and
 - `git` runs read-only queries, such as `remote get-url`, `rev-parse`,
   `status`, `diff`, `log`, `ls-files`, `merge-base` and `worktree list`. These
   identify the repository, find changed Markdown files and evaluate rules.
+- `zstd -dcq` decompresses a compressed Codex rollout when the Python running
+  the hook has no `compression.zstd` (before 3.14). Nothing else is passed to
+  it and nothing it prints leaves the machine except as captured session text.
 - `open` or `xdg-open` (companion only) and your browser open pages. The
   browser opens for `/memhub:login`, and for the `save-artifact`, `onboard`
   and `import-session` scripts when they find no access key or usable cached
@@ -477,7 +598,9 @@ Everything lives under `~/.config/memhub-plugin/` unless noted:
 
 - `pak-<api-host>.json` and `tokens-<api-host>.json`: credentials, mode 0600;
 - `turnflush/`, `codexflush/`, `cursorflush/`: capture cursors, locks and the
-  last error;
+  last error; `<session>.agents`, which of a session's agents already landed;
+  `_server_caps`, what the server accepts for agents (cached for up to 6
+  hours);
 - `mdcapture/`: Markdown capture bookkeeping;
 - `rulebook/`: cached rule books, per-session state, the fire and event logs;
 - `overview/`: brain-brief caches;
@@ -487,7 +610,7 @@ Everything lives under `~/.config/memhub-plugin/` unless noted:
   status strip asked; absent means every repository;
 - `prlink/`: the PR-link negative cache;
 - `compatibility/`, `releases/`: upgrade-check results;
-- `harness/stop.log`, `harness/offsets/`, `harness/judged/`: unless `MEMHUB_HARNESS_EXTRACT` turns the harness off;
+- `harness/stop.log`, `harness/offsets/`, `harness/judged/`, `harness/queue/`: unless `MEMHUB_HARNESS_EXTRACT` turns the harness off;
 - `rules-from-sessions/`: what `/memhub:start-rulebook` noted about each
   session it read, so it reads a session once;
 - `~/.claude/.memhub/directive_fired/`: what the brief already showed this
@@ -496,8 +619,8 @@ Everything lives under `~/.config/memhub-plugin/` unless noted:
   reminder.
 
 Once a day, `scripts/state_sweep.py` deletes stale capture, Markdown-capture
-and brain-brief pointer files (after 7 days) and stale rulebook state (after
-30).
+and brain-brief pointer files (after 7 days), the agent caches of a Codex or
+Cursor session idle that long, and stale rulebook state (after 30).
 `python3 scripts/state_sweep.py --dry-run` shows what it would delete.
 
 ### Strings that look like credential reads
@@ -534,6 +657,9 @@ them reads one, and none of that text is ever run:
 | `MEMHUB_BRIEF_POINTERS=0` | Turns off brain-brief recall searches |
 | `MEMHUB_BRIEF_TOKEN_BUDGET` | Session-start context budget (default 2,500 tokens) |
 | `MEMHUB_HARNESS_EXTRACT` | `0` turns off harness-tied rule drafting (on by default) |
+| `MEMHUB_SESSION_REDACT` | `0` stops the mod replacing credentials in a Bash command's output inside the session (Claude Code); the upload is still redacted |
+| `MEMHUB_HARNESS_DETACHED_DRAFT` | `0` keeps the visible hand-off in a session an Agent SDK app hosts (Zed), where the drafter otherwise runs detached and unseen |
+| `MEMHUB_CLAUDE_CLI` | The Claude Code binary the detached drafter runs, ahead of the session's own (`CLAUDE_CODE_EXECPATH`) and `claude` on `PATH` |
 | `MEMHUB_MCP_BASE_URL`, `MEMHUB_MCP_SERVER_PATH` | Point hooks and scripts at another MemHub (MCP tools follow `.mcp.json`) |
 | `MEMHUB_PRLINK_NEGATIVE_TTL_S` | PR-link negative cache lifetime; `0` turns it off |
 | `MEMHUB_RULEBOOK_BASE`, `MEMHUB_STATE_DIR`, `MEMHUB_ROOMS_FILE`, `MEMHUB_HARNESS_DIR` | Move local state |
@@ -544,7 +670,7 @@ them reads one, and none of that text is ever run:
 | `MEMHUB_PAK_LABEL` | Label for the access key `/memhub:login` mints |
 | `MEMHUB_RULEBOOK_DEBUG`, `MEMHUB_HARNESS_DEBUG` | Print hook tracebacks to stderr |
 | `MEMHUB_RULEBOOK_HOOK_VERSION` | Test override for the hook version that rules' minimum-version checks compare against |
-| `MEMHUB_HARNESS_CHILD` | Marks a `claude` process started by XTrace's test tooling: it is not captured, and harness drafting is off. The plugin never sets it |
+| `MEMHUB_HARNESS_CHILD` | Marks a `claude` process started by XTrace's test tooling: it is not captured, and harness drafting is off. The plugin sets it only on the detached drafters it launches itself (Codex, and Claude Code hosted by an Agent SDK app), so a drafter never judges its own turn |
 
 ## License
 
