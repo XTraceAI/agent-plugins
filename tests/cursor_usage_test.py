@@ -117,8 +117,9 @@ def test_hook_usage_is_exact_and_aborts_remain_unmeasured():
     generation, usage = cursor_flush._hook_usage(
         "afterAgentResponse", payload)
     assert generation == GENERATION
+    # The IDE's input_tokens (20120) includes its 1024 cache reads; stored net.
     assert usage == {
-        "input_tokens": 20120,
+        "input_tokens": 19096,
         "output_tokens": 48,
         "cache_read_input_tokens": 1024,
         "cache_creation_input_tokens": 9,
@@ -336,12 +337,13 @@ def test_main_persists_usage_before_send_and_deduplicates_stop():
     final = calls[0]["records"][-1]
     assert final["message"]["content"][0]["text"] == "USAGE_OK"
     assert final["message"]["usage"] == {
-        "input_tokens": 20120, "output_tokens": 48,
+        "input_tokens": 19096, "output_tokens": 48,
         "cache_read_input_tokens": 1024,
         "cache_creation_input_tokens": 9,
     }
     assert calls[0]["applied_usage"] == {GENERATION}
     assert list(state["usage_events"]) == [GENERATION]
+    assert state["usage_events"][GENERATION]["basis"] == "net"
     assert state["source_kind"] == "transcript"
     assert state["sent_usage_generations"] == [GENERATION]
     print("PASS test_main_persists_usage_before_send_and_deduplicates_stop")
@@ -375,6 +377,186 @@ def test_sticky_transcript_source_never_switches_to_late_store():
             cursor_flush._CURSOR_PROJECTS = old_projects
             cursor_flush.cursor_reader.locate = old_locate
     print("PASS test_sticky_transcript_source_never_switches_to_late_store")
+
+
+GROSS = {"input_tokens": 145087, "output_tokens": 295,
+         "cache_read_tokens": 143616, "cache_write_tokens": 7}
+NET = {"input_tokens": 1471, "output_tokens": 295,
+       "cache_read_input_tokens": 143616, "cache_creation_input_tokens": 7}
+
+
+def _assistant(uuid: str) -> dict:
+    return {"type": "assistant", "uuid": uuid,
+            "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "DONE"}]}}
+
+
+def test_gross_ide_hook_usage_is_stored_net_of_cache_reads():
+    payload = dict(GROSS, generation_id=GENERATION)
+    generation, usage = cursor_flush._hook_usage("stop", payload)
+    # Cache writes are left alone: whether IDE input includes them is unverified.
+    assert (generation, usage) == (GENERATION, NET)
+    events = cursor_flush._usage_events_with({}, generation, "final", usage)
+    assert events[GENERATION] == {"target_uuid": "final", "usage": NET,
+                                  "basis": "net"}
+    records = [_assistant("final")]
+    assert cursor_flush._apply_usage(records, events) == {GENERATION}
+    assert records[0]["message"]["usage"] == NET  # not subtracted a second time
+    print("PASS test_gross_ide_hook_usage_is_stored_net_of_cache_reads")
+
+
+def test_cache_reads_above_input_clamp_to_zero():
+    _, usage = cursor_flush._hook_usage("afterAgentResponse", {
+        "generation_id": GENERATION, "input_tokens": 10,
+        "cache_read_tokens": 50, "output_tokens": 1})
+    assert usage["input_tokens"] == 0
+    assert usage["cache_read_input_tokens"] == 50
+    print("PASS test_cache_reads_above_input_clamp_to_zero")
+
+
+def test_legacy_unmarked_usage_is_converted_once():
+    legacy_generation = "0f6c2d1e-7b3a-4c5d-9e8f-a1b2c3d4e5f6"
+    # Strict reads accept only UUID-shaped record ids.
+    OLD_TURN = "6f1d3b2a-0c4e-5d6f-8a9b-0c1d2e3f4a5b"
+    NEW_TURN = "7a2e4c3b-1d5f-5e7a-9b0c-1d2e3f4a5b6c"
+    gross = cursor_flush.cursor_reader.normalize_usage(GROSS)
+    # Saved by a plugin from before the basis marker: gross, no "basis".
+    state = {"usage_events": {
+        legacy_generation: {"target_uuid": OLD_TURN, "usage": gross}}}
+    with tempfile.TemporaryDirectory() as td:
+        old_state = cursor_flush.STATE_DIR
+        cursor_flush.STATE_DIR = Path(td)
+        try:
+            cursor_flush._state_path(SESSION).write_text(
+                json.dumps(state), encoding="utf-8")
+            assert cursor_flush._read_state(SESSION, strict=True) == state
+        finally:
+            cursor_flush.STATE_DIR = old_state
+
+    # A session straddling the upgrade: the new turn is stored net and marked,
+    # the old one stays as saved and is converted only when applied.
+    _, usage = cursor_flush._hook_usage(
+        "stop", dict(GROSS, generation_id=GENERATION))
+    events = cursor_flush._usage_events_with(state, GENERATION, NEW_TURN, usage)
+    assert "basis" not in events[legacy_generation]
+    assert events[legacy_generation]["usage"] == gross
+    for _ in range(2):  # every read converts the unchanged saved entry once
+        records = [_assistant(OLD_TURN), _assistant(NEW_TURN)]
+        assert cursor_flush._apply_usage(records, events) == {
+            legacy_generation, GENERATION}
+        assert records[0]["message"]["usage"] == NET
+        assert records[1]["message"]["usage"] == NET
+
+    # Re-sent after the upgrade, the legacy generation is replaced by a marked
+    # net sample rather than being subtracted on top of its old value.
+    resent = cursor_flush._usage_events_with(
+        {"usage_events": events}, legacy_generation, "elsewhere", usage)
+    assert resent[legacy_generation] == {
+        "target_uuid": OLD_TURN, "usage": NET, "basis": "net"}
+    records = [_assistant(OLD_TURN)]
+    cursor_flush._apply_usage(records, resent)
+    assert records[0]["message"]["usage"] == NET
+
+    # A basis this build does not know is left unmeasured, and refused on a
+    # strict read, rather than trusted or converted.
+    unknown = {GENERATION: {"target_uuid": NEW_TURN, "usage": NET,
+                            "basis": "gross"}}
+    assert cursor_flush._apply_usage([_assistant(NEW_TURN)], unknown) == set()
+    with tempfile.TemporaryDirectory() as td:
+        old_state = cursor_flush.STATE_DIR
+        cursor_flush.STATE_DIR = Path(td)
+        try:
+            cursor_flush._state_path(SESSION).write_text(
+                json.dumps({"usage_events": unknown}), encoding="utf-8")
+            try:
+                cursor_flush._read_state(SESSION, strict=True)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("an unknown usage basis passed a strict read")
+        finally:
+            cursor_flush.STATE_DIR = old_state
+    print("PASS test_legacy_unmarked_usage_is_converted_once")
+
+
+def test_resent_generation_stays_idempotent():
+    payload = dict(GROSS, generation_id=GENERATION)
+    _, first = cursor_flush._hook_usage("afterAgentResponse", payload)
+    events = cursor_flush._usage_events_with({}, GENERATION, "final", first)
+    _, again = cursor_flush._hook_usage("stop", payload)
+    events = cursor_flush._usage_events_with(
+        {"usage_events": events}, GENERATION, "final", again)
+    assert events == {GENERATION: {"target_uuid": "final", "usage": NET,
+                                   "basis": "net"}}
+    records = [_assistant("final")]
+    cursor_flush._apply_usage(records, events)
+    cursor_flush._apply_usage(records, events)
+    assert records[0]["message"]["usage"] == NET
+    print("PASS test_resent_generation_stays_idempotent")
+
+
+def test_recorded_ide_session_stores_net_usage_per_turn():
+    """Replay the usage hooks of a real three-turn Cursor IDE session
+    (tests/fixtures/cursor_ide_usage_recording.json) through main(), each
+    against the transcript as it stood when the hook fired."""
+    fixture = json.loads((ROOT / "tests" / "fixtures" /
+                          "cursor_ide_usage_recording.json").read_text(
+                              encoding="utf-8"))
+    session = fixture["session_id"]
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        projects = root / "projects"
+        path = (projects / "recording" / "agent-transcripts" / session /
+                f"{session}.jsonl")
+        path.parent.mkdir(parents=True)
+        sent: list[list[dict]] = []
+        originals = (cursor_flush.STATE_DIR, cursor_flush._CURSOR_PROJECTS,
+                     cursor_flush.cursor_reader._CHATS,
+                     cursor_flush.cursor_reader._PROJECTS,
+                     cursor_flush._flush, cursor_flush._log)
+
+        async def fake_flush(uuid, source_path, blob_ids, flush_mode="now",
+                             **kwargs):
+            sent.append(json.loads(json.dumps(kwargs["records"])))
+            cursor_flush._save_state(
+                uuid, transcript_revision=kwargs["source_revision"],
+                sent_usage_generations=sorted(kwargs["applied_usage"]),
+                last_flush_at=0)
+
+        try:
+            cursor_flush.STATE_DIR = root / "state"
+            cursor_flush._CURSOR_PROJECTS = projects
+            cursor_flush.cursor_reader._CHATS = root / "chats"
+            cursor_flush.cursor_reader._PROJECTS = projects
+            cursor_flush._flush = fake_flush
+            cursor_flush._log = lambda _message: None
+            for row in fixture["invocations"]:
+                rows = fixture["transcripts"][row["transcript"]]
+                path.write_text("".join(json.dumps(r) + "\n" for r in rows),
+                                encoding="utf-8")
+                payload = dict(row["payload"], transcript_path=str(path))
+                assert _run_main(row["event"], payload) == 0
+            state = cursor_flush._read_state(session, strict=True)
+        finally:
+            (cursor_flush.STATE_DIR, cursor_flush._CURSOR_PROJECTS,
+             cursor_flush.cursor_reader._CHATS,
+             cursor_flush.cursor_reader._PROJECTS,
+             cursor_flush._flush, cursor_flush._log) = originals
+
+    stored = {generation: (event["usage"]["input_tokens"],
+                           event["usage"]["cache_read_input_tokens"],
+                           event["basis"])
+              for generation, event in state["usage_events"].items()}
+    # Gross IDE input minus its cache reads: 18356-6272, 102136-72320,
+    # 145087-143616. Turn 3 was a one-line edit on a cached context.
+    assert stored == {
+        "c3e427e5-7e9a-45db-8b49-56016bbc68d0": (12084, 6272, "net"),
+        "e46407dd-f24c-4480-9690-901e3193d891": (29816, 72320, "net"),
+        "f0b04523-791b-45a4-9af8-7d9328b2af86": (1471, 143616, "net"),
+    }, stored
+    final = [r for r in sent[-1] if r.get("type") == "assistant"][-1]
+    assert final["message"]["usage"]["input_tokens"] == 1471
+    print("PASS test_recorded_ide_session_stores_net_usage_per_turn")
 
 
 if __name__ == "__main__":

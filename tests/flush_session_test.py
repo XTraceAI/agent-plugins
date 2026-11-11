@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """What the whole-transcript flush puts on the wire, and when it gives up.
 
-Run: uv run --with 'mcp<2' python plugins/memhub/scripts/flush_session_test.py
-(the module imports the MCP SDK through ``_memhub_auth``)
+Run: python3 tests/flush_session_test.py
 
 Covers the arguments assembly and the success/failure contract of one slice —
 the parts that decide whether a capture lands in the right brain, under the
@@ -188,7 +187,7 @@ def run_main(raises, deadline="0.5"):
     real_flush, real_log = fs._flush, fs._log
     stdin = sys.stdin
 
-    async def fake_flush(session_id, transcript_path):
+    async def fake_flush(session_id, transcript_path, session_ended=False):
         if raises == "slow":
             await asyncio.sleep(10)          # our wall clock wins
         raise TimeoutError("connection timed out")  # an inner socket timeout
@@ -253,7 +252,7 @@ check("a malformed payload is reported, not raised",
 def _child_run(flag):
     calls = []
 
-    async def fake_flush(session_id, transcript_path):
+    async def fake_flush(session_id, transcript_path, session_ended=False):
         calls.append(session_id)
 
     class FakeIn:
@@ -275,6 +274,213 @@ def _child_run(flag):
 
 check("a harness child exits 0 and ships nothing", _child_run("1") == (0, []))
 check("the same payload outside a child ships", _child_run("") == (0, ["fork-1"]))
+
+
+# ── agents and workflow runs (MemHub-Backend agent-sessions spec §10.2) ──
+#
+# What a full flush sends for a session that spawned Agent-tool agents, MemHub
+# harness forks and three dynamic workflows, against each server generation:
+# one without agent capture, one with §4.1 only, and one with the details and
+# runs. The server's tools are listed once, before the session goes.
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import agent_fixture as fx  # noqa: E402
+import redact as _redact  # noqa: E402
+
+_AGENTS_41 = {"messages": {}, "agent_id": {}, "parent_conversation_id": {}}
+SERVER_OLD = [{"name": "import_conversation", "inputSchema": {"properties": {"messages": {}}}}]
+SERVER_41 = [{"name": "import_conversation", "inputSchema": {"properties": dict(_AGENTS_41)}}]
+SERVER_FULL = [{"name": "import_conversation", "inputSchema": {"properties": {
+    **_AGENTS_41, "parent_agent_id": {}, "workflow_run_id": {}, "agent_status": {},
+    "agent_result_preview": {}, "workflow_runs": {}}}}]
+DETAIL_ARGS = {"parent_agent_id", "workflow_run_id", "agent_status", "agent_result_preview"}
+
+
+class RecordingSession:
+    def __init__(self, *_a, **_k):
+        self.sent = RecordingSession.sent
+
+    async def call_tool(self, name, arguments=None, timeout=None):
+        self.sent.append(dict(arguments))
+        return FakeResult(structured={"conversation_id": arguments["conversation_id"],
+                                      "messages_received": len(arguments["messages"]),
+                                      "path": "agentic"})
+
+
+def flush_tree(tree, tools, state_dir, ended=True):
+    """One full flush of ``tree`` against a server listing ``tools``.
+    Returns (imports sent, list_tools call count)."""
+    RecordingSession.sent = []
+    listed = []
+
+    def list_tools(url, bearer, *a, **k):
+        listed.append(1)
+        return tools
+
+    real = (fs.resolve_bearer, fs.mcp_http.Session, fs.mcp_http.list_tools,
+            fs.make_slices, fs._SESSION_STATE_DIR, fs._log)
+    fs.resolve_bearer = lambda: ("https://example.invalid/mcp", "tok")
+    fs.mcp_http.Session = RecordingSession
+    fs.mcp_http.list_tools = list_tools
+    # Small slices, so the session goes in several and "the last" means something.
+    fs.make_slices = lambda records: real[3](records, chunk_bytes=4000)
+    fs._SESSION_STATE_DIR = state_dir
+    fs._log = lambda _m: None
+    try:
+        asyncio.run(fs._flush(fx.SESSION, str(tree.transcript), ended))
+    finally:
+        (fs.resolve_bearer, fs.mcp_http.Session, fs.mcp_http.list_tools,
+         fs.make_slices, fs._SESSION_STATE_DIR, fs._log) = real
+    return RecordingSession.sent, len(listed)
+
+
+def session_slices(sent):
+    return [a for a in sent if a["conversation_id"] == fx.SESSION]
+
+
+def agent_imports(sent):
+    return [a for a in sent if a.get("parent_conversation_id") == fx.SESSION]
+
+
+_root = Path(tempfile.mkdtemp(prefix="flush-agents-"))
+_tree = fx.mirror_9b073366(_root / "proj")
+
+# (a) No agent capture on the server: no agents, no runs.
+_state = _root / "state-a"
+_state.mkdir()
+sent, listed = flush_tree(_tree, SERVER_OLD, _state)
+check("old server: tools listed once", listed == 1)
+check("old server: no agents sent", agent_imports(sent) == [])
+check("old server: no workflow_runs sent", not any("workflow_runs" in a for a in sent))
+check("old server: the session still goes", len(session_slices(sent)) > 1)
+
+# (b) §4.1 only: 74 agents with only the §4.1 arguments, no runs.
+_state = _root / "state-b"
+_state.mkdir()
+sent, listed = flush_tree(_tree, SERVER_41, _state)
+_agents = {a["conversation_id"] for a in agent_imports(sent)}
+check("4.1 server: tools listed once", listed == 1)
+check("4.1 server: 74 agents sent", len(_agents) == 74)
+check("4.1 server: no harness fork sent",
+      not any(f in str(_agents) for f in fx.HARNESS_FORKS))
+check("4.1 server: no detail arguments",
+      not any(DETAIL_ARGS & set(a) for a in agent_imports(sent)))
+check("4.1 server: no workflow_runs", not any("workflow_runs" in a for a in sent))
+_wf = [a for a in agent_imports(sent) if a.get("agent_type") == "workflow-subagent"]
+check("4.1 server: workflow agents go as plain agents",
+      len({a["agent_id"] for a in _wf}) == 64
+      and not any("parent_tool_use_id" in a for a in _wf))
+_cache = _json.loads((_state / f"{fx.SESSION}.agents").read_text())
+check("4.1 server: cache keys carry size, status and 'b'",
+      _cache[fx.TOOL_AGENTS[0]].endswith(":done:b")
+      and _cache["as00"].endswith(":-:b"))
+
+# The same server again: nothing re-sent.
+sent, listed = flush_tree(_tree, SERVER_41, _state)
+check("4.1 server: an unchanged agent is not re-sent", agent_imports(sent) == [])
+
+# (c) The server gains the details: every agent is re-sent once, with them.
+sent, listed = flush_tree(_tree, SERVER_FULL, _state)
+check("full server: tools listed once", listed == 1)
+_imports = agent_imports(sent)
+check("full server: each agent re-sent once on gaining details",
+      len({a["agent_id"] for a in _imports}) == 74)
+_by = {}
+for a in _imports:
+    _by.setdefault(a["agent_id"], a)
+check("full server: tool agents carry status and result",
+      _by[fx.TOOL_AGENTS[0]].get("agent_status") == "done"
+      and len(_by[fx.TOOL_AGENTS[0]].get("agent_result_preview", "")) == 2000)
+check("full server: workflow agents carry their run, never a status",
+      _by["as00"].get("workflow_run_id") == fx.RUN_SPLIT
+      and "agent_status" not in _by["as00"]
+      and _by["as00"].get("agent_description") == "design:A")
+_slices = session_slices(sent)
+check("full server: workflow_runs rides only on the last session slice",
+      len(_slices) > 1 and "workflow_runs" in _slices[-1]
+      and not any("workflow_runs" in a for a in _slices[:-1]))
+check("full server: three runs sent", len(_slices[-1]["workflow_runs"]) == 3)
+check("full server: never on an agent import",
+      not any("workflow_runs" in a for a in _imports))
+check("full server: runs are redacted", not _redact.contains_secret(_slices[-1]["workflow_runs"]))
+sent, listed = flush_tree(_tree, SERVER_FULL, _state)
+check("full server: runs re-sent on every flush, agents not",
+      "workflow_runs" in session_slices(sent)[-1] and agent_imports(sent) == [] and listed == 1)
+
+# A legacy integer cache entry never matches: that agent is re-sent once.
+_cache = _json.loads((_state / f"{fx.SESSION}.agents").read_text())
+_cache[fx.TOOL_AGENTS[1]] = 12345
+(_state / f"{fx.SESSION}.agents").write_text(_json.dumps(_cache))
+sent, _ = flush_tree(_tree, SERVER_FULL, _state)
+check("a legacy cache entry re-sends that agent once",
+      {a["agent_id"] for a in agent_imports(sent)} == {fx.TOOL_AGENTS[1]})
+
+# A status change re-keys the cache: a running agent that finishes is re-sent.
+_live = Path(tempfile.mkdtemp(prefix="flush-live-"))
+_t2 = fx.Tree(_live / "proj")
+_t2.records = [fx.assistant("r0", [fx.tool_use("toolu_L", "Agent", prompt="go")], "s0")]
+_t2.write_session()
+_mid = [fx.user("go", "u"), fx.assistant("r1", [fx.tool_use("t", "Bash", command="ls")], "a",
+                                         stop_reason="tool_use")]
+_t2.agent("l1", _mid, agentType="general-purpose", toolUseId="toolu_L")
+(_live / "state").mkdir()
+sent, _ = flush_tree(_t2, SERVER_FULL, _live / "state", ended=False)
+check("a running agent is sent as running",
+      [a.get("agent_status") for a in agent_imports(sent)] == ["running"])
+sent, _ = flush_tree(_t2, SERVER_FULL, _live / "state", ended=True)
+check("the same bytes at session end are re-sent as stopped",
+      [a.get("agent_status") for a in agent_imports(sent)] == ["stopped"])
+
+# No agents and no runs: the server's tools are not listed at all.
+_bare = Path(tempfile.mkdtemp(prefix="flush-bare-"))
+_t3 = fx.Tree(_bare / "proj")
+_t3.records = [fx.user("hi", "p0")]
+_t3.write_session()
+(_bare / "state").mkdir()
+sent, listed = flush_tree(_t3, SERVER_FULL, _bare / "state")
+check("nothing to send beyond the session: no tools listed", listed == 0 and len(sent) == 1)
+
+# A fork's copy of its owner's spawning response never leaves the machine.
+_fk = Path(tempfile.mkdtemp(prefix="flush-fork-"))
+_t4 = fx.Tree(_fk / "proj")
+_spawn = [fx.tool_use("toolu_K", "Agent", subagent_type="fork", prompt="p")]
+_t4.records = [fx.assistant("req_owner", _spawn, "s", fx.T0, "tool_use"),
+               fx.user([fx.tool_result("toolu_K", "Fork started")], "r")]
+_t4.write_session()
+_t4.agent("k1", fx.fork_records("k1", "req_owner", "toolu_K", fx.T0, _spawn),
+          agentType="fork", toolUseId="toolu_K")
+(_fk / "state").mkdir()
+for _server in (SERVER_41, SERVER_FULL):
+    sent, _ = flush_tree(_t4, _server, _fk / "state")
+    _msgs = [m for a in agent_imports(sent) for m in a["messages"]]
+    check("fork copies stripped for every server that takes agents",
+          _msgs and "req_owner" not in _json.dumps(_msgs)
+          and "fork-context-ref" not in _json.dumps(_msgs))
+
+# main() hands the flush whether the session ended.
+def _ended_for(payload):
+    seen = []
+
+    async def fake_flush(session_id, transcript_path, session_ended=False):
+        seen.append(session_ended)
+
+    class FakeIn:
+        def read(self):
+            return _json.dumps({"session_id": "s1", "transcript_path": __file__, **payload})
+
+    real_flush, real_log, stdin = fs._flush, fs._log, sys.stdin
+    fs._flush, fs._log, sys.stdin = fake_flush, (lambda _m: None), FakeIn()
+    try:
+        fs.main()
+    finally:
+        fs._flush, fs._log, sys.stdin = real_flush, real_log, stdin
+    return seen
+
+
+check("SessionEnd is a session end", _ended_for({"hook_event_name": "SessionEnd",
+                                                 "reason": "exit"}) == [True])
+check("a commit is not", _ended_for({"hook_event_name": "PostToolUse",
+                                     "tool_input": {"command": "git commit"}}) == [False])
 
 
 print(f"{'FAIL' if FAILURES else 'PASS'}: flush_session")

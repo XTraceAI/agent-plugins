@@ -127,7 +127,8 @@ def main():
         output = run("pre", {"cwd":tmp,"session_id":"many","tool_name":"Bash","tool_input":{"command":"git push"}}, {"MEMHUB_RULEBOOK_BASE":str(cache),"MEMHUB_RULEBOOK_FETCH":"0"})[1]
         out = json.loads(output)
         context = out['hookSpecificOutput']['additionalContext']
-        user = out['systemMessage']
+        # An advisory fire is shown to nobody: the bullet is the agent's copy, and the only one.
+        assert 'systemMessage' not in out, out
         # The spec list rides INLINE on the rule's own bullet, capped at 3 with the rest counted.
         bullet = [l for l in context.split('\n') if l.startswith('- **[many-specs]**')]
         assert len(bullet) == 1, context
@@ -137,11 +138,6 @@ def main():
         assert not any(' owns' in l and not l.startswith('- **[') for l in context.split('\n')), context
         # The agent still gets which owned paths each named spec answers for, on the same line.
         assert all(f'{p} owns app/item' in bullet[0] for p in named), bullet[0]
-        # The user's systemMessage names the same capped list, one detail line, and no owned-path detail.
-        detail = [l for l in user.split('\n') if '[many-specs]' in l and '▸' in l]
-        assert len(detail) == 1 and '(+9 more)' in detail[0], user
-        assert ' owns ' not in user and 'app/item' not in user, user
-        assert len(user.split('\n')) == 2, user
 
     # ENG-1153: a big shared file co-owned by narrow specs. Once the branch updates the
     # spec that governs the change, the file's other owners are not flagged for it —

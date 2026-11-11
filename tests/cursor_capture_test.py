@@ -61,6 +61,30 @@ def test_cross_platform_launcher_acknowledges_and_detaches():
     print("PASS test_cross_platform_launcher_acknowledges_and_detaches")
 
 
+def test_session_start_reaches_the_flusher_for_its_clock():
+    """sessionStart is a rulebook event, but its clock dates the session's
+    first records, so the flusher gets it too; other rulebook events don't."""
+    seen: list[str] = []
+    original = (cursor_capture.spawn_cursor_flush, cursor_capture.cursor_rulebook.note,
+                sys.stdin, sys.stdout, sys.argv)
+    try:
+        cursor_capture.spawn_cursor_flush = lambda raw, event: seen.append(event)
+        cursor_capture.cursor_rulebook.note = lambda *_args, **_kwargs: None
+        outputs = []
+        for event in ("sessionStart", "preToolUse", "postToolUse"):
+            sys.stdin = io.TextIOWrapper(io.BytesIO(b'{"session_id":"s"}'))
+            sys.stdout = io.StringIO()
+            sys.argv = ["cursor_capture.py", event]
+            assert cursor_capture.main() == 0
+            outputs.append(json.loads(sys.stdout.getvalue()))
+    finally:
+        (cursor_capture.spawn_cursor_flush, cursor_capture.cursor_rulebook.note,
+         sys.stdin, sys.stdout, sys.argv) = original
+    assert seen == ["sessionStart"]
+    assert outputs[0] == {}          # sessionStart still takes no permission
+    print("PASS test_session_start_reaches_the_flusher_for_its_clock")
+
+
 def test_detached_temporary_stdin_survives_parent_close():
     """The detached child must retain stdin after the launcher returns.
 
@@ -120,11 +144,18 @@ def test_cursor_manifest_uses_one_portable_launcher_per_event():
         "beforeShellExecution", "afterShellExecution", "afterFileEdit",
         "afterAgentResponse", "stop", "beforeSubmitPrompt", "sessionEnd",
         # The rulebook lane (cursor_rulebook.py).
-        "sessionStart", "preToolUse", "postToolUse", "beforeReadFile",
+        "sessionStart", "preToolUse", "postToolUse", "postToolUseFailure",
+        "beforeReadFile",
+        # Sub-agents (cursor_agents.py): subagentStop names the child; Start
+        # is answered and ignored. Neither fires in cursor-agent.
+        "subagentStart", "subagentStop",
     }
-    # Only the Read/Task calls the rulebook lane tracks, not every tool call.
-    assert document["hooks"]["preToolUse"][0]["matcher"] == "Read|Task"
-    assert document["hooks"]["postToolUse"][0]["matcher"] == "Task"
+    # Only the calls the rulebook lanes read, not every tool call: Read/Task
+    # are tracked, edits are gated and post-read, Shell results post-read.
+    edits = "Write|Edit|StrReplace|MultiEdit|search_replace"
+    assert document["hooks"]["preToolUse"][0]["matcher"] == f"Read|Task|{edits}"
+    assert document["hooks"]["postToolUse"][0]["matcher"] == f"Task|Shell|{edits}"
+    assert document["hooks"]["postToolUseFailure"][0]["matcher"] == "Shell"
     for event, handlers in document["hooks"].items():
         assert len(handlers) == 1, event
         command = handlers[0]["command"]

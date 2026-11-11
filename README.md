@@ -387,7 +387,7 @@ With the variable unset, the default, none of this runs.
 
 ## Skills
 
-Sixteen skills ship in `plugins/memhub/skills/` (the deprecated `commands/`
+Seventeen skills ship in `plugins/memhub/skills/` (the deprecated `commands/`
 format is gone; invocation is unchanged). Each is both user-invocable as
 `/memhub:<name>` and **model-invocable**: saying "save this spec to memhub" or
 "what did we decide about X?" in plain language triggers the right skill.
@@ -420,6 +420,12 @@ format is gone; invocation is unchanged). Each is both user-invocable as
   sessions that predate capture, or ran while it was dormant. It imports under
   the session's own id, the same id capture uses, so a session is one
   conversation rather than two competing copies.
+- `/memhub:rewind` — selects a locally checkpointed Codex or Claude Code
+  message and launches a replacement prompt or model in an isolated checkout,
+  directly from the client. Studio is optional. Only the repository is
+  restored; retained extra writable directories and remote effects are not
+  rewound. Requires prior checkpoint capture and a supported native version
+  (Claude Code 2.1.322+, with its sandbox available).
 - `/memhub:save-artifact <file> [name]` — terminal upload of a file as an
   artifact. Both upload skills exist so the model never re-emits file or
   transcript content token by token — a helper script ships the bytes.

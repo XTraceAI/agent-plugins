@@ -8,6 +8,7 @@ claude-hooks.json or the generator, re-run it, commit both.
 
 Run: python3 codex_hooks_parity_test.py   (stdlib only)
 """
+import io
 import json
 import sys
 from pathlib import Path
@@ -42,14 +43,20 @@ def test_no_claude_only_capture_leaked():
 
 
 def test_user_bridge_covers_live_codex_capabilities():
+    """codex-cli 0.163 ships hook schemas for UserPromptSubmit (input `prompt`,
+    output additionalContext + systemMessage) and SessionEnd, read from the
+    binary. Without the first, `prompt` rules, prompt-armed ordering and a
+    reply advisory's delivery never run on Codex; without the second the last
+    turn's fires never get their `session_end`."""
     bridge = json.loads(BRIDGE_HOOKS.read_text(encoding="utf-8"))["hooks"]
-    assert set(bridge) == {"SessionStart", "PreToolUse", "PostToolUse", "Stop"}
+    events = {"SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
+              "Stop", "SessionEnd"}
+    assert set(bridge) == events
     assert all(len(groups) == 1 for groups in bridge.values())
     text = json.dumps(bridge)
-    for action in ("dispatch SessionStart", "dispatch PreToolUse",
-                   "dispatch PostToolUse", "dispatch Stop"):
-        assert action in text, action
-    assert text.count("memhub_hook_bridge.py") == 8  # Unix + Windows, 4 handlers
+    for event in events:
+        assert "dispatch " + event in text, event
+    assert text.count("memhub_hook_bridge.py") == 12  # Unix + Windows, 6 handlers
     print("PASS test_user_bridge_covers_live_codex_capabilities")
 
 
@@ -113,6 +120,43 @@ def test_the_pr_link_prefilter_spares_ordinary_shell_calls():
                   {"tool_input": {}}):
         assert codex_hook_bridge._may_touch_github(shape), f"must fail open: {shape!r}"
     print("PASS test_the_pr_link_prefilter_spares_ordinary_shell_calls")
+
+
+def test_memhub_link_pr_reaches_the_pr_link_trigger():
+    """A `link_pr` call is the bug-origin trigger (MemHub-Backend
+    pr-weight-success-spec.md §7.1): the bundled matcher must let it in and
+    the bridge must route it to pr_link_trigger — `unlink_pr` must not."""
+    import re  # noqa: PLC0415
+    sys.path.insert(0, str(ROOT / "plugins" / "memhub" / "scripts"))
+    import codex_hook_bridge  # noqa: PLC0415
+
+    matcher = re.compile(json.loads(CODEX_HOOKS.read_text(encoding="utf-8"))
+                         ["hooks"]["PostToolUse"][0]["matcher"])
+    claude = json.loads(CLAUDE_HOOKS.read_text(encoding="utf-8"))["hooks"]["PostToolUse"]
+    (claude_matcher,) = [re.compile(g["matcher"]) for g in claude
+                         if any(h["command"].endswith(" pr_link_trigger") for h in g["hooks"])]
+    link = "mcp__plugin_memhub_memhub__link_pr"
+    unlink = "mcp__plugin_memhub_memhub__unlink_pr"
+    for rx in (matcher, claude_matcher):
+        assert rx.match(link) and rx.match("mcp__memhub__link_pr"), rx.pattern
+        assert not rx.match(unlink), rx.pattern
+
+    calls = []
+    original_link = codex_hook_bridge._pr_link_result
+    original_rulebook = codex_hook_bridge._rulebook_result
+    original_stdout = sys.stdout
+    codex_hook_bridge._pr_link_result = lambda *_a, **_k: calls.append("link")
+    codex_hook_bridge._rulebook_result = lambda *_a, **_k: None
+    sys.stdout = io.StringIO()
+    try:
+        for tool in (link, unlink, "mcp__memhub__search_memory"):
+            codex_hook_bridge._dispatch_post(Path("/unused"), b"{}", {"tool_name": tool})
+    finally:
+        sys.stdout = original_stdout
+        codex_hook_bridge._pr_link_result = original_link
+        codex_hook_bridge._rulebook_result = original_rulebook
+    assert calls == ["link"], calls
+    print("PASS test_memhub_link_pr_reaches_the_pr_link_trigger")
 
 
 if __name__ == "__main__":

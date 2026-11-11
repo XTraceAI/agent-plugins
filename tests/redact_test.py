@@ -60,9 +60,84 @@ def test_ordinary_content_survives():
         ("prefix mentioned in docs", "keys look like mhk_… in the guide"),
         ("prefix with a short tail", "mhk_short"),
         ("a path", "/Users/x/.config/memhub-plugin/pak-api.host.json"),
-        ("base64ish but unprefixed", "ZXlKaGJHY2lPaUpTVXpJMU5pSXNJblI1Y0NJNiJ9"),
+        ("a full git sha, in text that is not a transcript record",
+         "merged at 6285d40179074934f43deba53713a7d286cb3d5f"),
+        ("an e-mail address, in text that is not a transcript record", "ask dana@example.com"),
+        ("a lockfile digest", "integrity sha512-Zk9xQ2pL7vN3mR8tY1wB5cD0eF6gH4iJZk9xQ2pL7vN3mR8tY1wB5cD0eF6gH4iJ"),
+        ("a long identifier made of words", "MemHubBackendCaptureRedactionModule2026"),
+        ("code that names a token", "token = self.token"),
     ]:
         check(label, r.redact_text(text), text)
+
+
+# The server's rules, ported (MemHub-Backend app/core/redaction.py). Values
+# are made up; each has the shape of the real thing.
+VENDOR = [
+    ("an Anthropic key", "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789", "sk-ant-<redacted>"),
+    ("a GitHub token", "ghp_" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8", "ghp_<redacted>"),
+    ("an AWS access key id", "AKIAIOSFODNN7EXAMPLE", "AKIA<redacted>"),
+    ("a Slack token", "xoxb-123456789012-abcdefghijkl", "xoxb-<redacted>"),
+]
+
+
+def test_the_servers_rules_run_on_this_machine():
+    print("\nthe server's rules run here, before upload")
+    for label, secret, crumb in VENDOR:
+        out = r.redact_text(f"export KEY={secret} done")
+        check(f"{label}: value gone", secret in out, False)
+    out = r.redact_text("use sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789 here")
+    check("a vendor key keeps its prefix as a breadcrumb", "sk-ant-<redacted>" in out, True)
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+    check("a JWT", r.redact_text(f"Authorization: Bearer {jwt}"), "Authorization: Bearer <redacted-jwt>")
+    check("a DSN password",
+          r.redact_text("postgres://app:hunter2secret@db.internal:5432/prod"),
+          "postgres://app:<redacted>@db.internal:5432/prod")
+    check("an ENV-style secret assignment",
+          r.redact_text("AUTH_JWT_SECRET=correct-horse-battery"), "AUTH_JWT_SECRET=<redacted>")
+    pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAx7Zk9xQ2pL7vN3mR8tY1wB5c\n-----END RSA PRIVATE KEY-----"
+    out = r.redact_text(pem)
+    check("a PEM private key body", "MIIEowIBAAKCAQEA" in out, False)
+    check("…its BEGIN and END lines stay", out.startswith("-----BEGIN RSA PRIVATE KEY-----<redacted>")
+          and out.endswith("-----END RSA PRIVATE KEY-----"), True)
+    bare = "Zk9xQ2pL7vN3mR8tY1wB5cD0eF6gH4iJ"       # no prefix, no name: entropy alone
+    check("a bare high-entropy token (Shannon entropy)", r.redact_text(f"the key is {bare}"),
+          "the key is <redacted>")
+    check("entropy is what decides", r.shannon_entropy(bare) >= 4.0
+          and r.shannon_entropy("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") == 0.0, True)
+    for text in ["AUTH_JWT_SECRET=correct-horse-battery", f"k {bare}", pem,
+                 "postgres://app:hunter2secret@db.internal:5432/prod", f"Bearer {jwt}"]:
+        once = r.redact_text(text)
+        check(f"idempotent: {text[:24]!r}", r.redact_text(once), once)
+
+
+def test_transcript_records_get_capture_strength():
+    print("\ntranscript records: capture strength, identifiers kept")
+    dd = "0123456789abcdef0123456789abcdef"            # a Datadog key is 32 hex
+    rec = {"type": "user", "uuid": "6285d40179074934f43deba53713a7d2",
+           "sessionId": "0123456789abcdef0123456789abcdef", "cwd": "/Users/dana/repo",
+           "gitBranch": "fm/topic", "timestamp": "2026-11-10T00:00:00Z",
+           "message": {"role": "user", "content": [
+               {"type": "tool_result", "tool_use_id": "toolu_01AbCdEfGhIjKlMnOpQrStUv",
+                "content": f"DD_API_KEY={dd}\nbare {dd}\nmail dana@example.com\ncard 4111 1111 1111 1111"},
+               {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                                            "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"}}]}}
+    out = r.redact_records([rec])[0]
+    text = out["message"]["content"][0]["content"]
+    check("a named hex key", f"DD_API_KEY={dd}" in text, False)
+    check("a bare 32-hex token", dd in text, False)
+    check("an e-mail address", "dana@example.com" in text, False)
+    check("a card number", "4111 1111 1111 1111" in text, False)
+    check("the record's uuid is untouched", out["uuid"], rec["uuid"])
+    check("a 32-hex session id is untouched", out["sessionId"], rec["sessionId"])
+    check("cwd and branch are untouched", (out["cwd"], out["gitBranch"]), (rec["cwd"], rec["gitBranch"]))
+    check("the tool-call id is untouched", out["message"]["content"][0]["tool_use_id"],
+          rec["message"]["content"][0]["tool_use_id"])
+    check("image bytes are untouched", out["message"]["content"][1]["source"]["data"],
+          rec["message"]["content"][1]["source"]["data"])
+    check("idempotent, so the server's pass changes nothing", r.redact_records([out])[0], out)
+    clean = {"type": "assistant", "uuid": "u1", "message": {"role": "assistant", "content": "ran the tests, 12 passed"}}
+    check("a clean record comes back equal", r.redact_records([clean])[0], clean)
+    check("the input is not mutated", rec["message"]["content"][0]["content"].startswith("DD_API_KEY=0123"), True)
 
 
 def test_structure_is_preserved():
@@ -148,6 +223,8 @@ def test_identities_for_a_model_bound_window():
 
 if __name__ == "__main__":
     for test in (test_secrets_are_removed, test_ordinary_content_survives,
+                 test_the_servers_rules_run_on_this_machine,
+                 test_transcript_records_get_capture_strength,
                  test_structure_is_preserved, test_never_raises, test_batch,
                  test_identities_for_a_model_bound_window):
         test()

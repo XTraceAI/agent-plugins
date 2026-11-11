@@ -186,6 +186,7 @@ def _payload(path: Path, event: str, generation: str, text: str) -> dict:
         "transcript_path": str(path),
         "workspace_roots": [str(path.parent)],
         "model": "cursor-test-model",
+        # IDE input is gross of its 5 cache reads, so 95 is stored.
         "input_tokens": 100, "output_tokens": 10,
         "cache_read_tokens": 5, "cache_write_tokens": 1,
         "status": "completed",
@@ -256,7 +257,7 @@ def test_main_flow_pins_persist_and_ship():
             # backlog; the mid-turn record has no real clock and stays
             # unmeasured.
             assert _stamps_of(calls[0]) == [ISO_1, ISO_1, None, NOW_1]
-            assert calls[0][3]["message"]["usage"]["input_tokens"] == 100
+            assert calls[0][3]["message"]["usage"]["input_tokens"] == 95
             state = cursor_flush._read_state(SESSION)
             assert sorted(state["record_ts"].values(),
                           key=lambda v: (v is None, v)) == [
@@ -272,7 +273,7 @@ def test_main_flow_pins_persist_and_ship():
             assert len(calls) == 2
             assert _stamps_of(calls[1]) == [
                 ISO_1, ISO_1, None, NOW_1, ISO_2, NOW_2, NOW_2]
-            assert calls[1][6]["message"]["usage"]["input_tokens"] == 100
+            assert calls[1][6]["message"]["usage"]["input_tokens"] == 95
             assert _stamps_of(calls[1])[:4] == _stamps_of(calls[0])
 
             # A third boundary with NO new content but a fresh usage sample:
@@ -348,8 +349,8 @@ def test_main_flow_pins_persist_and_ship():
                 ISO_1, ISO_1, None, None, ISO_2, None, None, None]
             cursor_flush.apply_session_state(records, SESSION)
             assert _stamps_of(records) == _stamps_of(calls[3])
-            assert records[3]["message"]["usage"]["input_tokens"] == 100
-            assert records[7]["message"]["usage"]["input_tokens"] == 100
+            assert records[3]["message"]["usage"]["input_tokens"] == 95
+            assert records[7]["message"]["usage"]["input_tokens"] == 95
         finally:
             cursor_flush.STATE_DIR = originals["state_dir"]
             cursor_flush._CURSOR_PROJECTS = originals["projects"]
@@ -412,6 +413,9 @@ def test_event_can_flush_seals_quiet_observers():
         assert can(event, {}), event
     assert not can("someFutureHook", {})
     assert not can("unknown", {})
+    # sessionStart saves only its clock (see the sessionStart tests below);
+    # it never reads the transcript, so it stays outside the observers.
+    assert not can("sessionStart", {})
     print("PASS test_event_can_flush_seals_quiet_observers")
 
 
@@ -470,6 +474,259 @@ def test_apply_session_state_refuses_non_uuid_ids():
         finally:
             cursor_flush.STATE_DIR = old_state
     print("PASS test_apply_session_state_refuses_non_uuid_ids")
+
+
+# ---- hook wall clocks: sessionStart, beforeSubmitPrompt, sessionEnd ------
+
+
+class _Flow:
+    """main() against a fixture transcript, with the clock and send faked."""
+
+    def __init__(self, root: Path):
+        self.path = (root / "projects" / "fixture" / "agent-transcripts" /
+                     SESSION / f"{SESSION}.jsonl")
+        self.root = root
+        self.calls: list[list[dict]] = []
+        self.now = NOW_1
+
+    def __enter__(self):
+        self.originals = (cursor_flush.STATE_DIR, cursor_flush._CURSOR_PROJECTS,
+                          cursor_flush.cursor_reader._CHATS,
+                          cursor_flush.cursor_reader._PROJECTS,
+                          cursor_flush._flush, cursor_flush._log,
+                          cursor_flush._now_iso)
+
+        async def fake_flush(uuid, source_path, blob_ids, flush_mode="now",
+                             **kwargs):
+            self.calls.append(json.loads(json.dumps(kwargs["records"])))
+            cursor_flush._save_state(
+                uuid, transcript_revision=kwargs["source_revision"],
+                sent_usage_generations=sorted(kwargs["applied_usage"]),
+                pending_pr_urls=[], last_flush_at=1_787_000_000.0)
+
+        cursor_flush.STATE_DIR = self.root / "state"
+        cursor_flush._CURSOR_PROJECTS = self.root / "projects"
+        cursor_flush.cursor_reader._CHATS = self.root / "chats"
+        cursor_flush.cursor_reader._PROJECTS = self.root / "projects"
+        cursor_flush._flush = fake_flush
+        cursor_flush._log = lambda _message: None
+        cursor_flush._now_iso = lambda: self.now
+        return self
+
+    def __exit__(self, *_exc):
+        (cursor_flush.STATE_DIR, cursor_flush._CURSOR_PROJECTS,
+         cursor_flush.cursor_reader._CHATS, cursor_flush.cursor_reader._PROJECTS,
+         cursor_flush._flush, cursor_flush._log,
+         cursor_flush._now_iso) = self.originals
+
+    def hook(self, event: str, now: str, **extra) -> None:
+        self.now = now
+        payload = {"hook_event_name": event, "session_id": SESSION,
+                   "conversation_id": SESSION, "generation_id": "",
+                   "workspace_roots": [str(self.path.parent)],
+                   "model": "cursor-test-model",
+                   # sessionStart's transcript_path is null on IDE and CLI.
+                   "transcript_path": (None if event == "sessionStart"
+                                       else str(self.path))}
+        payload.update(extra)
+        assert _run_main(event, payload) == 0
+
+    def state(self) -> dict:
+        return cursor_flush._read_state(SESSION)
+
+
+START = "2026-08-23T18:16:12.481Z"     # inside TAG_1's minute (18:16)
+END_1 = "2026-08-23T18:18:20.904Z"     # after TAG_2's minute starts (18:18)
+END_2 = "2026-08-23T18:18:47.115Z"
+
+
+def test_session_start_saves_its_clock_without_observing():
+    with tempfile.TemporaryDirectory() as td, _Flow(Path(td)) as flow:
+        _write_rows(flow.path, TURN_1)
+        flow.hook("sessionStart", START)
+        state = flow.state()
+        assert state["session_start_at"] == START
+        # No pin map, no source, no send: the first REAL observation is still
+        # a first observation, so its backlog semantics are unchanged.
+        assert "record_ts" not in state and "source_kind" not in state
+        assert flow.calls == []
+        # A repeated sessionStart never moves the session's start later.
+        flow.hook("sessionStart", "2026-08-23T18:40:00.000Z")
+        assert flow.state()["session_start_at"] == START
+    print("PASS test_session_start_saves_its_clock_without_observing")
+
+
+def test_cli_session_end_dates_each_invocation_and_resends_are_stable():
+    """cursor-agent: sessionStart once, then one sessionEnd per invocation
+    and no usage hooks. Before, invocation 1 shipped only minute tags and
+    undated records — the session spanned 0 s of agent time."""
+    with tempfile.TemporaryDirectory() as td, _Flow(Path(td)) as flow:
+        flow.hook("sessionStart", START)
+        _write_rows(flow.path, TURN_1)
+        flow.hook("sessionEnd", END_1, reason="completed")
+        assert len(flow.calls) == 1
+        # Banner and prompt: the session's exact start beats the 18:16 tag.
+        # Final assistant: the sessionEnd clock, though this is the first
+        # observation. The mid-turn record has no real clock and stays NULL.
+        assert _stamps_of(flow.calls[0]) == [START, START, None, END_1]
+
+        # --resume: no sessionStart. Invocation 2's prompt carries only an
+        # 18:18 tag, which reads EARLIER than invocation 1's end (18:18:20):
+        # it is raised to that bound rather than reordered before it.
+        _write_rows(flow.path, TURN_1 + TURN_2)
+        flow.hook("sessionEnd", END_2, reason="completed")
+        assert len(flow.calls) == 2
+        stamps = _stamps_of(flow.calls[1])
+        assert stamps == [START, START, None, END_1, END_1, END_2, END_2]
+        assert stamps[:4] == _stamps_of(flow.calls[0])
+        dated = [cursor_flush._parse_iso(s) for s in stamps if s]
+        assert dated == sorted(dated)
+        assert (dated[-1] - dated[0]).total_seconds() > 0
+
+        # A re-send at a much later wall clock (forced here by queued PR
+        # evidence) ships the ORIGINAL dates, never its own clock.
+        flow.hook("afterShellExecution", "2026-08-23T23:00:00.000Z",
+                  command="gh pr create --fill",
+                  output="https://github.com/xtraceai/agent-plugins/pull/9")
+        assert len(flow.calls) == 3
+        assert _stamps_of(flow.calls[2]) == stamps
+        records, _meta = cursor_reader.to_canonical(flow.path, session_id=SESSION)
+        cursor_flush.apply_session_state(records, SESSION)
+        assert _stamps_of(records) == stamps
+    print("PASS test_cli_session_end_dates_each_invocation_and_resends_are_stable")
+
+
+def test_session_end_dates_its_records_at_the_hook_clock():
+    """The sessionEnd boundary may wait on a busy upload before it reads;
+    the invocation's new records must not then be dated after the final
+    record its clock dates (seen live: 4 ms out of order)."""
+    with tempfile.TemporaryDirectory() as td, _Flow(Path(td)) as flow:
+        flow.hook("sessionStart", START)
+        _write_rows(flow.path, TURN_1)
+        flow.hook("sessionEnd", END_1)
+        _write_rows(flow.path, TURN_1 + TURN_2)
+        later = iter([END_2, "2026-08-23T18:18:49.000Z"])
+        cursor_flush._now_iso = lambda: next(later)
+        assert _run_main("sessionEnd", {
+            "hook_event_name": "sessionEnd", "session_id": SESSION,
+            "conversation_id": SESSION, "transcript_path": str(flow.path),
+            "workspace_roots": [str(flow.path.parent)]}) == 0
+        assert _stamps_of(flow.calls[-1])[-2:] == [END_2, END_2]
+    print("PASS test_session_end_dates_its_records_at_the_hook_clock")
+
+
+def test_session_end_never_dates_records_written_while_it_waits():
+    """An in-flight send can hold the upload lock while the next --resume
+    invocation writes its turn. sessionEnd observes before that wait, so its
+    clock dates only its own invocation; the next sessionEnd keeps its end."""
+    with tempfile.TemporaryDirectory() as td, _Flow(Path(td)) as flow:
+        flow.hook("sessionStart", START)
+        _write_rows(flow.path, TURN_1)
+        real_acquire = cursor_flush._acquire
+
+        def busy_upload(uuid, blocking=False, *, observations=False):
+            if not observations:
+                # Invocation 2 runs while this hook waits on the send.
+                _write_rows(flow.path, TURN_1 + TURN_2)
+                flow.now = "2026-08-23T18:18:40.000Z"
+            return real_acquire(uuid, blocking, observations=observations)
+
+        cursor_flush._acquire = busy_upload
+        try:
+            flow.hook("sessionEnd", END_1)
+        finally:
+            cursor_flush._acquire = real_acquire
+        assert _stamps_of(flow.calls[-1]) == [START, START, None, END_1]
+        flow.hook("sessionEnd", END_2)
+        stamps = _stamps_of(flow.calls[-1])
+        assert stamps == [START, START, None, END_1, END_1, END_2, END_2]
+    print("PASS test_session_end_never_dates_records_written_while_it_waits")
+
+
+def test_ide_before_submit_prompt_clock_beats_the_minute_tag():
+    prompt_1 = "2026-08-23T18:16:31.579Z"
+    stop_1 = "2026-08-23T18:16:40.250Z"
+    prompt_2 = "2026-08-23T18:18:02.991Z"
+    stop_2 = "2026-08-23T18:18:33.425Z"
+    with tempfile.TemporaryDirectory() as td, _Flow(Path(td)) as flow:
+        # The IDE fires sessionStart when the chat opens, which can be well
+        # before the first prompt: 18:15:40 is outside the 18:16 tag's
+        # minute, so it dates nothing and the banner keeps its tag.
+        flow.hook("sessionStart", "2026-08-23T18:15:40.000Z")
+        # beforeSubmitPrompt fires before Cursor writes the prompt (the
+        # transcript does not exist yet): its clock is queued, not lost.
+        flow.hook("beforeSubmitPrompt", prompt_1, prompt="Reply  once")
+        assert len(flow.state()["prompt_clocks"]) == 1
+        _write_rows(flow.path, TURN_1)
+        flow.hook("stop", stop_1, generation_id=GEN_1, input_tokens=100,
+                  output_tokens=10, status="completed")
+        assert _stamps_of(flow.calls[-1]) == [ISO_1, prompt_1, None, stop_1]
+        assert flow.state()["prompt_clocks"] == []
+
+        # Turn 2's clock waits through a boundary that sees no new prompt,
+        # then lands on the prompt whose text it announced.
+        flow.hook("beforeSubmitPrompt", prompt_2, prompt="Edit it")
+        _write_rows(flow.path, TURN_1 + TURN_2)
+        flow.hook("stop", stop_2, generation_id=GEN_2, input_tokens=100,
+                  output_tokens=10, status="completed")
+        assert _stamps_of(flow.calls[-1]) == [
+            ISO_1, prompt_1, None, stop_1, prompt_2, stop_2, stop_2]
+        assert flow.state()["prompt_clocks"] == []
+    print("PASS test_ide_before_submit_prompt_clock_beats_the_minute_tag")
+
+
+def test_prompt_clock_only_dates_its_own_prompt():
+    with tempfile.TemporaryDirectory() as td, _Flow(Path(td)) as flow:
+        # A submit Cursor never wrote (different text) stays queued and
+        # dates nothing; the prompt keeps its tag.
+        flow.hook("beforeSubmitPrompt", "2026-08-23T18:16:20.000Z",
+                  prompt="something else")
+        _write_rows(flow.path, TURN_1)
+        flow.hook("stop", NOW_1, generation_id=GEN_1, input_tokens=100,
+                  output_tokens=10, status="completed")
+        assert _stamps_of(flow.calls[-1]) == [ISO_1, ISO_1, None, NOW_1]
+        assert len(flow.state()["prompt_clocks"]) == 1
+    # Unit: a clock that reads earlier than the prompt's own tag minute is
+    # not its clock; an already-pinned prompt is never re-dated.
+    records = [_rec("banner", ts=ISO_1, role="user"), {
+        "type": "user", "uuid": "ask", "timestamp": ISO_2,
+        "message": {"role": "user", "content": "Edit it"}}]
+    state = {"prompt_clocks": [{"at": "2026-08-23T18:17:59.000Z",
+                                "digest": cursor_flush._prompt_digest("Edit it")}]}
+    assert cursor_flush._exact_clocks(records, state, "stop", NOW_2) == ({}, [])
+    state["record_ts"] = {"ask": ISO_2}
+    state["prompt_clocks"][0]["at"] = NOW_2
+    assert cursor_flush._exact_clocks(records, state, "stop", NOW_2) == ({}, [])
+    print("PASS test_prompt_clock_only_dates_its_own_prompt")
+
+
+def test_new_prompt_is_never_dated_before_the_previous_turn():
+    def ask(uuid, ts):
+        return {"type": "user", "uuid": uuid, "timestamp": ts,
+                "message": {"role": "user", "content": uuid}}
+    late = "2026-08-23T18:18:40.000Z"
+    records = [ask("p1", ISO_1), _rec("a1"), ask("p2", ISO_2), _rec("a2")]
+    stamps = cursor_flush._stamp_records(
+        records, {"p1": ISO_1, "a1": late}, NOW_2, first_observation=False)
+    # p2's tag (18:18:00) predates a1's pin: raised to it, not reordered.
+    assert _stamps_of(records) == [ISO_1, late, late, NOW_2]
+    assert stamps["p2"] == late
+    # Same for a hook clock; and a later-than-floor clock is left alone.
+    records = [ask("p1", ISO_1), _rec("a1"), ask("p2", ISO_2)]
+    cursor_flush._stamp_records(
+        records, {"p1": ISO_1, "a1": late}, NOW_2, first_observation=False,
+        clocks={"p2": "2026-08-23T18:18:10.000Z"})
+    assert records[2]["timestamp"] == late
+    records = [ask("p1", ISO_1), _rec("a1"), ask("p2", ISO_2)]
+    cursor_flush._stamp_records(
+        records, {"p1": ISO_1, "a1": NOW_1}, NOW_2, first_observation=False,
+        clocks={"p2": "2026-08-23T18:18:10.000Z"})
+    assert records[2]["timestamp"] == "2026-08-23T18:18:10.000Z"
+    # Read-only replay never re-dates: pins and tags ride as they are.
+    records = [ask("p1", ISO_1), _rec("a1"), ask("p2", ISO_2)]
+    cursor_flush._stamp_records(records, {"a1": late}, None, first_observation=True)
+    assert _stamps_of(records) == [ISO_1, late, ISO_2]
+    print("PASS test_new_prompt_is_never_dated_before_the_previous_turn")
 
 
 if __name__ == "__main__":

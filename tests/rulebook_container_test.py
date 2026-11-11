@@ -443,10 +443,9 @@ def test_delivery_lanes() -> None:
         # The advise-feedback hint sits between the rules and the disclosure;
         # like the disclosure it carries no book facts and comes from the
         # hook's own constant.
-        check("no book facts → byte-identical to the pre-container output, plus the disclosure",
+        check("no book facts → byte-identical to the pre-container output, plus the notes",
               ctx(out_old) == pre_container + "\n" + hook.ADVISE_FEEDBACK_HINT + "\n"
-              + hook.disclosure_instruction(
-                  ["📏 Rule fired: Pair advisory", "📏 Rule fired: Team advisory"]),
+              + hook.CREDIT_NOTE,
               repr(ctx(out_old)))
 
         # --- an anchor rule is not displaced by a wider book ----------------
