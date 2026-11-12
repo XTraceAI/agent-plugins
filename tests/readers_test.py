@@ -159,6 +159,9 @@ def test_codex_transform():
         "output_tokens": 20,
         "cache_read_input_tokens": 60,
         "cache_creation_input_tokens": 10,
+        # Reasoning delta from a zero baseline; last request's prompt size.
+        "output_tokens_details": {"thinking_tokens": 5},
+        "prompt_tokens": 100,
     }, recs[3]
     print("PASS test_codex_transform")
 
@@ -198,13 +201,216 @@ def test_codex_usage_uses_cumulative_deltas():
         "input_tokens": 30, "output_tokens": 20,
         "cache_read_input_tokens": 60,
         "cache_creation_input_tokens": 10,
+        "output_tokens_details": {"thinking_tokens": 5},
+        "prompt_tokens": 100,
     }, assistants[0]
+    # Reasoning is a cumulative delta too (8 - 5), never the rebroadcast total.
     assert assistants[1]["message"]["usage"] == {
         "input_tokens": 30, "output_tokens": 15,
         "cache_read_input_tokens": 40,
         "cache_creation_input_tokens": 10,
+        "output_tokens_details": {"thinking_tokens": 3},
+        "prompt_tokens": 180,
     }, assistants[1]
     print("PASS test_codex_usage_uses_cumulative_deltas")
+
+
+def _tc(total, last=None, rate_limits=None, stamp="2026-01-01T00:00:00Z"):
+    payload = {"type": "token_count",
+               "info": None if total is None else
+               {"total_token_usage": total, "last_token_usage": last or total}}
+    if rate_limits is not None:
+        payload["rate_limits"] = rate_limits
+    return {"timestamp": stamp, "type": "event_msg", "payload": payload}
+
+
+def _usage(inp, out, reasoning, cached=0):
+    return {"input_tokens": inp, "cached_input_tokens": cached,
+            "cache_write_input_tokens": 0, "output_tokens": out,
+            "reasoning_output_tokens": reasoning, "total_tokens": inp + out}
+
+
+def _answer(text):
+    return _line("response_item", {"type": "message", "role": "assistant",
+                                   "content": [{"type": "output_text", "text": text}]})
+
+
+RATE_LIMITS = {
+    "limit_id": "codex", "limit_name": None,
+    "primary": {"used_percent": 0.0, "window_minutes": 300, "resets_at": 1792049838},
+    "secondary": {"used_percent": 10.0, "window_minutes": 10080,
+                  "resets_at": 1792538546, "account_id": "acct-should-not-leave"},
+    "credits": {"has_credits": False, "unlimited": False, "balance": None},
+    "individual_limit": {"used_percent": 3.0},
+    "spend_control_reached": None, "plan_type": "team",
+    "rate_limit_reached_type": None,
+    "access_token": "sk-should-never-leave",
+}
+
+
+def test_codex_malformed_reasoning_leaves_counts_unchanged():
+    for bad in ("5", True, -1, None, 2.5):
+        total = _usage(100, 20, 0)
+        total["reasoning_output_tokens"] = bad
+        roll = [_line("session_meta", {"id": "r", "cwd": "/x"}), _answer("a"), _tc(total)]
+        recs, _ = codex.rollout_to_claude_records(roll)
+        usage = recs[-1]["message"]["usage"]
+        assert "output_tokens_details" not in usage, (bad, usage)
+        assert usage["input_tokens"] == 100 and usage["output_tokens"] == 20, usage
+    # A malformed snapshot breaks the reasoning chain for exactly one step: the
+    # next delta has no known baseline and is skipped, never invented.
+    first, second, third = _usage(10, 2, 1), _usage(20, 4, "x"), _usage(30, 6, 9)
+    roll = [_line("session_meta", {"id": "r", "cwd": "/x"}),
+            _answer("a"), _tc(first), _answer("b"), _tc(second),
+            _answer("c"), _tc(third)]
+    recs, _ = codex.rollout_to_claude_records(roll)
+    details = [r["message"]["usage"].get("output_tokens_details") for r in recs]
+    assert details == [{"thinking_tokens": 1}, None, None], details
+    print("PASS test_codex_malformed_reasoning_leaves_counts_unchanged")
+
+
+def test_codex_inherited_baseline_has_no_first_thinking_delta():
+    roll = [_line("session_meta", {"id": "r", "cwd": "/x"}),
+            _tc(_usage(50, 5, 40)), _answer("a"), _tc(_usage(60, 7, 43))]
+    recs, _ = codex.rollout_to_claude_records(roll, usage_baseline_unknown=True)
+    assert recs[-1]["message"]["usage"]["output_tokens_details"] == {"thinking_tokens": 3}
+    seeded, _ = codex.rollout_to_claude_records(
+        roll[2:], initial_usage_total=codex._usage_total(_usage(50, 5, 40)))
+    assert "output_tokens_details" not in seeded[-1]["message"]["usage"], seeded
+    print("PASS test_codex_inherited_baseline_has_no_first_thinking_delta")
+
+
+def test_codex_prompt_tokens_come_from_the_last_request():
+    # One delta covering two requests: summed input 300k, last request 150k.
+    total = _usage(300_000, 10, 0)
+    last = _usage(150_000, 5, 0)
+    roll = [_line("session_meta", {"id": "p", "cwd": "/x"}), _answer("a"), _tc(total, last)]
+    recs, _ = codex.rollout_to_claude_records(roll)
+    assert recs[-1]["message"]["usage"]["prompt_tokens"] == 150_000
+    for bad in (-1, True, "150000", 2**31):
+        last = _usage(150_000, 5, 0)
+        last["input_tokens"] = bad
+        roll[-1] = _tc(total, last)
+        recs, _ = codex.rollout_to_claude_records(roll)
+        assert "prompt_tokens" not in recs[-1]["message"]["usage"], bad
+    print("PASS test_codex_prompt_tokens_come_from_the_last_request")
+
+
+def test_codex_service_tier_is_carried_when_codex_names_one():
+    roll = [_line("session_meta", {"id": "t", "cwd": "/x"}),
+            _line("event_msg", {"type": "thread_settings_applied",
+                                "thread_settings": {"service_tier": "default"}}),
+            _answer("a"), _tc(_usage(10, 2, 0)),
+            _line("turn_context", {"model": "m", "service_tier": "priority"}),
+            _answer("b"), _tc(_usage(20, 4, 0)),
+            _line("turn_context", {"model": "m"}),
+            _answer("c"), _tc(_usage(30, 6, 0)),
+            _line("event_msg", {"type": "thread_settings_applied",
+                                "thread_settings": {"service_tier": None}}),
+            _answer("d"), _tc(_usage(40, 8, 0)),
+            _line("turn_context", {"model": "m", "service_tier": "flex"}),
+            _line("turn_context", {"model": "m", "service_tier": 7}),
+            _answer("e"), _tc(_usage(50, 10, 0))]
+    recs, _ = codex.rollout_to_claude_records(roll)
+    tiers = [r["message"]["usage"].get("service_tier") for r in recs]
+    # An absent key keeps the tier; a present one resets it, even to null or
+    # an unusable value, so a stale tier never lingers on later requests.
+    assert tiers == ["default", "priority", "priority", None, None], tiers
+    bare = [roll[0], _answer("a"), _tc(_usage(10, 2, 0))]
+    recs, _ = codex.rollout_to_claude_records(bare)
+    assert "service_tier" not in recs[-1]["message"]["usage"]
+    print("PASS test_codex_service_tier_is_carried_when_codex_names_one")
+
+
+def test_codex_merge_usage_rules():
+    record = {"message": {"usage": {"input_tokens": 5, "prompt_tokens": 900,
+                                    "output_tokens_details": {"thinking_tokens": 2},
+                                    "service_tier": "flex"}}}
+    codex._merge_usage(record, {"input_tokens": 3, "prompt_tokens": 400,
+                                "output_tokens_details": {"thinking_tokens": 4,
+                                                          "bogus": "x"},
+                                "service_tier": "default", "flag": True})
+    assert record["message"]["usage"] == {
+        "input_tokens": 8, "prompt_tokens": 900,          # prompt keeps the max
+        "output_tokens_details": {"thinking_tokens": 6},  # nested counts add
+        "service_tier": "default",                        # text: last wins
+    }, record
+    # A type that does not match what is already there is skipped, not coerced.
+    clash = {"message": {"usage": {"output_tokens_details": 3, "prompt_tokens": "9"}}}
+    codex._merge_usage(clash, {"output_tokens_details": {"thinking_tokens": 1},
+                               "prompt_tokens": 4})
+    assert clash["message"]["usage"] == {"output_tokens_details": 3, "prompt_tokens": "9"}
+    text_clash = {"message": {"usage": {"service_tier": 5}}}
+    codex._merge_usage(text_clash, {"service_tier": "flex"})
+    assert text_clash["message"]["usage"] == {"service_tier": 5}
+    print("PASS test_codex_merge_usage_rules")
+
+
+def test_codex_account_limits_are_allowlisted():
+    roll = [_line("session_meta", {"id": "l", "cwd": "/x"}), _answer("a"),
+            _tc(_usage(10, 2, 0), rate_limits={"plan_type": "plus"},
+                stamp="2026-10-14T19:40:10Z"),
+            # A rate-limit-only update carries no info; it is still the latest.
+            _tc(None, rate_limits=RATE_LIMITS, stamp="2026-10-14T19:40:11.123Z")]
+    recs, meta = codex.rollout_to_claude_records(roll)
+    assert meta["account_limits"] == {
+        "source": "codex", "observed_at": "2026-10-14T19:40:11.123000Z",
+        "plan_type": "team",
+        "primary": {"used_percent": 0.0, "window_minutes": 300, "resets_at": 1792049838},
+        "secondary": {"used_percent": 10.0, "window_minutes": 10080,
+                      "resets_at": 1792538546},
+        "credits": {"has_credits": False, "unlimited": False, "balance": None},
+        "rate_limit_reached_type": None, "limit_id": "codex", "limit_name": None,
+        "spend_control_reached": None,
+    }, meta["account_limits"]
+    assert recs[-1]["message"]["usage"]["input_tokens"] == 10
+    _, without = codex.rollout_to_claude_records(roll[:2])
+    assert without["account_limits"] is None
+    print("PASS test_codex_account_limits_are_allowlisted")
+
+
+def test_codex_garbage_rate_limits_never_fail_a_read():
+    from readers import codex_limits
+    base = [_line("session_meta", {"id": "g", "cwd": "/x"}), _answer("a")]
+    garbage_values = (
+        ["not", "a", "dict"], "string",
+        {"plan_type": 7, "primary": [1], "secondary": {"used_percent": True,
+         "window_minutes": -5, "resets_at": "soon"}, "credits": "lots",
+         "limit_id": {"x": 1}, "spend_control_reached": "yes"},
+        {"primary": {"used_percent": float("nan")}},
+        {"primary": {"used_percent": 101}},
+    )
+    for garbage in garbage_values:
+        roll = base + [_tc(_usage(10, 2, 0), rate_limits=garbage)]
+        for strict in (False, True):   # a checked read does not fail either
+            recs, meta = codex.rollout_to_claude_records(roll, strict=strict)
+            assert meta["account_limits"] is None, (garbage, meta["account_limits"])
+            assert recs[-1]["message"]["usage"]["input_tokens"] == 10
+    # An undated snapshot cannot be ordered against a newer one: dropped.
+    undated = base + [_tc(_usage(10, 2, 0), rate_limits={"plan_type": "team"})]
+    undated[-1].pop("timestamp")
+    _, meta = codex.rollout_to_claude_records(undated, strict=True)
+    assert meta["account_limits"] is None, meta
+    assert codex_limits.sanitize({"plan_type": "team"}, "yesterday") is None
+    # Parity with the backend sanitizer: empty strings are dropped, and a
+    # snapshot whose surviving keys are all null is no snapshot.
+    stamp = "2026-10-14T19:40:11Z"
+    assert codex_limits.sanitize({"plan_type": "", "limit_id": ""}, stamp) is None
+    assert codex_limits.sanitize({"limit_name": None,
+                                  "spend_control_reached": None}, stamp) is None
+    kept = codex_limits.sanitize({"plan_type": "team", "limit_name": None}, stamp)
+    assert kept["plan_type"] == "team" and kept["limit_name"] is None, kept
+    # The parser itself never raises, whatever it is handed.
+    class Hostile(dict):
+        def get(self, *_a, **_k):
+            raise RuntimeError("boom")
+    assert codex_limits.snapshot_from(Hostile(plan_type="x"), "2026-10-14T19:40:11Z") is None
+    # Equal instants in different spellings canonicalise identically.
+    assert (codex_limits.canonical_observed_at("2026-10-14T19:40:11Z")
+            == codex_limits.canonical_observed_at("2026-10-14T21:40:11.000000+02:00")
+            == codex_limits.canonical_observed_at("2026-10-14T19:40:11.000000000Z")
+            == "2026-10-14T19:40:11.000000Z")
+    print("PASS test_codex_garbage_rate_limits_never_fail_a_read")
 
 
 def test_codex_recovers_wrapped_ask_without_shifting_legacy_ids():
@@ -300,6 +506,7 @@ def test_codex_usage_without_assistant_gets_stable_record():
         "input_tokens": 4, "output_tokens": 2,
         "cache_read_input_tokens": 8,
         "cache_creation_input_tokens": 0,
+        "prompt_tokens": 12,
     }, usage_record
     assert usage_record["uuid"] == second[-1]["uuid"]
 
@@ -343,12 +550,14 @@ def test_codex_second_usage_without_output_does_not_hit_prior_assistant():
         "input_tokens": 6, "output_tokens": 2,
         "cache_read_input_tokens": 4,
         "cache_creation_input_tokens": 0,
+        "prompt_tokens": 10,
     }, assistants[0]
     assert assistants[1]["message"]["content"] == [{"type": "text", "text": ""}]
     assert assistants[1]["message"]["usage"] == {
         "input_tokens": 5, "output_tokens": 1,
         "cache_read_input_tokens": 3,
         "cache_creation_input_tokens": 0,
+        "prompt_tokens": 18,
     }, assistants[1]
     print("PASS test_codex_second_usage_without_output_does_not_hit_prior_assistant")
 
@@ -367,6 +576,29 @@ def test_codex_missing_call_id_orphans_uniquely():
            recs[2]["message"]["content"][0]["tool_use_id"]]
     assert all(ids) and len(set(ids)) == 3, ids   # never None, never mispaired
     print("PASS test_codex_missing_call_id_orphans_uniquely")
+
+
+def test_codex_records_carry_the_session_branch():
+    """Codex names the branch once, in ``session_meta.payload.git``; every
+    record carries it as Claude's top-level ``gitBranch`` — the key the
+    server's ``branches_from_records`` reads — and nothing else changes."""
+    plain, _ = codex.rollout_to_claude_records(CODEX_SYNTH)
+    meta = dict(CODEX_SYNTH[0], payload={**CODEX_SYNTH[0]["payload"],
+                                         "git": {"branch": "  feat/x  ",
+                                                 "commit_hash": "abc123"}})
+    branched, _ = codex.rollout_to_claude_records([meta, *CODEX_SYNTH[1:]])
+    assert branched and all(r.get("gitBranch") == "feat/x" for r in branched), branched
+    assert not any("commit_hash" in json.dumps(r) for r in branched)
+    # Identity is untouched: the same uuids, the same records otherwise.
+    assert [{k: v for k, v in r.items() if k != "gitBranch"} for r in branched] == plain
+    assert not readers.validate_canonical(branched)
+    assert not any("gitBranch" in r for r in plain), "absent stays absent"
+    for git in ({"branch": "   "}, {"branch": 7}, {"branch": "b" * 256}, "main", None, {}):
+        roll = [dict(CODEX_SYNTH[0], payload={**CODEX_SYNTH[0]["payload"], "git": git}),
+                *CODEX_SYNTH[1:]]
+        recs, _ = codex.rollout_to_claude_records(roll)
+        assert not any("gitBranch" in r for r in recs), git
+    print("PASS test_codex_records_carry_the_session_branch")
 
 
 def test_clean_user_text():
@@ -512,7 +744,7 @@ def _make_cursor_transcript(base: Path,
 
 def _make_cursor_store(base: Path, uuid: str = "11111111-2222-3333-4444-555555555555",
                        cwd: str = "/repo/proj", schema_version: int = 1,
-                       node_clocks: bool = True) -> Path:
+                       node_clocks: bool = True, git_branch=None) -> Path:
     """Build a store.db + meta.json mirroring the observed format: JSON leaf
     blobs id'd by sha256, an interior node, and a root whose protobuf field 1
     lists child hashes in order."""
@@ -520,10 +752,12 @@ def _make_cursor_store(base: Path, uuid: str = "11111111-2222-3333-4444-55555555
     import sqlite3 as sq
     d = base / "19ee0000deadbeef" / uuid
     d.mkdir(parents=True)
-    (d / "meta.json").write_text(json.dumps({
-        "schemaVersion": schema_version, "cwd": cwd,
-        "createdAtMs": 1787116704338, "updatedAtMs": 1787116723901,
-        "hasConversation": True}), encoding="utf-8")
+    meta = {"schemaVersion": schema_version, "cwd": cwd,
+            "createdAtMs": 1787116704338, "updatedAtMs": 1787116723901,
+            "hasConversation": True}
+    if git_branch is not None:
+        meta["gitBranch"] = git_branch
+    (d / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
 
     def blob(data: bytes) -> tuple[str, bytes]:
         return hashlib.sha256(data).hexdigest(), data
@@ -642,6 +876,24 @@ def test_cursor_store_without_node_clocks_stays_unmeasured():
             assert "timestamp" not in r, r
         assert not readers.validate_canonical(recs)
     print("PASS test_cursor_store_without_node_clocks_stays_unmeasured")
+
+
+def test_cursor_store_records_carry_the_meta_branch():
+    """A store.db session's meta.json names the branch; every record carries
+    it as top-level ``gitBranch``. No branch in meta.json, or a hook
+    transcript (which has no meta.json), carries none."""
+    with tempfile.TemporaryDirectory() as td:
+        recs, _ = cursor.to_canonical(_make_cursor_store(Path(td), git_branch=" fix/y "))
+        assert recs and all(r.get("gitBranch") == "fix/y" for r in recs), recs
+        assert not readers.validate_canonical(recs)
+    for absent in (None, "", "  ", "b" * 256):
+        with tempfile.TemporaryDirectory() as td:
+            recs, _ = cursor.to_canonical(_make_cursor_store(Path(td), git_branch=absent))
+            assert not any("gitBranch" in r for r in recs), absent
+    with tempfile.TemporaryDirectory() as td:
+        recs, _ = cursor.to_canonical(_make_cursor_transcript(Path(td)), cwd="/repo/proj")
+        assert recs and not any("gitBranch" in r for r in recs)
+    print("PASS test_cursor_store_records_carry_the_meta_branch")
 
 
 def test_cursor_transcript_reader_end_to_end():

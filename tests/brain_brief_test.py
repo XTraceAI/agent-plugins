@@ -118,6 +118,15 @@ check("names the brain in agent context", BRAIN in _ctx(first))
 check("names the room in agent context",
       "Repo: XTraceAI/agent-plugins" in _ctx(first))
 check("states it is the default target", "DEFAULT target" in _ctx(first))
+check("no session id → no save_artifact session line", "session_id" not in _ctx(first))
+os.environ.pop("CODEX_THREAD_ID", None)
+sid_ctx = _ctx(_brief({"cwd": "/repo", "session_id": "abcd-1234"}))
+check("names this session for save_artifact, bare on Claude Code",
+      'pass `session_id: "abcd-1234"`' in sid_ctx)
+sid_ctx = _ctx(_brief({"cwd": "/repo", "session_id": "abcd-1234",
+                       "transcript_path": "/u/.codex/sessions/2026/10/16/rollout-x.jsonl"}))
+check("…and codex-<id> on Codex, the id capture sends",
+      'pass `session_id: "codex-abcd-1234"`' in sid_ctx)
 check("first resolution reaches the USER", "systemMessage" in first)
 
 second = _brief()
@@ -525,10 +534,10 @@ check("a pending cache for another branch is not delivered by the prompt hook, a
 brain_brief._write_json(PCACHE, POINTERS)
 
 # a budget cut at SessionStart leaves the marker alone, so the prompt delivers the rest.
-# 550 is picked to fit some but not all pointers under the head sentence
-# (a brief of ~850-900 chars does: 550 tokens × 4 × 2/5 = 880); re-pick it if
+# 665 is picked to fit some but not all pointers under the head sentence
+# (a brief of ~1050-1090 chars does: 665 tokens × 4 × 2/5 = 1064); re-pick it if
 # the head grows or the split moves.
-os.environ["MEMHUB_BRIEF_TOKEN_BUDGET"] = "550"
+os.environ["MEMHUB_BRIEF_TOKEN_BUDGET"] = "665"
 bctx = _ctx(_brief({"cwd": "/repo", "session_id": "s10"}))
 shown_at_start = set(brain_brief._ids_in(bctx))
 check("the trimmed brief showed some but not all cached pointers",

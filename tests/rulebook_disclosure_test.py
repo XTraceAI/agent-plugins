@@ -173,31 +173,10 @@ def _repo(td: str) -> tuple[Path, str]:
     return repo_dir, "disclose-test"
 
 
-def test_an_advisory_fire_leads_with_the_disclosure_line():
-    with tempfile.TemporaryDirectory() as td:
-        base = Path(td) / "rb"
-        repo_dir, repo = _repo(td)
-        seed(base, repo, ["adv"])
-        out = run(base, repo, "pre", {"cwd": str(repo_dir), "session_id": "s1",
-                                      "tool_name": "Bash",
-                                      "tool_input": {"command": "advisory-cmd"}})
-        msg = out.get("systemMessage", "")
-        lines = msg.split("\n")
-        check("the first line is the disclosure",
-              lines[:1] == ["📏 Rule fired: Run the suite before pushing"], repr(msg))
-        check("the second line is today's branded detail, indented",
-              len(lines) > 1 and lines[1].startswith("   XTrace ▸ [Run the suite")
-              and "a red main blocks everyone" in lines[1], repr(msg))
-        ctx = out["hookSpecificOutput"]["additionalContext"]
-        check("the agent context still carries the rule bullet",
-              "- **[Run the suite before pushing]**" in ctx, ctx)
-        check("…and ends with the echo instruction",
-              ctx.rstrip().endswith("needs to hear about._"), ctx[-200:])
-        check("…which forbids paraphrasing and omitting",
-              "Do not paraphrase" in ctx and "did not change what you were going to do" in ctx)
-
-
-def test_the_echoed_lines_are_string_equal_to_what_the_terminal_shows():
+def test_an_advisory_fire_is_shown_to_nobody_and_goes_to_the_agent_alone():
+    """Only a block is put on the person's screen. An advisory fire reaches the
+    agent as its bullet, with a note that it needs no announcement and may be
+    credited in a sentence when it changed what the agent did."""
     with tempfile.TemporaryDirectory() as td:
         base = Path(td) / "rb"
         repo_dir, repo = _repo(td)
@@ -205,17 +184,16 @@ def test_the_echoed_lines_are_string_equal_to_what_the_terminal_shows():
         out = run(base, repo, "pre", {"cwd": str(repo_dir), "session_id": "s1",
                                       "tool_name": "Bash",
                                       "tool_input": {"command": "advisory-cmd"}})
-        msg, ctx = out.get("systemMessage", ""), \
-            out["hookSpecificOutput"]["additionalContext"]
-        # Every OTHER line of the systemMessage is a disclosure; the ones
-        # between are the indented detail lines.
-        shown = [l for l in msg.split("\n") if not l.startswith("   ")]
-        quoted = [l for l in ctx.split("\n") if l.startswith(("📏 ", "⛔️ "))]
-        check("two rules → two stanzas", len(shown) == 2, repr(msg))
-        check("the echoed lines equal the shown ones, exactly",
-              shown == quoted, f"{shown!r} != {quoted!r}")
-        check("…and the existing order is preserved",
-              shown[0].endswith("Run the suite before pushing"), repr(shown))
+        check("nothing is shown to the user", "systemMessage" not in out, repr(out))
+        ctx = out["hookSpecificOutput"]["additionalContext"]
+        check("the agent context still carries the rule bullet",
+              "- **[Run the suite before pushing]**" in ctx, ctx)
+        check("…and no line to echo",
+              "Rule fired:" not in ctx and "Begin your next reply" not in ctx, ctx[-400:])
+        check("…and ends with the credit note",
+              ctx.rstrip().endswith("tells them why._")
+              and "team rule from the MemHub Rulebook" in ctx, ctx[-300:])
+        check("…which asks for no announcement", "need no announcement" in ctx, ctx[-300:])
 
 
 def test_a_blocked_gate_discloses_with_the_stop_symbol_and_still_denies():
@@ -268,15 +246,15 @@ def test_session_start_introduces_the_rules_and_discloses_nothing():
               ctx.startswith("## 📏 Rulebook (team rules — advisory)"), ctx[:80])
         check("the preamble says rules carry CLAUDE.md's standing",
               "same weight as this repo's CLAUDE.md" in ctx, ctx[:600])
-        check("…and mandates the disclosure shape",
-              "📏 Rule fired: <the rule, in 20 words or fewer>" in ctx, ctx[:600])
+        check("…and asks for a credit when a rule changed the outcome, never an announcement",
+              "They need no announcement" in ctx
+              and "team rule from the MemHub Rulebook" in ctx, ctx[:600])
         check("the posture bullet is unchanged",
               "- Keep pull requests under 500 lines." in ctx, ctx)
         check("the armed-rules line is unchanged",
               "1 rule armed for this repo" in ctx, ctx)
-        check("NO posture rule is dressed as a fire",
-              "Rule fired:" not in ctx.replace(
-                  "📏 Rule fired: <the rule, in 20 words or fewer>", ""), ctx)
+        check("NO posture rule is dressed as a fire, and no fire line is asked for",
+              "Rule fired:" not in ctx, ctx)
         check("session start reaches the agent only, not the terminal",
               "systemMessage" not in out, str(out))
 
@@ -304,6 +282,11 @@ def test_book_path_is_answered_by_the_hook_that_reads_it():
                               env={**os.environ, "PYTHONUTF8": "1"})
         check(f"an empty repo argument exits non-zero ({empty!r})",
               proc.returncode != 0 and proc.stdout.strip() == "", proc.stdout)
+    proc = subprocess.run([sys.executable, str(HOOK), "book-path", "--projectless"],
+                          capture_output=True, text=True, timeout=60,
+                          env={**os.environ, "PYTHONUTF8": "1"})
+    check("--projectless prints the book a call in no checkout reads (repo=\"\")",
+          proc.returncode == 0 and proc.stdout.strip() == hook.book_path(""), proc.stdout + proc.stderr)
     proc = subprocess.run([sys.executable, str(HOOK), "book-path"],
                           capture_output=True, text=True, timeout=60,
                           env={**os.environ, "PYTHONUTF8": "1"})

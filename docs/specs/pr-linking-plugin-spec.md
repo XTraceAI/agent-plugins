@@ -11,6 +11,11 @@ is the sole source of truth for the plugin half: an implementer should need noth
 work type to every link. §4.5's context strings and §8/§9's skill steps below are the
 PRE-classification shapes; where the two disagree, the work-type spec is authoritative.
 
+**Merged (2026-10):** the two skills below are now one. `/memhub:find-contributing-sessions` is
+`/memhub:link-pr --find [pr-or-url ...]`, with unchanged behavior, and its scanner moved to
+`skills/link-pr/scripts/find_sessions.py`; the hook text offers `/memhub:link-pr --find <pr_url>`.
+The §5 file table and §9.1 keep the old name as the history of what this spec shipped.
+
 ---
 
 ## 0. Overview
@@ -32,16 +37,16 @@ and `pr_babysit_trigger.py` arms the babysit loop — but neither creates a link
   2. *connected, and this call OPENED the pull request* (`gh pr create`, a POST to
      `…/repos/<o>/<r>/pulls`, or a create-shaped GitHub MCP tool) → link this session,
      unconditionally, `link_source="session_self"` — and, only if the code came mostly from
-     elsewhere, also offer `/memhub:find-contributing-sessions`;
+     elsewhere, also offer `/memhub:link-pr --find`;
   3. *connected, any other GitHub call that names one PR* → the model decides: link if it wrote
-     the code here, else offer `/memhub:find-contributing-sessions`.
+     the code here, else offer `/memhub:link-pr --find`.
 
   **Opening a pull request is itself work the session did**, so case 2 asks no authorship question
   — the creating session is always part of that PR's history, and a PR having many sessions means
   linking it displaces nobody. Case 3 is where judgment lives, and it is the model's, not the
   hook's: the agent knows whether it edited these files this session, and no heuristic has to.
 - **`/memhub:link-pr`** — the manual path. Link this session (or named ones) to a PR.
-- **`/memhub:find-contributing-sessions`** — scans local session history for sessions that
+- **`/memhub:link-pr --find`** (originally its own skill, `find-contributing-sessions`) — scans local session history for sessions that
   plausibly wrote the code in a PR, ranks them, has the user approve, and links the approved ones.
 
 **Unchanged, deliberately:** `pr_provenance.py` and the `provenance.github_pr_urls` capture path
@@ -64,7 +69,7 @@ are independent.
 | `plugins/memhub/scripts/codex_hook_bridge.py` `_dispatch_post` | How Codex fans several hook scripts out and folds their `additionalContext` into one document. |
 | `plugins/memhub/scripts/cursor_capture.py` | Cursor's launcher. Today it only ever answers `{"permission": "allow"}` — see §5.3. |
 | `plugins/memhub/scripts/capture.py` + `scripts/readers/` | `list`/`import` over all three hosts. `current` is added here (§7). |
-| `plugins/memhub/skills/pr-babysit/SKILL.md` | House style for a skill that takes a PR argument, resolves the repo's room, and is auto-armed by a hook. |
+| `plugins/memhub/skills/pr-babysit/SKILL.md` | House style for a skill that takes a PR argument and is auto-armed by a hook. |
 | `plugins/memhub/skills/start-rulebook/` | The precedent for a skill with its own `scripts/` that scans local transcripts and hands back JSON instead of transcript text. |
 
 ---
@@ -274,7 +279,7 @@ vary):
 - `touches_github` when the name splits as `mcp__<server>__<tool>` and the **server** segment
   contains "github". The server segment runs to the FIRST `__`, and is not `[^_]*`: server names
   routinely contain underscores (`github_enterprise`, and every plugin-provided server — this
-  repo's own tools arrive as `mcp__plugin_memhub_memhub__add_memory`), and a
+  repo's own tools arrive as `mcp__plugin_memhub_memhub__save_artifact`), and a
   no-underscore pattern rejected all of them. Matching `github` anywhere in the WHOLE name would
   instead catch `mcp__notes__github_summary`, which is a note-taking tool — the server segment is
   what separates the two.
@@ -473,7 +478,7 @@ it links itself unconditionally:
 > the pull request is itself work this session did, and the call is idempotent.
 > Then, **only if most of the code in this pull request was written in OTHER sessions** (you
 > opened it for work done earlier, or you are shipping someone else's branch), add one sentence
-> offering `/memhub:find-contributing-sessions <pr_url>` so those sessions get linked too. A pull
+> offering `/memhub:link-pr --find <pr_url>` so those sessions get linked too. A pull
 > request has many sessions; yours does not displace them. Do not run it without a yes.
 
 **B2 — connected, any other GitHub call naming one PR** (`github_connected:true`,
@@ -490,7 +495,7 @@ fetching a pull request says nothing about who wrote it:
 > idempotent.
 > **If it was not** — you are reviewing, checking out, or commenting on someone else's work, or
 > work from an earlier session — do not link. Instead offer, in one sentence, to run
-> `/memhub:find-contributing-sessions <pr_url>` to find the sessions that did write it. Do not
+> `/memhub:link-pr --find <pr_url>` to find the sessions that did write it. Do not
 > run it without the user saying yes.
 > If this session already linked itself to this pull request, say nothing at all.
 
@@ -514,7 +519,7 @@ cannot silence the other:
 
 ```json
 {
-  "matcher": "^(Bash|mcp__.*[Gg]it[Hh]ub.*__.*)$",
+  "matcher": "^(Bash|mcp__.*[Gg]it[Hh]ub.*__.*|mcp__.+__link_pr)$",
   "hooks": [{
     "type": "command",
     "timeout": 15,
@@ -531,10 +536,14 @@ for a check that is almost always going to decline — but it must NOT use `[^_]
 server segment, which rejects `github_enterprise` and every plugin-provided server. This matcher
 and the payload globs below are coarse pre-filters that only decide whether the trigger starts;
 `pr_link.is_github_mcp_tool` is the precise gate, and it is the one that has to be exactly right.
+The `mcp__.+__link_pr` alternative is MemHub's own `link_pr`: a successful call with
+`pr_type="fix"` earns the bug-origin instruction (MemHub-Backend
+`docs/specs/pr-weight-success-spec.md` §7.1); `pr_link.is_memhub_link_pr` is its precise gate,
+and `__unlink_pr` matches neither.
 
 `scripts/hook_entry.py` runs every Claude hook (the plugin directory admits no inline shell in a
 hook command), and its `PostToolUse pr_link_trigger` route matches the shell-`case` globs
-`*gh*pr*|*[Gg]it[Hh]ub*|*api/v3*|*repos/*pulls*` before anything else runs — against the two
+`*gh*pr*|*[Gg]it[Hh]ub*|*api/v3*|*repos/*pulls*|mcp__*__link_pr` before anything else runs — against the two
 fields `touches_github` reads, the tool name and `tool_input.command` (each also case-folded and
 with shell quotes and backslashes removed, as `pr_link` reads them), never the tool's output.
 That cheap byte test keeps `pr_link_trigger.py` from starting on ordinary shell traffic — the same
@@ -545,7 +554,8 @@ call; and `*api/v3*` plus `*repos/*pulls*` catch the ENTERPRISE forms, which con
 `curl -X POST https://ghe.corp/api/v3/repos/o/r/pulls` has no "github" anywhere in it, and
 `gh api --hostname ghe.corp … repos/o/r/pulls` has no URL at all. Without those two the whole
 enterprise path is detected by the Python and then never reached, which is a silence no log
-explains. A `gh api repos/o/r/pulls` command matches through `*repos/*pulls*` in the command
+explains. `mcp__*__link_pr` admits the bug-origin lane, whose tool name carries none of the
+other four. A `gh api repos/o/r/pulls` command matches through `*repos/*pulls*` in the command
 itself. The globs are pinned as a superset of `touches_github` by `tests/hook_entry_test.py`, so
 tool output — a `cat` of a changelog that cites a PR — no longer starts the trigger at all.
 
@@ -572,7 +582,8 @@ different things:
 - **`plugins/memhub/hooks/codex-hooks.json`** — the plugin-bundled manifest, read by Codex
   releases that load hooks from the plugin itself. It is re-fetched with every plugin upgrade and
   costs the user nothing, so its `PostToolUse` matcher IS widened here, to
-  `^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|Bash|shell|local_shell|mcp__.*[Gg]it[Hh]ub.*__.*)$`.
+  `^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|Bash|shell|local_shell|mcp__.*[Gg]it[Hh]ub.*__.*)$`
+  (since ENG-1268 also `|mcp__.+__link_pr`, routed by `_dispatch_post` to the same trigger).
   On that path Codex gets GitHub-MCP detection.
 - **`references/codex-hooks-bridge.json`** — the compatibility bridge `setup_codex_hooks.py`
   installs into `~/.codex/hooks.json`, a file the user has already trusted. Widening it would
@@ -753,7 +764,11 @@ they carry the org resolution.
 
 ---
 
-## 9. `/memhub:find-contributing-sessions`
+## 9. `/memhub:link-pr --find` (originally `/memhub:find-contributing-sessions`)
+
+> **Merged (2026-10)** into `/memhub:link-pr` as its `--find` mode: the skill text is step 3 of
+> `skills/link-pr/SKILL.md` and the scanner is `skills/link-pr/scripts/find_sessions.py`. The
+> trigger phrases below now sit in link-pr's description.
 
 > **Superseded in part (v0.78.0, ENG-1128)** by `docs/specs/find-contributing-sessions-unlinked-prs.md`,
 > which owns the skill and `find_sessions.py`: no argument now maps the caller's own unlinked PRs
@@ -930,7 +945,7 @@ caps are honoured on a synthetic 50k-record session.
 - **`README.md`**, the `/memhub:*` list — two entries, in the house voice, next to `pr-babysit`:
   - `/memhub:link-pr [pr] [--session <id>] [--unlink]` — links a coding session to a pull request
     in MemHub, so the PR's session context is published from a confirmed fact.
-  - `/memhub:find-contributing-sessions [pr]` — scans this machine's session history for the
+  - `/memhub:link-pr --find [pr]` (was `/memhub:find-contributing-sessions [pr]`) — scans this machine's session history for the
     sessions that wrote a PR's code, ranks the candidates, and links the ones you approve.
 - **`README.md`**, the PR section — a short paragraph: after a call that addresses GitHub (`gh pr
   …`, a `curl` / `gh api` request to the REST API, or a GitHub MCP tool), MemHub checks whether

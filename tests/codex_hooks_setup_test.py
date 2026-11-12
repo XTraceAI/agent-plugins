@@ -10,7 +10,9 @@ import os
 import subprocess
 import sys
 import tempfile
-from unittest.mock import patch
+import time
+import types
+from unittest.mock import call, patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,7 +48,7 @@ def test_install_preserves_other_hooks_and_is_idempotent():
         }
         (home / "hooks.json").write_text(json.dumps(original), encoding="utf-8")
         changed, expected, backup = setup.install(home)
-        assert changed and expected == 4 and backup and backup.exists()
+        assert changed and expected == 6 and backup and backup.exists()
         installed = json.loads((home / "hooks.json").read_text(encoding="utf-8"))
         assert installed["description"] == "mine"
         # The user's own SessionStart hook keeps its slot; ours is appended.
@@ -65,10 +67,10 @@ def test_install_preserves_other_hooks_and_is_idempotent():
         ]
         assert any(str(home) in command for command in commands)
         assert "${CODEX_HOME" not in installed_text
-        assert setup.status(home)[:3] == (True, 4, 4)
+        assert setup.status(home)[:3] == (True, 6, 6)
 
         again, count, second_backup = setup.install(home)
-        assert not again and count == 4 and second_backup is None
+        assert not again and count == 6 and second_backup is None
         assert json.loads((home / "hooks.json").read_text(encoding="utf-8")) == installed
     print("PASS test_install_preserves_other_hooks_and_is_idempotent")
 
@@ -121,7 +123,7 @@ def test_install_replaces_legacy_bridge_without_duplicates():
         assert "plugins/cache/xtrace-plugins" not in text
         assert "0.26/scripts/codex_flush.py" not in text
         assert "echo user" in text
-        assert setup.status(home)[:3] == (True, 4, 4)
+        assert setup.status(home)[:3] == (True, 6, 6)
     print("PASS test_install_replaces_legacy_bridge_without_duplicates")
 
 
@@ -466,7 +468,7 @@ def test_status_checks_materialized_windows_commands():
         doc["hooks"]["Stop"][0]["hooks"][0]["commandWindows"] = "py -3 broken.py"
         (home / "hooks.json").write_text(json.dumps(doc), encoding="utf-8")
         healthy, actual, expected, _hooks_ok, _runner_ok = setup.status(home)
-        assert not healthy and actual == expected == 4
+        assert not healthy and actual == expected == 6
     print("PASS test_status_checks_materialized_windows_commands")
 
 
@@ -482,10 +484,10 @@ def test_cli_names_only_the_memhub_handlers_for_review():
             sys.argv = real_argv
 
         text = output.getvalue()
-        assert "installed (4 handlers)" in text
+        assert "installed (6 handlers)" in text
         assert f"User config - {Path(raw) / 'hooks.json'}" in text
         assert f"review command: {Path(raw) / 'memhub_hook_bridge.py'}" in text
-        assert "trust only the 4 handlers" in text
+        assert "trust only the 6 handlers" in text
         assert "do not use 'Trust all'" in text
     print("PASS test_cli_names_only_the_memhub_handlers_for_review")
 
@@ -518,11 +520,130 @@ def test_rulebook_denial_survives_context_merge():
 
 
 def test_stop_flushes_rule_fires_and_capture():
-    with patch.object(bridge, "_detach_flush") as capture, patch.object(bridge, "_run") as fire_flush:
+    quiet = subprocess.CompletedProcess([], 0, b"", b"")
+    with patch.object(bridge, "_detach_flush") as capture, \
+            patch.object(bridge, "_detach_script") as detach, \
+            patch.object(bridge, "_run", return_value=quiet) as run:
         bridge._dispatch(Path("/plugin"), b"{}", "Stop")
     capture.assert_called_once_with(Path("/plugin"), b"{}", "Stop")
-    fire_flush.assert_called_once_with(Path("/plugin"), "rulebook_hook.py", b"{}",
-                                       "flush", "final", "--host", "codex", timeout=7)
+    # The reply rules first (rulebook_reply.py); then, side by side and so in
+    # no fixed order, the fire flush and quarantine check. Classification is
+    # detached and contributes no Stop output.
+    assert run.call_count == 3, run.call_args_list
+    detach.assert_called_once_with(Path("/plugin"), b"{}", "harness_stop.py", "stop", "--host", "codex")
+    assert run.call_args_list[0] == call(Path("/plugin"), "rulebook_hook.py", b"{}",
+                                         "reply", "--host", "codex", timeout=7)
+    rest = run.call_args_list[1:]
+    for expected in (call(Path("/plugin"), "rulebook_hook.py", b"{}",
+                          "flush", "final", "--host", "codex", timeout=7),
+                     call(Path("/plugin"), "rulebook_quarantine.py", b"{}",
+                          "stop", "--host", "codex", timeout=7)):
+        assert expected in rest, rest
+
+
+def _stop_out(answers):
+    """The bridge's Stop output when each lane answers `answers[<lane>]`
+    (`reply`, `flush`, `quarantine`), quiet otherwise. Keyed by lane, not by
+    call order: the flush and quarantine run side by side."""
+    quiet = subprocess.CompletedProcess([], 0, b"", b"")
+
+    def run(root, script, payload, *args, timeout=7):
+        lane = {"rulebook_quarantine.py": "quarantine", "harness_stop.py": "harness"}.get(
+            script, args[0] if args else "")
+        return answers.get(lane, quiet)
+    out = io.BytesIO()
+    fake = types.SimpleNamespace(buffer=out, write=lambda s: out.write(s.encode()))
+    with patch.object(bridge, "_detach_flush"), patch.object(bridge, "_detach_script"), \
+            patch.object(bridge, "_run", side_effect=run), patch.object(bridge.sys, "stdout", fake):
+        bridge._dispatch(Path("/plugin"), b"{}", "Stop")
+    return out.getvalue()
+
+
+def _status_text(home: Path, state_dir: Path) -> str:
+    real_argv = sys.argv
+    sys.argv = ["setup_codex_hooks.py", "status", "--codex-home", str(home)]
+    output = io.StringIO()
+    try:
+        with patch.object(setup, "_HOOK_STATE_DIR", state_dir), \
+                contextlib.redirect_stdout(output):
+            assert setup.main() == 0
+    finally:
+        sys.argv = real_argv
+    return output.getvalue()
+
+
+def _age(path: Path, seconds_ago: float) -> None:
+    stamp = time.time() - seconds_ago
+    os.utime(path, (stamp, stamp))
+
+
+def test_status_confirms_trust_only_from_state_newer_than_the_install():
+    """Codex runs a user hook only once it is trusted, so bridge-written state
+    after the install is evidence; anything else stays unverified."""
+    with tempfile.TemporaryDirectory() as raw:
+        home, state = Path(raw) / "codex", Path(raw) / "codexflush"
+        home.mkdir()
+        setup.install(home)
+        _age(home / "hooks.json", 600)
+        _age(home / "memhub_hook_bridge.py", 600)
+
+        # No state directory at all: a fresh install nobody has trusted yet.
+        text = _status_text(home, state)
+        assert "trust: Codex-controlled; verify the 6 MemHub handlers" in text, text
+        assert "confirmed" not in text, text
+
+        # State from before the install (an older bridge) proves nothing.
+        state.mkdir()
+        old = state / "codex-old.json"
+        old.write_text("{}", encoding="utf-8")
+        _age(old, 3600)
+        assert setup.hooks_ran_at(home, state) is None
+        assert "confirmed" not in _status_text(home, state)
+
+        # A capture write after the install: the hooks ran, so trust is real.
+        fresh = state / "codex-new.json"
+        fresh.write_text("{}", encoding="utf-8")
+        ran = setup.hooks_ran_at(home, state)
+        assert ran is not None and ran == fresh.stat().st_mtime
+        text = _status_text(home, state)
+        assert "trust: confirmed (MemHub hooks ran at " in text, text
+        assert "Codex-controlled" not in text, text
+
+        # Re-installing a changed bridge asks for fresh evidence again.
+        doc = json.loads((home / "hooks.json").read_text(encoding="utf-8"))
+        doc["hooks"]["Stop"][0]["hooks"][0]["timeout"] = 31
+        (home / "hooks.json").write_text(json.dumps(doc), encoding="utf-8")
+        stamp = time.time() + 5
+        os.utime(home / "hooks.json", (stamp, stamp))
+        assert setup.hooks_ran_at(home, state) is None
+    print("PASS test_status_confirms_trust_only_from_state_newer_than_the_install")
+
+
+def test_trust_is_never_reported_for_an_unhealthy_install():
+    with tempfile.TemporaryDirectory() as raw:
+        home, state = Path(raw) / "codex", Path(raw) / "codexflush"
+        state.mkdir(parents=True)
+        (state / "codex-new.json").write_text("{}", encoding="utf-8")
+        home.mkdir()
+        real_argv = sys.argv
+        sys.argv = ["setup_codex_hooks.py", "status", "--codex-home", str(home)]
+        output = io.StringIO()
+        try:
+            with patch.object(setup, "_HOOK_STATE_DIR", state), \
+                    contextlib.redirect_stdout(output):
+                assert setup.main() == 1
+        finally:
+            sys.argv = real_argv
+        assert "NOT INSTALLED" in output.getvalue()
+        assert "trust:" not in output.getvalue()
+        assert setup.hooks_ran_at(home, state) is None
+    print("PASS test_trust_is_never_reported_for_an_unhealthy_install")
+
+
+def test_hook_state_dir_matches_the_writers():
+    """The evidence directory is the one the bridge's lanes write."""
+    assert setup._HOOK_STATE_DIR == bridge._STATE_DIR == _load("codex_flush").STATE_DIR
+    print("PASS test_hook_state_dir_matches_the_writers")
 
 
 if __name__ == "__main__":

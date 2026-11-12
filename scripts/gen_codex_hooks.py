@@ -56,8 +56,12 @@ _ALL_TOOLS = "^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|Bash|shell|local_s
 # compatibility bridge in references/codex-hooks-bridge.json is a file the user
 # already trusted in ~/.codex/hooks.json, and widening it would cost a
 # re-trust for a detection they can do with /memhub:link-pr.
+# `mcp__.+__link_pr` is MemHub's own tool: a `pr_type="fix"` link earns the
+# bug-origin instruction (MemHub-Backend pr-weight-success-spec.md §7.1);
+# `pr_link.is_memhub_link_pr` is its precise gate.
 _POST_TOOLS = ("^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|Bash|shell|"
-               "local_shell|exec_command|shell_command|mcp__.*[Gg]it[Hh]ub.*__.*)$")
+               "local_shell|exec_command|shell_command|mcp__.*[Gg]it[Hh]ub.*__.*|"
+               "mcp__.+__link_pr)$")
 
 
 # Claude-only capture scripts: they read Claude's transcript store and must

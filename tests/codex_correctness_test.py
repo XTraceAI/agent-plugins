@@ -20,6 +20,7 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import time
@@ -364,11 +365,30 @@ def test_the_stop_lane_tells_the_hook_it_is_codex():
     # The flush lane used to only SHIP rows that already carried their host, so
     # it needed none — #240 made it also CREATE events, which is what turned a
     # correct omission into a bug.
-    with patch.object(bridge, "_detach_flush"), patch.object(bridge, "_run") as run:
+    quiet = subprocess.CompletedProcess([], 0, b"", b"")
+    with patch.object(bridge, "_detach_flush"), patch.object(bridge, "_detach_script") as sensor, \
+            patch.object(bridge, "_run", return_value=quiet) as run:
         bridge._dispatch(Path("/plugin"), b"{}", "Stop")
-    args = run.call_args[0]
-    assert "rulebook_hook.py" in args, args
-    assert args[-2:] == ("--host", "codex"), args
+    # Every Stop lane names the host, including the detached harness sensor.
+    # Synchronous policy calls retain reply-before-flush ordering.
+    calls = [c[0] for c in run.call_args_list]
+    assert calls[0][1:3] == ("rulebook_hook.py", b"{}") and calls[0][3] == "reply", calls
+    assert sorted(a[1] for a in calls[1:]) == ["rulebook_hook.py", "rulebook_quarantine.py"], calls
+    sensor.assert_called_once_with(Path("/plugin"), b"{}", "harness_stop.py", "stop", "--host", "codex")
+    for args in calls + [sensor.call_args[0]]:
+        assert args[-2:] == ("--host", "codex"), args
+
+
+def test_the_stop_runs_the_reply_rules_before_the_flush():
+    # The `reply` rules (rulebook_reply.py) run on Codex's Stop too, as codex,
+    # and BEFORE the flush, so a fire they record ships with this Stop.
+    with patch.object(bridge, "_detach_flush"), patch.object(bridge, "_detach_script"), \
+            patch.object(bridge, "_run") as run:
+        bridge._dispatch(Path("/plugin"), b"{}", "Stop")
+    calls = [c[0] for c in run.call_args_list]
+    modes = [a[a.index("rulebook_hook.py") + 2] for a in calls if "rulebook_hook.py" in a]
+    assert modes == ["reply", "flush"], calls
+    assert calls[0][-2:] == ("--host", "codex"), calls
 
 
 def test_every_bridge_lane_that_writes_a_row_names_its_host():
