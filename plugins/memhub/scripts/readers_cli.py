@@ -511,8 +511,10 @@ def main(argv=None) -> int:
                     scope = configured if selected_path.is_relative_to(configured) else selected_path.parent
                     path_reader = SimpleNamespace(HOST="codex", _SESSIONS=scope)
                     anchors = root_anchors(path_reader, lambda error: diagnostic("discovery_incomplete"))
-                    pattern = ("**", "rollout-*.jsonl") if scope == configured else ("rollout-*.jsonl",)
-                    candidates = paths(scope, pattern, lambda error: diagnostic("discovery_incomplete"))
+                    candidates = []
+                    for name in reader.ROLLOUT_GLOBS:
+                        pattern = ("**", name) if scope == configured else (name,)
+                        candidates += paths(scope, pattern, lambda error: diagnostic("discovery_incomplete"))
                     if incomplete:
                         return 2
                     sessions = [{"path": str(candidate)} for candidate in candidates
@@ -708,7 +710,7 @@ def main(argv=None) -> int:
                 if args.session == "latest":
                     if sid != latest_native_id:
                         continue
-                elif sid != args.session.removesuffix(".jsonl"):
+                elif sid != args.session.removesuffix(".zst").removesuffix(".jsonl"):
                     continue
             if native is None:
                 native = reader._metadata_from_header(source_header)
@@ -770,7 +772,7 @@ def main(argv=None) -> int:
             diagnostic("session_unavailable")
             return 2
     elif args.session and not explicit_path:
-        native_id = args.session.removesuffix(".jsonl") if args.host == "codex" else args.session
+        native_id = args.session.removesuffix(".zst").removesuffix(".jsonl") if args.host == "codex" else args.session
         prepared = [item for item in prepared if item[2]["native_session_id"] == native_id]
         if not prepared:
             diagnostic("session_unavailable")

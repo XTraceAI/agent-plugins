@@ -5,9 +5,11 @@
 // For each fire:
 //   (a) `$.state` `fires` gets a FireNote (newest last, capped at 50) — the
 //       companion's feed, replacing its regex over hook output (W7).
-//   (b) the disclosure. The person sees the line as a dim transcript row
+//   (b) the disclosure. Only a gate's fire is shown to the person (a call
+//       that was stopped, or a gate the agent overrode): a dim transcript row
 //       (`$.ui.log`), the mod path's stand-in for the Python hook's
-//       `systemMessage`. Gate G2 (spec §8.4) has passed: MemHub-Backend
+//       `systemMessage`. An advisory fire is shown to nobody and echoed by
+//       nobody; its system row below still records it. Gate G2 (spec §8.4) has passed: MemHub-Backend
 //       stores a disclosure `system` row as a role="system" message (#1493),
 //       so the system row is on (SYSTEM_ROW_DISCLOSURE). With it off (Act's
 //       `systemRow` = false, the Python path's behaviour), the model is told
@@ -52,9 +54,9 @@ export const SYSTEM_ROW_DISCLOSURE = true
  * lifts that instruction; it costs one row, not one per fire.
  */
 export const NO_ECHO_NOTE =
-  '_MemHub now shows each rule fire to the user and records it in the transcript itself. ' +
-  'Do not write `📏 Rule fired:` or `⛔️ Rule fired:` lines in your replies: that part of ' +
-  "the Rulebook's session-start instruction no longer applies. Follow the rules themselves as before._"
+  '_MemHub records each rule fire in the transcript itself. ' +
+  'Do not write `📏 Rule fired:` or `⛔️ Rule fired:` lines in your replies, whatever an ' +
+  "earlier Rulebook instruction in this session said. Follow the rules themselves as before._"
 
 export const FIRES_CAP = 50
 /** Rows kept for a ledger that could not be written, before the oldest drop. */
@@ -68,10 +70,8 @@ export function disclosureInstruction(lines: readonly string[]): string {
     'line(s), verbatim and each on its own line, before anything else — including ' +
     'before any tool call narration:_\n' +
     quoted +
-    '\n_This is how the team sees its rules working. Do not paraphrase, do not merge ' +
-    'them into a sentence, and do not omit one because it did not change what you were ' +
-    'going to do — a rule that fired and changed nothing is exactly the rule the team ' +
-    'needs to hear about._'
+    '\n_This is how the team sees what its rules stopped. Do not paraphrase and do ' +
+    'not merge them into a sentence._'
   )
 }
 
@@ -136,11 +136,14 @@ export class Act {
       let written = noted
       const failed: string[] = []
       for (const f of v.fires) {
-        // `$.ui.log` is synchronous and may throw: the line is best effort.
-        try {
-          this.io.log(f.line)
-        } catch {
-          // the transcript copy (the system row, or the model's echo) remains
+        // Only a gate's fire is put on the person's screen. `$.ui.log` is
+        // synchronous and may throw: the line is best effort.
+        if (f.mode === 'gate') {
+          try {
+            this.io.log(f.line)
+          } catch {
+            // the transcript copy (the system row, or the model's echo) remains
+          }
         }
         if (!this.systemRow) continue
         try {
@@ -174,9 +177,11 @@ export class Act {
   modelText(v: Verdict | undefined): string | undefined {
     if (!v) return undefined
     const lines = [...v.context]
-    if (v.fires.length && !this.disclosed.has(v)) {
-      lines.push(disclosureInstruction(this.unwritten.get(v) ?? v.fires.map(f => f.line)))
-    }
+    // Without a system row the model's echo is the transcript copy — of a
+    // gate's fire only: an advisory fire is echoed by nobody (CREDIT_NOTE).
+    const gateLines = new Set(v.fires.filter(f => f.mode === 'gate').map(f => f.line))
+    const echo = (this.unwritten.get(v) ?? v.fires.map(f => f.line)).filter(l => gateLines.has(l))
+    if (echo.length && !this.disclosed.has(v)) lines.push(disclosureInstruction(echo))
     const text = lines.join('\n')
     return text.trim() ? text : undefined
   }

@@ -30,6 +30,14 @@
 // route an `_unportable` rule to the Python hook or skip it, never evaluate it
 // here. Python never emits `_unportable`; the vector test strips it and
 // accepts a Python `None` for such a row (the pattern really was invalid).
+//
+// `given.session` (rulebook_session.py: context size, idle time, tool calls
+// this turn, repeat counts) is portable: its shaping (`givenNorm`) is ported
+// here, and the engine answers the predicate itself by asking the Python
+// (probes.ts `sessionHolds`, one `rulebook_mod_state.py` call) only once the
+// rule's pattern and every other `given` condition matched — so such a rule
+// costs a book nothing on the calls it does not match. The `givenOk` below
+// (the golden vectors' pure form) has no session facts and answers false.
 
 import type { HookRule } from './index'
 import { pyCompile, pyFindall1, pySearch } from './pyre'
@@ -214,6 +222,7 @@ const MATCHER_KEYS: ReadonlyMap<string, string> = new Map([
   ['command_rx', 'rx'], ['command_not_rx', 'not_rx'], ['content_not_rx', 'content_not_rx'],
   ['warn_once_per', 'fire_scope'], ['result_rx', 'rx'],
   ['prompt_rx', 'rx'], ['prompt_not_rx', 'not_rx'],
+  ['reply_rx', 'rx'], ['evidence_command_rx', 'evidence_rx'],
 ])
 const RESULT_KEYS: ReadonlyMap<string, string> = new Map([
   ...MATCHER_KEYS,
@@ -225,9 +234,15 @@ export const MATCHER_KNOWN: ReadonlySet<string> = new Set([
   'path_rx', 'path_not_rx', 'match_heredoc_body', 'body_rx', 'warn_once_per',
   'converted_rx', 'predicts_rx', 'min_chars', 'result_rx',
   'prompt_rx', 'prompt_not_rx', 'given',
+  'reply_rx', 'evidence_command_rx',   // event "reply": the Stop lane (Python only: rulebook_reply.py)
 ])
 const PROMPT_ONLY_KEYS: ReadonlySet<string> = new Set(['prompt_rx', 'prompt_not_rx'])
 const PROMPT_SHARED_KEYS: ReadonlySet<string> = new Set(['warn_once_per', 'given', 'predicts_rx'])
+/** `_OWN_KEYS`: an event that reads ONLY its own keys (plus the shared ones); no other event reads them. */
+const OWN_KEYS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ['prompt', PROMPT_ONLY_KEYS], ['reply', new Set(['reply_rx', 'evidence_command_rx'])],
+])
+const ANY_OWN: ReadonlySet<string> = new Set([...OWN_KEYS.values()].flatMap((k) => [...k]))
 const SCOPE_MAP: ReadonlyMap<string, string> = new Map([['turn', 'call'], ['file', 'session'], ['session', 'session']])
 const RESERVED_RULE_KEYS: ReadonlySet<string> = new Set([
   'id', 'text', 'why', 'status', 'mode', '_version', '_label',
@@ -239,7 +254,7 @@ const RESERVED_RULE_KEYS: ReadonlySet<string> = new Set([
 ])
 export const RX_KEYS: readonly string[] = [
   'rx', 'not_rx', 'body_rx', 'cmd_rx', 'cmd_not_rx', 'path_rx', 'path_not_rx',
-  'content_rx', 'content_not_rx', 'exclude_rx', 'converted_rx',
+  'content_rx', 'content_not_rx', 'exclude_rx', 'converted_rx', 'evidence_rx',
 ]
 const RX_MAX = 2000
 const RX_NESTED = String.raw`\([^()]*[+*|][^()]*\)\s*[+*{]|\(\.\*\)|(\.\*){2,}`
@@ -252,7 +267,7 @@ const BOOK_MEMBERS_MAX = 10 ** 9
 const BOOK_KEYS: readonly string[] = ['_rulebook_id', '_book_name', '_book_scope', '_book_members', '_book_kind', '_book_label']
 export const CANDIDATE_ID_PREFIX = 'candidate-'
 
-type Kind = 'rx' | 'int' | 'str' | 'bool'
+type Kind = 'rx' | 'int' | 'str' | 'bool' | 'repeat_key'
 const GIVEN: ReadonlyMap<string, ReadonlyMap<string, Kind>> = new Map([
   ['repo', new Map<string, Kind>([
     ['branch_rx', 'rx'], ['branch_not_rx', 'rx'], ['diff_lines_gt', 'int'],
@@ -262,12 +277,27 @@ const GIVEN: ReadonlyMap<string, ReadonlyMap<string, Kind>> = new Map([
   ['user', new Map<string, Kind>([['said_rx', 'rx'], ['not_said_rx', 'rx']])],
   ['file', new Map<string, Kind>([['lines_gt', 'int'], ['bytes_gt', 'int']])],
   ['agent', new Map<string, Kind>([['main', 'bool']])],
+  ['session', new Map<string, Kind>([
+    ['context_tokens_gt', 'int'], ['idle_seconds_gt', 'int'], ['turn_tool_calls_gt', 'int'],
+    ['repeat_count_gt', 'int'], ['repeat_key', 'repeat_key'],
+  ])],
 ])
+/** rulebook_session.MAX / REPEAT_KEYS */
+const SESSION_MAX: ReadonlyMap<string, number> = new Map([
+  ['context_tokens_gt', 10_000_000], ['idle_seconds_gt', 30 * 86400],
+  ['turn_tool_calls_gt', 100_000], ['repeat_count_gt', 100_000],
+])
+/** `rulebook_session.kind_ok` */
+function sessKindOk(k: string, v: unknown): boolean {
+  if (k === 'repeat_key') return v === 'rule' || v === 'command' || v === 'file'
+  const hi = SESSION_MAX.get(k)
+  return hi !== undefined && typeof v !== 'boolean' && isInt(v) && v >= 0 && v <= hi
+}
 const ORDERING_KEYS: ReadonlySet<string> = new Set([
   'required_command_rx', 'gated_command_rx', 'armed_by_events',
-  'armed_by_rx', 'min_edits', 'display_name', 'path_rx',
+  'armed_by_rx', 'min_edits', 'display_name', 'path_rx', 'armed_by_command_rx',
 ])
-const ARMED_BY_EVENTS: ReadonlySet<string> = new Set(['edit', 'write', 'session', 'prompt'])
+const ARMED_BY_EVENTS: ReadonlySet<string> = new Set(['edit', 'write', 'session', 'prompt', 'command'])
 
 // ── prose ──────────────────────────────────────────────────────────────────
 
@@ -305,7 +335,7 @@ const portable = (p: unknown): boolean => typeof p !== 'string' || pyCompile(p) 
 /** `ordering_rx_ok` */
 export function orderingRxOk(o: Dict): boolean {
   if (!['required_command_rx', 'gated_command_rx'].every((k) => rxOk(get(o, k)))) return false
-  return hasOwn(o, 'armed_by_rx') ? rxOk(o.armed_by_rx ?? null) : true
+  return ['armed_by_rx', 'armed_by_command_rx'].every((k) => !hasOwn(o, k) || rxOk(o[k] ?? null))
 }
 
 // ── version skew ───────────────────────────────────────────────────────────
@@ -434,8 +464,10 @@ export function givenNorm(g: unknown): Dict | null {
         if (safeSpecDir(v) === null) return null
       } else if (kind === 'bool') {
         if (typeof v !== 'boolean') return null
-      } else return null
+      } else if (kind !== 'repeat_key') return null
     }
+    // bounds and the repeat_key enum (`rulebook_session.kind_ok`)
+    if (block === 'session' && !Object.entries(spec).every(([k, v]) => sessKindOk(k, v))) return null
     out[block] = { ...spec }
   }
   return out
@@ -527,7 +559,7 @@ function unportableKeys(r: Dict): string[] {
   }
   const o = get(r, 'ordering')
   if (isDict(o)) {
-    for (const k of ['required_command_rx', 'gated_command_rx', 'armed_by_rx', 'path_rx']) {
+    for (const k of ['required_command_rx', 'gated_command_rx', 'armed_by_rx', 'armed_by_command_rx', 'path_rx']) {
       if (hasOwn(o, k) && !portable(o[k])) bad.push(`ordering.${k}`)
     }
   }
@@ -605,7 +637,8 @@ function shape(row: unknown, opts: ShapeOptions): Dict | null {
   for (const [k, v] of Object.entries(m)) {
     if (k === 'event' || !MATCHER_KNOWN.has(k)) continue
     if (k === 'result_rx' && hasOwn(m, 'content_rx')) continue
-    if (PROMPT_ONLY_KEYS.has(k) !== (r.on === 'prompt') && !PROMPT_SHARED_KEYS.has(k)) continue
+    const own = typeof r.on === 'string' ? OWN_KEYS.get(r.on) : undefined
+    if (!PROMPT_SHARED_KEYS.has(k) && (own ? !own.has(k) : ANY_OWN.has(k))) continue
     const dest = keys.get(k) ?? k
     if (RESERVED_RULE_KEYS.has(dest)) continue
     r[dest] = v ?? null
@@ -613,6 +646,7 @@ function shape(row: unknown, opts: ShapeOptions): Dict | null {
   const fs = hasOwn(r, 'fire_scope') ? r.fire_scope ?? null : 'session'
   r.fire_scope = typeof fs === 'string' && SCOPE_MAP.has(fs) ? SCOPE_MAP.get(fs)! : get(r, 'fire_scope')
   if (!RX_KEYS.every((k) => !hasOwn(r, k) || rxOk(r[k] ?? null))) return null
+  if (r.on === 'reply' && !truthy(get(r, 'rx'))) return null
   if (r.on === 'prompt') {
     if (!truthy(get(r, 'rx'))) return null
     r.mode = 'advise'
@@ -805,6 +839,10 @@ export function givenOk(rule: Dict, facts: GivenFacts, read: ReadFacts = null): 
   const g = get(rule, 'given')
   if (!truthy(g)) return true
   if (!isDict(g)) throw new PyTypeError("'given' is not a dict")   // Python: AttributeError
+  // `given.session` facts live in the transcript and a local counter, which
+  // this pure form is not handed (the engine asks probes.ts `sessionHolds`):
+  // an unknown fact holds no predicate.
+  if (truthy(get(g, 'session'))) return false
   const block = (k: string): Dict => {
     const b = get(g, k)
     return truthy(b) && isDict(b) ? b : {}

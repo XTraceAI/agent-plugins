@@ -17,8 +17,10 @@
 #   --no-fork-agent  leave Claude Code's fork agent settings as they are (default:
 #                    CLAUDE_CODE_FORK_SUBAGENT=1 in settings.json, so rule
 #                    drafts run in the desktop app too, not only the terminal,
-#                    and Agent(fork) in permissions.allow, so auto mode does
-#                    not review, and often deny, each draft's launch)
+#                    Agent(fork) in permissions.allow, so auto mode does
+#                    not review, and often deny, each draft's launch, and a
+#                    note in autoMode.allow so the draft may file a proposed
+#                    rule; putting a rule in force is still reviewed)
 #   --repos LIST     make MemHub active only in these repositories (org/name, as
 #                    the origin remote spells them, comma-separated); writes
 #                    ~/.config/memhub-plugin/repos.json. Everywhere else the
@@ -359,7 +361,10 @@ for p in json.load(sys.stdin):
   # so), and writes nothing when rule drafting is off.
   # --allow-rule adds Agent(fork) to permissions.allow too. Auto mode otherwise
   # reviews each launch, and denies a fair share, because the request comes
-  # from a hook's output. Only here: onboard runs inside a session, where the
+  # from a hook's output. It also appends a note to autoMode.allow (after
+  # "$defaults" when it starts the list) naming the draft's create_rule call,
+  # which the classifier otherwise reads as modifying a shared resource; the
+  # note covers a proposed rule only. Only here: onboard runs inside a session, where the
   # classifier refuses an agent writing its own allow rule. Probed first so an
   # older released plugin, whose script lacks the flag, still gets the key.
   if [ "$FORK_AGENT" = 1 ] && [ -f "$PLUGIN_ROOT/scripts/setup_claude_fork.py" ]; then
@@ -440,6 +445,12 @@ if [ -n "$CURSOR_BIN" ]; then
   # Cursor has no command to install or update a plugin, and re-indexing the
   # marketplace does not touch an installed copy's files.
   note "Cursor: open Customize, find MemHub and select Add — or, if it is already installed, Update (or remove and Add again) to get the new version. Cursor has no command for this step"
+fi
+
+if [ -n "$PLUGIN_ROOT" ] && [ -f "$PLUGIN_ROOT/scripts/install_compare.py" ]; then
+  step "Local rewind command"
+  python3 "$PLUGIN_ROOT/scripts/install_compare.py" --plugin-root "$PLUGIN_ROOT"
+  note "Local rewind: add ~/.local/bin to PATH if needed; memhub-compare enable captures future Codex boundaries"
 fi
 
 step "Repositories"

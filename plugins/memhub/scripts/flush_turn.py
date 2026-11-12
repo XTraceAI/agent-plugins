@@ -652,6 +652,19 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     if not records:
         return
 
+    # Local rewind (rewind/claude_capture.py): cursor identities and checkpoint
+    # metadata on source sessions; on a comparison branch, the inherited prefix
+    # is never sent and every batch carries its authenticated lineage. A
+    # fenced, unregistered branch is HELD — cursor unmoved, no ordinary upload.
+    from rewind.claude_capture import prepare as prepare_rewind, watermark as rewind_watermark
+    from rewind.state import Unavailable as RewindUnavailable
+    try:
+        records, rewind_skip, comparison = prepare_rewind(session_id, transcript_path, records)
+    except RewindUnavailable as exc:
+        _log(f"rewind lineage held: {exc}")
+        _mark_failure(session_id, "rewind_lineage_pending", str(exc))
+        return
+
     pending_pr_urls, accepted_pr_urls, missing_pr_urls = (
         pr_provenance.queued_urls(state, records)
     )
@@ -696,7 +709,8 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # ``elide_oversized_tool_results`` and ``redact_records`` are both 1:1,
     # including on their never-raise fallbacks (each returns the list it was
     # handed), so the correspondence survives them.
-    keep = [i for i, r in enumerate(records) if not is_command_wrapper(r)]
+    keep = [i for i, r in enumerate(records)
+            if not is_command_wrapper(r) and i not in rewind_skip]
     sendable = redact_records(
         elide_oversized_tool_results([records[i] for i in keep])
     )
@@ -790,6 +804,8 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     provenance = pr_provenance.import_provenance(pending_pr_urls)
     if provenance:
         arguments["provenance"] = provenance
+    if comparison is not None:
+        arguments["comparison_lineage"] = comparison
     # Transport failures are CLASSIFIED here, not left to the catch-all in
     # main(). Falling through to it recorded every one as reason="error" — a
     # permanent-looking breadcrumb — which is actively wrong for the two cases
@@ -991,6 +1007,9 @@ async def _flush(session_id: str, transcript_path: str) -> None:
             "backend did not acknowledge the captured PR URL",
         )
         return
+    if comparison is not None:
+        # Only a confirmed, persisted import moves the run's final watermark.
+        rewind_watermark(session_id, batch)
     _mark_success(session_id, offset=batch_consumed,
                   last_uuid=out.get("ack_through"), cwd=cwd,
                   namespace=namespace, title=title,

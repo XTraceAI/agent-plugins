@@ -10,6 +10,7 @@ Lanes (the mode argument):
            A read rule sees the Read tool AND shell reads (cat/head/sed -n …).
   post     PostToolUse: advisories on failing results (on="result");
            ordering-rule ARM (edit-family) and RECEIPT (bash).
+  reply    Stop: on="reply" rules over the turn's final text (rulebook_reply.py).
   fetch    Refresh the server book for one repo (GET /rules?view=hook with
            If-None-Match) into <BASE>/book/<repo>.json. Spawned DETACHED.
   flush    Stop / SessionEnd: POST unsent ledger rows to /fires in batches
@@ -31,10 +32,14 @@ the most people — an ordering, never a suppression. A backend that sends no
 book facts ranks every rule alike, and the stable sorts keep old behaviour.
 
 How a fire reaches people (spec §5.3):
-  * Every fire is DISCLOSED as `📏 Rule fired: <rule, ≤ 20 words>` (`⛔️` when
-    a gate stopped the call): to the user in `systemMessage`, and to the agent,
-    told to echo the byte-identical line, since only the agent's copy reaches
-    the transcript. `disclosure_line` builds both.
+  * An ADVISORY fire is silent to the person: the rule goes to the agent in
+    `additionalContext` and nothing is put on screen. The agent is told it may
+    credit the rule in a sentence when following it changed what it did
+    (`CREDIT_NOTE`), and not to announce it otherwise.
+  * A BLOCKED call is DISCLOSED as `⛔️ Rule fired: <rule, ≤ 20 words>`: to the
+    user in `systemMessage`, and to the agent, told to echo the byte-identical
+    line, since only the agent's copy reaches the transcript. A gate the agent
+    overrode shows one line too. `disclosure_line` builds both copies.
   * `mode: gate` rules BLOCK (`permissionDecision: deny`) with the override
     their lane accepts: Bash takes `RULEBOOK_OVERRIDE='<why>' <command>`; an
     edit takes a `rulebook-override[<rule>]: <why>` marker in the content
@@ -42,7 +47,8 @@ How a fire reaches people (spec §5.3):
     delegated, or run as an overridden `cat`. The fire records its
     `override_reason`; the next matching call is gated again. Gates are never
     deduped nor capped. Result rules and the shell-written-files lane run
-    after the fact and cannot gate.
+    after the fact and cannot gate; a gate edit rule the latter matches
+    quarantines the file instead (rulebook_quarantine.py).
   * A gate is honoured from whatever book is cached, however old: a stale gate
     costs one override, a gate that silently lapses offline is the failure a
     gate exists to prevent.
@@ -73,9 +79,11 @@ Two engines, one evaluate():
     so receipts from subagents and sibling sessions count.
 
 A matcher rule's `given` block adds predicates checked AFTER its regex matched
-— `repo`, `user`, `file` and `agent` facts, answered lazily by `Probes`. A
+— `repo`, `user`, `file`, `agent` and `session` (rulebook_session.py)
+facts, answered lazily by `Probes`. A
 fact that cannot be established never satisfies a predicate. `given_ok()` is
-pure over a Probes and the event's read facts.
+pure over a Probes and the event's read facts, except for the local repeat
+counter that `session.repeat_count_gt` keeps.
 """
 import fnmatch
 import hashlib
@@ -136,7 +144,7 @@ LEDGER_SCHEMA = 2       # ledger/fires.jsonl row shape (spec §3.2)
 BOOK_DIR = os.path.join(BASE, "book")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from rulebook_shell import (  # noqa: E402,F401 — split out for size (rulebook_shell.py); tests read expand_path, heredoc_bodies, _HD_OPEN here
+from rulebook_shell import (  # noqa: E402,F401 — split out for size (rulebook_shell.py); tests read expand_path, heredoc_bodies, _HD_OPEN, redact_secrets, anchor_hits here
     BASH_READ_MAX_FILES,
     _head_tail_lines,
     _sed_lines,
@@ -157,6 +165,11 @@ from rulebook_shell import (  # noqa: E402,F401 — split out for size (rulebook
     heredoc_bodies,
     shell_only,
     strip_leading_assignments,
+    _ANCHOR_RX,
+    _REDACTIONS,
+    anchor_hits,
+    anchor_rx,
+    redact_secrets,
 )
 
 # ── forward-test redirect (spec §4.3.3) ─────────────────────────────────────
@@ -386,7 +399,8 @@ def command_fires(rx, text, not_rx=None, flags=re.I | re.M):
 # (`bash_write_targets`, below) and can gate. This is the backstop for the
 # rest, read from the DISK: the pre lane stamps the call, the post lane asks
 # git what changed since and feeds each file through the same matcher a Write
-# goes through. It lands AFTER the write, so it advises only.
+# goes through. It lands AFTER the write, so it cannot refuse it: a gate
+# rule advises and quarantines the file (rulebook_quarantine.py).
 
 def _worktrees(root):
     """Every worktree of `root`'s repository, `root` first. Empty on any failure."""
@@ -735,13 +749,14 @@ class OrderingEngine:
             json.dump(st, f)
         os.replace(tmp, self.path)
 
-    def feed(self, rule, *, hook_phase, tool, cmd="", file_path="", ok=None, armed=None):
+    def feed(self, rule, *, hook_phase, tool, cmd="", file_path="", ok=None, armed=None, ran=None):
         """Returns "fired" | "allowed" | "discharged" | None. Mutates state
         under lock; None on lock timeout (fail open).
 
         `armed` is "session" or "prompt" when the obligation was armed in the
         SESSION's own state (read by the caller): such an obligation belongs
-        to one session, not the shared worktree state."""
+        to one session, not the shared worktree state. `ran`: the call did not
+        fail (lenient `bash_ok`) — a command arms only then (rulebook_moments)."""
         spec = rule["ordering"]
         armed_by = tuple(spec.get("armed_by_events", ("edit", "write")))
         by_call = any(k in armed_by for k in ("session", "prompt"))
@@ -764,7 +779,10 @@ class OrderingEngine:
         # ORDER and JOINER both have to hold (see `self_discharging`).
         if is_gate and by_call and self_discharging(seg, spec):
             return None
-        if not (is_edit or is_receipt or is_gate):
+        kw = {"executes": executes, "unquoted": unquoted, "receipt_segments": receipt_segments,
+              "command_fires": command_fires} if "command" in armed_by and seg else None
+        arm = _rm().command_arms(seg, spec, **kw) if kw and ran is True and hook_phase == "post" else ""
+        if not (is_edit or is_receipt or is_gate or arm):
             return None
 
         lock = self._locked()
@@ -774,9 +792,13 @@ class OrderingEngine:
             st = self._read()
             s = st.setdefault(self.branch, {}).setdefault(
                 rule["id"], {"count": 0, "last_edit": None})
-            if is_edit:                                   # handler 1: mutation arms
+            if is_edit or arm:                            # handler 1: mutation arms
                 s["count"] += 1
-                s["last_edit"] = file_path
+                if is_edit:
+                    s["last_edit"] = file_path
+                    s.pop("last_cmd", None)
+                else:
+                    s["last_cmd"] = arm
                 self._write(st)
                 return None
             if is_receipt:                                # handler 2: green receipt
@@ -787,7 +809,7 @@ class OrderingEngine:
                     # to the caller as legacy conversions (#240).
                     legacy = [f for f in [s.get("open_fire")] + list(s.get("open_fires") or []) if f]
                     rule["_legacy_fires"] = list(dict.fromkeys(legacy))
-                    for k in ("open_fire", "open_fires", "resolved_fires"):
+                    for k in ("open_fire", "open_fires", "resolved_fires", "last_cmd"):
                         s.pop(k, None)
                     self._write(st)
                     return "discharged"
@@ -798,6 +820,11 @@ class OrderingEngine:
                 rule["_gate_msg"] = (
                     f"{s['count']} edit(s) since the last passing "
                     f"'{name}' (last: {s['last_edit']}). Run it first.")
+                if s.get("last_cmd"):
+                    rule["_gate_msg"] = _rm().command_gate_msg(s, name)
+                return "fired"
+            if kw and (msg := _rm().command_gate_msg(s, name, seg, spec, **kw)):
+                rule["_gate_msg"] = msg
                 return "fired"
             if armed:
                 since = ("this session started" if armed == "session"
@@ -842,6 +869,9 @@ _GIVEN = {
     # main agent vs subagent (transcript under <session>/subagents/);
     # `main: true` lets a delegate's reads pass.
     "agent": {"main": "bool"},
+    # the agent session itself: rulebook_session.py
+    "session": {"context_tokens_gt": "int", "idle_seconds_gt": "int", "turn_tool_calls_gt": "int",
+                "repeat_count_gt": "int", "repeat_key": "repeat_key"},
 }
 
 
@@ -880,8 +910,9 @@ def hook_version():
 # Every key of an `ordering` block this hook knows how to honour; a rule
 # written for a NEWER hook degrades (see `degradation`).
 _ORDERING_KEYS = frozenset({"required_command_rx", "gated_command_rx", "armed_by_events",
-                            "armed_by_rx", "min_edits", "display_name", "path_rx"})
-_ARMED_BY_EVENTS = frozenset({"edit", "write", "session", "prompt"})
+                            "armed_by_rx", "min_edits", "display_name", "path_rx",
+                            "armed_by_command_rx"})
+_ARMED_BY_EVENTS = frozenset({"edit", "write", "session", "prompt", "command"})
 
 
 def given_unsupported(g):
@@ -988,8 +1019,10 @@ def given_norm(g):
             elif kind == "bool":
                 if not isinstance(v, bool):
                     return None
-            else:
+            elif kind != "repeat_key":
                 return None
+        if block == "session" and not all(_rs().kind_ok(k, v) for k, v in spec.items()):
+            return None             # bounds and the repeat_key enum
         out[block] = dict(spec)
     return out
 
@@ -1326,9 +1359,10 @@ class Probes:
         return self._get("agent_main", lambda: self._agent_id is None)
 
 
-def given_ok(rule, probes, read=None):
+def given_ok(rule, probes, read=None, ev=None):
     """True when every predicate in the rule's `given` holds. Pure over the
-    Probes (which memoizes) and `read`, the event's own `read_facts`; a probe
+    Probes (which memoizes) and `read`, the event's own `read_facts` — save
+    `session`, which counts a repeat in local state; `ev` is (cmd, path). A probe
     answering None — or a `file` predicate with no facts — fails."""
     g = rule.get("given")
     if not g:
@@ -1382,7 +1416,8 @@ def given_ok(rule, probes, read=None):
         said = any(re.search(v, t, re.I) for t in turns)
         if (k == "said_rx" and not said) or (k == "not_said_rx" and said):
             return False
-    return True
+    s = g.get("session")    # last: a repeat counts only a call all else matched
+    return not s or _rs().holds(s, rule, probes, ev, base=_base(), host=_host_arg())
 
 
 # ── plumbing ────────────────────────────────────────────────────────────────
@@ -1459,6 +1494,7 @@ _MATCHER_KEYS = {   # server matcher block (§3.1) → the hook's flat pilot key
     "command_rx": "rx", "command_not_rx": "not_rx", "content_not_rx": "content_not_rx",
     "warn_once_per": "fire_scope", "result_rx": "rx",
     "prompt_rx": "rx", "prompt_not_rx": "not_rx",
+    "reply_rx": "rx", "evidence_command_rx": "evidence_rx",
 }
 _RESULT_KEYS = dict(_MATCHER_KEYS, command_rx="cmd_rx", command_not_rx="cmd_not_rx",
                     content_rx="rx", content_not_rx="exclude_rx")
@@ -1473,6 +1509,7 @@ _MATCHER_KNOWN = frozenset({
     "path_rx", "path_not_rx", "match_heredoc_body", "body_rx", "warn_once_per",
     "converted_rx", "predicts_rx", "min_chars", "result_rx",
     "prompt_rx", "prompt_not_rx",   # event "prompt" (0.99.0): the UserPromptSubmit lane
+    "reply_rx", "evidence_command_rx",   # event "reply": the Stop lane (rulebook_reply.py)
     "given",            # rides inside the matcher block; linted by `given_norm` below
 })
 
@@ -1488,6 +1525,9 @@ _PROMPT_ONLY_KEYS = frozenset({"prompt_rx", "prompt_not_rx"})
 # what a prompt rule reads besides its own patterns; every other matcher key
 # is about a tool call, which a prompt is not
 _PROMPT_SHARED_KEYS = frozenset({"warn_once_per", "given", "predicts_rx"})
+# an event that reads ONLY its own keys (plus the shared ones); no other event reads them
+_OWN_KEYS = {"prompt": _PROMPT_ONLY_KEYS, "reply": frozenset({"reply_rx", "evidence_command_rx"})}
+_ANY_OWN = frozenset().union(*_OWN_KEYS.values())
 _SCOPE_MAP = {"turn": "call", "file": "session", "session": "session"}   # warn_once_per → fire_scope
 _RESERVED_RULE_KEYS = frozenset({"id", "text", "why", "status", "mode", "_version", "_label",
                                  "on", "repo_scope", "_scope_repos", "_scope_paths",
@@ -1498,7 +1538,7 @@ _RESERVED_RULE_KEYS = frozenset({"id", "text", "why", "status", "mode", "_versio
 
 
 _RX_KEYS = ("rx", "not_rx", "body_rx", "cmd_rx", "cmd_not_rx", "path_rx", "path_not_rx",
-            "content_rx", "content_not_rx", "exclude_rx", "converted_rx")
+            "content_rx", "content_not_rx", "exclude_rx", "converted_rx", "evidence_rx")
 # The server's cap (validation.MAX_REGEX); it floors any pattern past 400 at
 # min_hook_version 0.88.0, so every hook that receives one must load it.
 _RX_MAX = 2000
@@ -1758,7 +1798,7 @@ def ordering_rx_ok(o):
     valid rule after it. `rx_ok` already refuses both shapes."""
     if not all(rx_ok(o.get(k)) for k in ("required_command_rx", "gated_command_rx")):
         return False
-    return rx_ok(o["armed_by_rx"]) if "armed_by_rx" in o else True
+    return all(rx_ok(o[k]) for k in ("armed_by_rx", "armed_by_command_rx") if k in o)
 
 
 def to_hook_rule(row):
@@ -1859,7 +1899,8 @@ def to_hook_rule(row):
             # `prompt_rx` and `command_rx` land on the same `rx`: each event
             # reads only its own, so a row carrying both cannot let dict order
             # decide which pattern the rule matches.
-            if (k in _PROMPT_ONLY_KEYS) != (r["on"] == "prompt") and k not in _PROMPT_SHARED_KEYS:
+            own = _OWN_KEYS.get(r["on"])
+            if k not in _PROMPT_SHARED_KEYS and (k not in own if own else k in _ANY_OWN):
                 continue
             dest = keys.get(k, k)
             if dest in _RESERVED_RULE_KEYS:   # a matcher key can never overwrite the row's own fields
@@ -1868,6 +1909,8 @@ def to_hook_rule(row):
         r["fire_scope"] = _SCOPE_MAP.get(str(r.get("fire_scope", "session")), r.get("fire_scope"))
         if not all(rx_ok(r[k]) for k in _RX_KEYS if k in r):
             return None
+        if r["on"] == "reply" and not r.get("rx"):
+            return None       # no claim pattern: it would fire on every reply
         if r["on"] == "prompt":
             # A prompt rule with no pattern would fire on every prompt — a
             # session note wearing the wrong delivery. Say which prompts, or
@@ -2182,102 +2225,6 @@ def fetch_book(repo, timeout=None):
         _breadcrumb("fetch", f"HTTP {reply.status}: unexpected reply shape")
 
 
-# ── credentials out of command text ────────────────────────────────────────
-#
-# A command line is where credentials live — `curl -H "Authorization: Bearer
-# …"`, `psql postgres://user:pw@host`, `--token=…`. Wherever command text is
-# about to leave the machine (the judge's call excerpt, an override reason,
-# the harness window) those values are replaced first.
-#
-# This is a denylist and cannot be complete — the docstring and the README say
-# so. It is a floor, not a guarantee.
-_REDACTIONS = (
-    # `--token=x`, `--password x`, `API_KEY=x` — the value, not the flag, so the
-    # judge still sees that a credential was passed. A quoted value
-    # (`--token='x'`, `PGPASSWORD="two words"`) goes whole, quotes and all.
-    #
-    # `auth` is deliberately NOT in this list even though it names plenty of
-    # real secrets: it also names `gh auth login`, `--auth-mode`, `auth0_sub`,
-    # and eating the word after those costs the judge the verb of the command
-    # for nothing. The `Authorization:` header has its own rule below, which is
-    # where `auth` actually carries a credential.
-    # The key must END with the credential word. Allowing a trailing suffix
-    # matched `--token-budget 500` and ate the number, which is not a secret and
-    # is exactly the kind of over-redaction that degrades the judge on ordinary
-    # commands. `aws_secret_access_key`, `--with-token` and `API_KEY` all still
-    # match, because each ends with one.
-    (re.compile(r"(?i)\b([a-z0-9_-]*(?:secret|passwd|password|token|api[_-]?key|"
-                r"access[_-]?key|credential))(\s*[=:]\s*|\s+)('[^']*'|\"[^\"]*\"|[^\s\"']+)"),
-     r"\1\2<redacted>"),
-    # `curl -u user:password`, `-U user:password`, a quoted password
-    # (`-u user:'pass word'`), and a quoted pair (`-u 'user:pass word'`).
-    (re.compile(r"(?i)(\s-{1,2}(?:u|user)[=\s]+)([^\s:\"']+):('[^']*'|\"[^\"]*\"|[^\s\"']+)"),
-     r"\1\2:<redacted>"),
-    (re.compile(r"(?i)(\s-{1,2}(?:u|user)[=\s]+)(['\"])([^:'\"]+):([^'\"]*)\2"),
-     r"\1\2\3:<redacted>\2"),
-    # Authorization / Proxy-Authorization headers, with or without a scheme.
-    (re.compile(r"(?i)(authorization\s*:\s*)(?:bearer|basic|token)?\s*[^\s\"']+"),
-     r"\1<redacted>"),
-    # Credentials inline in a URL: scheme://user:pw@host
-    (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)([^\s:/@]+):([^\s@]+)@"), r"\1\2:<redacted>@"),
-    # Vendor-shaped keys, which are recognisable on their own.
-    (re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}"), "<redacted>"),
-    (re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{16,}"), "<redacted>"),
-    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "<redacted>"),
-    (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"), "<redacted>"),
-    (re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+"), "<redacted>"),
-    (re.compile(r"\bmhk_[A-Za-z0-9_-]{8,}"), "<redacted>"),
-)
-
-
-def redact_secrets(text):
-    """Strip credential-shaped values from a command before it is sent.
-
-    Order matters: the URL rule must run before the vendor-key rules, or a
-    password that happens to look like a key is rewritten first and the
-    surrounding `user:…@host` shape no longer matches.
-    """
-    if not text:
-        return text
-    for pattern, repl in _REDACTIONS:
-        text = pattern.sub(repl, text)
-    return text
-
-
-# Anchor rules (§4.7), matched here against the cached book. An anchor fires
-# when it appears in the call's command or path as a WHOLE identifier: not
-# preceded by an identifier character other than `/` (so `SKILL.md` matches
-# `skills/x/SKILL.md` and a relative path matches the tail of an absolute one),
-# and not followed by any (so `agent-plugins` does not match
-# `agent-plugins-internal`). An anchor ending in `/` names a directory and
-# also matches any path under it. Case-sensitive, literal. Whether the rule fits the
-# call is the judge's question (`judge_fires`), not this one's.
-_ANCHOR_RX = {}
-
-
-def anchor_rx(anchor):
-    """The compiled whole-identifier pattern for one anchor, once per run;
-    None for an anchor with nothing left to match (a bare `/`)."""
-    if anchor not in _ANCHOR_RX:
-        core = anchor.rstrip("/")
-        tail = r"(?:/|(?![A-Za-z0-9_./-]))" if anchor.endswith("/") else r"(?![A-Za-z0-9_./-])"
-        _ANCHOR_RX[anchor] = re.compile(
-            r"(?<![A-Za-z0-9_.-])" + re.escape(core) + tail) if core else None
-    return _ANCHOR_RX[anchor]
-
-
-def anchor_hits(rule, text):
-    """The anchors of `rule` that appear in `text` as whole identifiers."""
-    if not text:
-        return []
-    out = []
-    for a in rule.get("anchors") or []:
-        rx = anchor_rx(a) if isinstance(a, str) else None
-        if rx is not None and rx.search(text):
-            out.append(a)
-    return out
-
-
 # ── the rule judge (rule-judge-spec §3, §5) ────────────────────────────────
 #
 # A pattern says a rule MIGHT apply; it matches words, not situations. After
@@ -2298,8 +2245,8 @@ JUDGE_RESULT_CHARS = 3000          # the output an output rule matched; the serv
 JUDGE_ID_CHARS = 200               # repo / session_id / turn_id, the server's bound
 JUDGE_VERDICTS = frozenset({"fit", "no_fit", "timeout", "failed", "no_rule", "disabled"})
 # Matcher rules and anchor rules. Not `ordering` (an obligation the state
-# machine armed is not a pattern's guess), and the session and prompt lanes
-# never reach the fire pass that calls this.
+# machine armed is not a pattern's guess), not `reply` (rulebook_reply.py),
+# and the session and prompt lanes never reach the fire pass that calls this.
 _JUDGED_ON = frozenset({"bash", "edit", "read", "result", "anchor"})
 
 
@@ -2629,6 +2576,11 @@ def spawn_fetch(repo):
 # GATE row it is the excuse given on the blocked call, the row's own record.
 # `judge_score` / `judge_verdict` (rule-judge-spec §4) are on a row only when
 # the judge answered for that fire; see `wire_row`.
+def _rs():
+    import rulebook_session  # noqa: PLC0415 — beside this file; given.session
+    return rulebook_session
+
+
 def _rm():
     """`rulebook_moments`, imported beside this file on first use: what the
     hook's size limit moved out (ENG-1235). Imported lazily, like every
@@ -3248,7 +3200,7 @@ def state_path(session_id):
 
 def load_state(p):
     st = {"fired": [], "counts": {}, "raw": {}, "armed": {},
-          "armed_once": [], "armed_version": {}, "spec_pending": {}}
+          "armed_once": [], "armed_version": {}, "spec_pending": {}, "quarantine": {}}
     try:
         with open(p, encoding="utf-8") as f:
             st.update(json.load(f))
@@ -3271,6 +3223,8 @@ def load_state(p):
         st["armed_version"] = {}
     if not isinstance(st.get("spec_pending"), dict):
         st["spec_pending"] = {}
+    if not isinstance(st.get("quarantine"), dict):
+        st["quarantine"] = {}
     return st
 
 
@@ -3303,7 +3257,7 @@ def drop_arming(st, rid):
 # is on disk now.
 _ARMING_KEYS = ("armed", "armed_version")
 _APPEND_KEYS = ("armed_once",)      # only ever appended to
-_DELTA_KEYS = _ARMING_KEYS + ("spec_pending",)
+_DELTA_KEYS = _ARMING_KEYS + ("spec_pending", "quarantine")
 
 
 def snapshot_arming(st):
@@ -3737,6 +3691,18 @@ ADVISE_FEEDBACK_HINT = (
     "_If you go on without following one of these, say why on your next shell command — "
     "`RULEBOOK_OVERRIDE='[<label>] <why>' <command>` — so the reason is recorded against "
     "that rule instead of silence._")
+# An advisory fire is not shown to the person and not announced by the agent:
+# a line above every answer for a rule that changed nothing taught people to
+# skip the line (pilot feedback, ENG-1326). What is worth saying is the case
+# where the rule changed the outcome, in the agent's own words. Written as a
+# fact about what helps the person, not as an order about what to say: a model
+# told what to say can read the text as an injected message (see the upgrade
+# notice below).
+CREDIT_NOTE = (
+    "_These are not shown to the user and need no announcement. If following one changes "
+    "what you do — you do something the user did not ask for, or hold back from something "
+    "they asked for — one plain sentence saying it was a team rule from the MemHub Rulebook "
+    "tells them why._")
 DISCLOSE_ADVISORY = "📏"
 DISCLOSE_BLOCKED = "⛔️"
 DISCLOSE_PREFIX = "Rule fired: "
@@ -3782,7 +3748,9 @@ def disclosure_line(rule, blocked=False):
 
 
 def disclosure_instruction(lines):
-    """What goes at the end of `additionalContext`, once per emitting call.
+    """What goes at the end of `additionalContext` for the fires that are
+    shown to the person: a blocked call, a gate the agent overrode, a reply
+    check. An advisory fire gets `CREDIT_NOTE` instead.
 
     The `systemMessage` copy is deterministic but invisible to everything
     downstream; this copy is the one that lands in the transcript, and so the
@@ -3792,10 +3760,8 @@ def disclosure_instruction(lines):
     return ("\n_Disclose these to the user. Begin your next reply with the following "
             "line(s), verbatim and each on its own line, before anything else — including "
             "before any tool call narration:_\n" + quoted +
-            "\n_This is how the team sees its rules working. Do not paraphrase, do not merge "
-            "them into a sentence, and do not omit one because it did not change what you were "
-            "going to do — a rule that fired and changed nothing is exactly the rule the team "
-            "needs to hear about._")
+            "\n_This is how the team sees what its rules stopped. Do not paraphrase and do "
+            "not merge them into a sentence._")
 
 
 def emit(event_name, text, *, user_line=None, deny=None):
@@ -4141,9 +4107,9 @@ CODEX_NO_REPO = (
 SESSION_PREAMBLE = (
     "These are your team's engineering rules — standing instructions from your teammates, "
     "carrying the same weight as this repo's CLAUDE.md. Follow them as you would CLAUDE.md: "
-    "they are how this team works, not suggestions to weigh. When one fires, you MUST disclose "
-    "it to the user on its own line, exactly `📏 Rule fired: <the rule, in 20 words or fewer>`, "
-    "before anything else in that reply."
+    "they are how this team works, not suggestions to weigh. They need no announcement: when "
+    "following one changes what you do, one plain sentence saying it was a team rule from the "
+    "MemHub Rulebook tells the user why."
 )
 
 MAX_BOOKS_NAMED = 6       # session-start roster: bounded, like every other context spend
@@ -4343,6 +4309,7 @@ def prompt_lane(rules, repo, root, gitdir, branch, session, ctx, data, text):
     before = snapshot_arming(st)
     probes = Probes(root, branch, transcript_path=data.get("transcript_path"),
                     agent_id=ctx["agent_id"])
+    probes.call = (session, data)
     fired, dedup_keys = [], {}
     marks = {"fired": list(st["fired"]), "counts": dict(st["counts"]),
              "spec_pending": dict(st["spec_pending"])}
@@ -4369,7 +4336,6 @@ def prompt_lane(rules, repo, root, gitdir, branch, session, ctx, data, text):
     fired.sort(key=book_rank)
     shown, cut = fired[:MAX_ADVISE], fired[MAX_ADVISE:]
     lines = [f"## {BRAND} Rulebook (team rules — advisory, not blocking)"]
-    user_lines, disclosures = [], []
     for r in shown:
         label = r.get("_label") or r["id"]
         lines.append(f"- **[{label}]** {r['text']}{_why(r)}")
@@ -4378,13 +4344,11 @@ def prompt_lane(rules, repo, root, gitdir, branch, session, ctx, data, text):
             st["fired"].append(stale_key)
             lines.append(f"  _(advice only — {r['_degraded']}. Update the "
                          f"{BRAND} plugin to let this rule gate.)_")
-        line = disclosure_line(r)
-        disclosures.append(line)
-        user_lines.extend([line, f"   {BRAND} ▸ [{label}] {r['text']}"])
+    # Advisory fires, all of them: nothing on the person's screen.
     lines.append(ADVISE_FEEDBACK_HINT)
-    lines.append(disclosure_instruction(disclosures))
+    lines.append(CREDIT_NOTE)
     try:
-        emit("UserPromptSubmit", "\n".join(lines), user_line="\n".join(user_lines))
+        emit("UserPromptSubmit", "\n".join(lines))
     except Exception:
         pass
     fired_at = _now()
@@ -4572,6 +4536,10 @@ def main():
            # Local-only, like `host`: the call this fire is anchored on, so the
            # Stop lane can build the effect judge's window (fire_effect.py).
            "tool_use_id": str(data.get("tool_use_id") or "") or None}
+    if mode == "reply":   # Stop: the turn's final text (rulebook_reply.py)
+        import rulebook_reply  # noqa: PLC0415 — beside this file
+        return rulebook_reply.lane(globals(), rules, repo=repo, root=root, gitdir=gitdir,
+                                   branch=branch, session=session, ctx=ctx, data=data)
     if mode == "prompt":
         # UserPromptSubmit. It arms ordering rules silently: anything printed
         # here is injected above the person's own words, and an arming is not
@@ -4625,6 +4593,7 @@ def main():
         probe_branch = _branch(os.path.join(repo_info(elsewhere)[2], "HEAD"))
     probes = Probes(probe_root, probe_branch, command=cmd_text,
                     transcript_path=data.get("transcript_path"), agent_id=ctx["agent_id"])
+    probes.call = (session, data)
 
     if mode == "session":
         # Fetch BEFORE rendering, but only when the book is old enough to be
@@ -4700,6 +4669,8 @@ def main():
     resp = data.get("tool_response") if (mode == "post" and tool == "Bash") else None
     if mode == "post" and str(data.get("hook_event_name") or "") == "PostToolUseFailure":
         rtext, resp = failure_result(data)   # a failed call's `error`, same lane (ENG-1236)
+    elif isinstance(resp, str):
+        resp = _rm().codex_resp(data, resp)   # Codex: exit code from the rollout
     ordering = None
     dedup_keys = {}
 
@@ -4763,7 +4734,7 @@ def main():
                         if text is not None:
                             events.append({"tool": "Write", "phase": "pre", "order_phase": "post",
                                            "cmd": "", "fp": path, "body": text, "rtext": "", "resp": None,
-                                           "via": "bash", "root": wt, "rules": srules, "at": sat})
+                                           "via": "bash", "root": wt, "rules": srules, "at": sat, "new": is_new})
     # A patch is an edit tool call, not a file a command already wrote: its
     # events keep the call's own phase, exactly like Claude's Edit. The edit
     # lane judges it at pre, where a gate can still refuse it (via None), and
@@ -4914,7 +4885,8 @@ def main():
                     ok = bash_ok(ev["resp"], strict=r.get("mode") == "gate") \
                         if ev["resp"] is not None else None
                     outcome = ordering.feed(r, hook_phase=ev["order_phase"], tool=etool, cmd=ecmd,
-                                            file_path=efp, ok=ok, armed=st["armed"].get(rid))
+                                            file_path=efp, ok=ok, armed=st["armed"].get(rid),
+                                            ran=bash_ok(ev["resp"]) if ev["resp"] is not None else None)
                 except Exception:
                     outcome = None
                 if outcome == "discharged":
@@ -4946,15 +4918,11 @@ def main():
             if ev.get("via") == "bash" and [rid, os.path.realpath(efp)] in pre_written:
                 continue
             scope = r.get("fire_scope", "session")
-            # A gate blocks EVERY matching call — never deduped (§5.3), in
-            # any lane the hook can refuse: a Bash command, an edit the tool
-            # has not written yet, or a read — the Read tool's own, or one a
-            # Bash segment is about to make. `via` guards the difference: a
-            # post-lane synthetic EDIT ("bash") is a file a command ALREADY
-            # wrote, so it cannot be refused and keeps its rule's ordinary
-            # dedup; a pre-lane one ("bash-pre") and a synthetic READ have not
-            # happened, and refusing the command is refusing the write or read.
-            if ephase == "pre" and r.get("mode") == "gate" and ev.get("via") in (None, "bash-read", "bash-pre") \
+            # A gate fires on EVERY matching call — never deduped (§5.3): a
+            # Bash command, an edit or read not yet made (refusable), and a
+            # file a command ALREADY wrote ("bash"), which cannot be refused
+            # but opens a quarantine (rulebook_quarantine.py) per write.
+            if ephase == "pre" and r.get("mode") == "gate" and ev.get("via") in (None, "bash", "bash-read", "bash-pre") \
                     and ((etool == "Bash" and r.get("on") == "bash")
                          or (etool in EDIT_TOOLS and r.get("on") == "edit")
                          or (etool in READ_TOOLS and r.get("on") == "read")):
@@ -4963,7 +4931,7 @@ def main():
             # the regex first (pure, cheap), the given second (probes run only now)
             matched = evaluate(r, hook_phase=ephase, tool=etool, cmd=ecmd, file_path=efp,
                                body=ebody, result_text=ev["rtext"], added=ev.get("added")) \
-                and given_ok(r, probes, read=ev.get("read"))
+                and given_ok(r, probes, read=ev.get("read"), ev=(ecmd, efp))
             if scope != "call" and not scope.startswith("counter") and key in st["fired"]:
                 if matched:
                     st["raw"][rid] = st["raw"].get(rid, 0) + 1   # what dedup swallowed
@@ -5036,6 +5004,14 @@ def main():
                       fired_at=fired_at, judge=judged)
         unfire(st, r, dedup_keys.get(r["id"]), marks, reset_raw=r["id"] in fresh)
     fired_now = [r for r in fired_now if r["id"] not in held]
+    if st["quarantine"] or (mode == "post" and fired_now):   # rulebook_quarantine.py
+        try:
+            import rulebook_quarantine as rq  # noqa: PLC0415
+            fired_now += rq.on_call(globals(), st, mode=mode, tool=tool, cmd=cmd, events=events, fired=fired_now,
+                                    fired_on=fired_on, rules=rules, repo=repo, root=root, cmd_root=probe_root,
+                                    label=override_label, reason=override_reason)
+        except Exception:
+            pass
 
     def _dismiss(dismissals):
         """Post a `dismissed` event per rule the override names; returns the
@@ -5069,7 +5045,7 @@ def main():
     # (`via == "bash-pre"`): refusing the command refuses the write. A fire
     # from the post-lane synthetic lane (`via == "bash"`, a file discovered
     # after a command wrote it) is post-hoc whatever its rule says, so it
-    # advises: there is nothing left to refuse.
+    # advises: there is nothing left to refuse (a gate's quarantines instead).
     def _gateable(r):
         if mode != "pre" or r.get("mode") != "gate":
             return False
@@ -5201,10 +5177,11 @@ def main():
                 else f" _(`{path}`, read by that command)_"
         return f" _(in `{path}`, written by that command)_"
 
-    # §3: every fire is disclosed, on BOTH channels. The disclosure line comes
-    # first and today's line is kept verbatim beneath it, indented — so nothing
-    # a user recognises is lost, and the brand stays off the line the agent is
-    # told to echo into the transcript.
+    # §3: a call that was stopped, and a gate the agent overrode, are disclosed
+    # on BOTH channels: the disclosure line first, the detail beneath it,
+    # indented, with the brand kept off the line the agent is told to echo into
+    # the transcript. An advisory fire is on neither: the rule's bullet above is
+    # the agent's copy, and the person is shown nothing (CREDIT_NOTE).
     disclosures = []
     for r in shown:
         label = r.get("_label") or r["id"]
@@ -5241,15 +5218,19 @@ def main():
             lines.append(note)
         # A gate that was overridden still FIRED and the call still ran, so it
         # takes 📏; ⛔️ is reserved for a call that was actually stopped.
-        line = disclosure_line(r, blocked=blocked_here)
-        disclosures.append(line)
-        user_lines.append(line)
-        user_lines.append("   " + detail_line)
+        # …and so is a fire that puts a file in quarantine: commits and pushes
+        # are blocked from here on, which the person has to hear about.
+        if r["id"] in gate_ids or "QUARANTINED" in str(r.get("_gate_msg") or ""):
+            line = disclosure_line(r, blocked=blocked_here)
+            disclosures.append(line)
+            user_lines.append(line)
+            user_lines.append("   " + detail_line)
     # The advisory's feedback channel. The call has already run, so a reason
     # travels on the NEXT shell command, naming the rule — what turns a silent
     # non-conversion into a recorded one the rule's reviewer can read.
     if any(r["id"] not in gate_ids for r in shown):
         lines.append(ADVISE_FEEDBACK_HINT)
+        lines.append(CREDIT_NOTE)
     deny = None
     if blocked:
         # Each lane names the override it actually accepts: an Edit tool call

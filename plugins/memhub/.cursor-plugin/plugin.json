@@ -1,8 +1,8 @@
 {
   "name": "memhub",
   "displayName": "MemHub",
-  "description": "Team memory for Cursor. Your sessions are saved to your memory automatically, your team keeps a shared brain of specs and docs, and MCP tools let the agent search and save team memory. Team rules that block a shell command or a file read run at the moment they apply; rules on edits run on Claude Code and Codex, not yet on Cursor.",
-  "version": "0.133.0",
+  "description": "Team memory for Cursor. Your sessions are saved to your memory automatically, your team keeps a shared brain of specs and docs, and MCP tools let the agent search and save team memory. Team rules on shell commands, file reads and edits run at the moment they apply, including rules that check a command's result or ask for one command before another; each session starts with the team's rules and the repo's brain brief; rules on prompts and replies run on Claude Code and Codex, not yet on Cursor.",
+  "version": "0.151.0",
   "license": "Apache-2.0",
   "author": {
     "name": "XTrace"

@@ -288,7 +288,8 @@ function compare(step: Step, got: Verdict, w: ReturnType<typeof world>, session:
   if ((pyCtx ?? null) !== (tsCtx ?? null)) add('context', pyCtx ?? null, tsCtx ?? null)
   else if (pyDeny !== undefined && got.deny !== undefined && pyDeny !== got.deny) add('context', { deny: pyDeny }, { deny: got.deny })
   const sys = step.py.stdout?.systemMessage ?? ''
-  const lines = got.fires.map((f) => f.line)
+  // Only a gate's fire is shown to the person; an advisory fire has no line on either path.
+  const lines = got.fires.filter((f) => f.mode === 'gate').map((f) => f.line)
   const sysCount = sys.split('Rule fired: ').length - 1
   if (lines.some((l) => !sys.includes(l)) || sysCount !== lines.length) add('fires', sys || null, lines)
   const fires = got.ledger.filter((x) => !isEvent(x)).map((x) => fireAsWritten(x, session))

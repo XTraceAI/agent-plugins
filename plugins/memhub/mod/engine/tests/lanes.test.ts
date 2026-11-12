@@ -20,8 +20,9 @@
 import { test, expect } from 'claude-code/testing'
 
 import { postResultText } from '../../lanes'
-import { createEngine, ForeignRepoError } from '../engine'
+import { createEngine, ForeignRepoError, QuarantineHandoff } from '../engine'
 import type { EngineIO, HookRule, StateOp, TurnMessage, Verdict } from '../index'
+import { sessionFileName } from '../repo'
 import {
   applyStateOp, eventAsWritten, fireAsWritten, isEvent, modelText, sessionDoc as laneSessionDoc, sortedArgv,
 } from './lane_io'
@@ -50,8 +51,12 @@ type Step = {
   prompt?: string
   session?: string
   cwd?: string
-  /** A call into another repo's checkout: the mod hands it to Python (ForeignRepoError). */
-  handoff?: boolean
+  /**
+   * A call into another repo's checkout: the mod hands it to Python
+   * (ForeignRepoError). `'quarantine'`: a call while the session has a file
+   * in quarantine, handed over whether or not Python fires (QuarantineHandoff).
+   */
+  handoff?: boolean | 'quarantine'
 }
 type Case = {
   name: string
@@ -74,6 +79,7 @@ type StepOut = {
   turn_id: string | null
   wt_state: Record<string, unknown>
   armings: Dict
+  quarantine: Dict
 }
 type CaseOut = { root: string; rules: HookRule[]; git_table: [string[], number, string][]; steps: StepOut[] }
 
@@ -180,7 +186,13 @@ function world(c: Case, o: CaseOut) {
     }
     return wt
   }
-  return { io, s, put, state, sessionDoc }
+  /** What Python left in the session's quarantine after a call it served. */
+  const setQuarantine = (session: string, q: Dict) => {
+    const doc = sessionDoc(session)
+    doc.quarantine = q
+    put(`${BASE}/state/${sessionFileName(session)}`, JSON.stringify(doc), s.now)
+  }
+  return { io, s, put, state, sessionDoc, setQuarantine }
 }
 
 const noTurnId = (b: Dict) => ({ ...b, turn_id: '<turn>' })
@@ -250,6 +262,18 @@ for (const v of VECTORS) {
     engine.setBook(o.rules, { repo: REPO, fetchedAt: 0 })
     for (const [i, raw] of c.steps.entries()) {
       const want = o.steps[i]!
+      if (raw.handoff === 'quarantine') {
+        // Python serves it whole; the shared session file then holds what
+        // Python left. The post half of a call whose pre was handed over is
+        // never run by the mod (lanes.ts `foreign`), so it is not run here.
+        const where = `${c.name} step ${i}`
+        if (raw.lane !== 'post') {
+          const threw = await runStep(engine, w, o, raw, i).then(() => null, (err: unknown) => err)
+          expect({ where, quarantine: threw instanceof QuarantineHandoff }).toEqual({ where, quarantine: true })
+        }
+        w.setQuarantine(raw.session ?? SESSION, want.quarantine)
+        continue
+      }
       if (raw.handoff) {
         // Python judged it with the other repo's book (the vector's fires); the mod must not.
         const where = `${c.name} step ${i}`
@@ -264,7 +288,8 @@ for (const v of VECTORS) {
       expect({ where, context: modelText(got) }).toEqual({ where, context: hso.additionalContext as string | undefined })
       expect({ where, deny: got.deny }).toEqual({ where, deny: hso.permissionDecisionReason as string | undefined })
       const sys = want.stdout?.systemMessage ?? ''
-      for (const f of got.fires) expect({ where, line: sys.includes(f.line) }).toEqual({ where, line: true })
+      // The person is shown a gate's fire and nothing of an advisory one, on both paths.
+      for (const f of got.fires) expect({ where, line: sys.includes(f.line) }).toEqual({ where, line: f.mode === 'gate' })
       const fires = got.ledger.filter((r) => !isEvent(r)).map((r) => fireAsWritten(r, sessionId))
       const events = got.ledger.filter(isEvent).map((r) => eventAsWritten(r, sessionId))
       expect({ where, fires }).toEqual({ where, fires: want.fires })
@@ -276,6 +301,7 @@ for (const v of VECTORS) {
       const doc = w.sessionDoc(sessionId)
       const armings = { armed: doc.armed, armed_version: doc.armed_version, armed_once: doc.armed_once }
       expect({ where, armings }).toEqual({ where, armings: want.armings })
+      expect({ where, quarantine: doc.quarantine }).toEqual({ where, quarantine: want.quarantine })
     }
   })
 }
@@ -340,7 +366,7 @@ test('a Bash output persisted to a file fires on its stdout, past the preview th
 
 test('lane vectors cover every lane, a gate, a judge hold and an ordering receipt', () => {
   // Recorded count (vector_checks.ts): raise it when cases are added.
-  expect(belowRatchet('lanes', VECTORS.length, 29)).toBeNull()
+  expect(belowRatchet('lanes', VECTORS.length, 30)).toBeNull()
   const steps = VECTORS.flatMap((v) => (v.out as CaseOut).steps)
   const lanes = new Set(VECTORS.flatMap((v) => (v.args[0] as Case).steps.map((s) => s.lane)))
   expect([...lanes].sort()).toEqual(['post', 'pre', 'prompt', 'session'])
@@ -365,6 +391,42 @@ test('a rule pyre cannot run is never skipped: every tool and prompt lane throws
   await expect(engine.post({ ...call, phase: 'post' })).rejects.toThrow('not portable')
   await expect(engine.prompt('hi', SESSION, root)).rejects.toThrow('not portable')
   await expect(engine.session(SESSION, root)).resolves.toBeDefined()
+})
+
+test('a given.session rule keeps the book in the mod: the Python is asked only when its pattern matched', async () => {
+  const root = '/tmp/memhub-lane-vectors/session-given'
+  const io = bareWorld(root)
+  const asked: StateOp[] = []
+  let answer = false
+  const engine = createEngine({
+    ...io,
+    state: async (ops, cwd) => {
+      if (ops.some((op) => op.op === 'session')) {
+        asked.push(...ops)
+        return ops.map(() => ({ holds: answer }))
+      }
+      return io.state(ops, cwd)
+    },
+  })
+  engine.setBook([{ id: 'big', on: 'bash', mode: 'advise', rx: '^rg\\b', text: 'delegate',
+    fire_scope: 'call', given: { session: { context_tokens_gt: 300000 } } }], { repo: REPO, fetchedAt: 0 })
+  const pre = (command: string, toolUseId: string) =>
+    engine.pre({ phase: 'pre', tool: 'Bash', input: { command }, sessionId: SESSION, cwd: root, toolUseId })
+  // no throw (the lane is not handed to Python), and no question for a call the pattern misses
+  expect((await pre('ls', 'tu-1')).fires).toEqual([])
+  expect(asked).toEqual([])
+  expect((await pre('rg foo', 'tu-2')).fires).toEqual([])
+  expect(asked).toEqual([{
+    op: 'session', session: SESSION, rule: { id: 'big', given: { session: { context_tokens_gt: 300000 } } },
+    hook_event_name: 'PreToolUse', tool_use_id: 'tu-2', agent_id: null, ev: ['rg foo', ''],
+  }])
+  answer = true
+  expect((await pre('rg foo', 'tu-3')).fires.map((f) => f.ruleId)).toEqual(['big'])
+  // the prompt lane asks too, with the prompt's own event name
+  engine.setBook([{ id: 'cold', on: 'prompt', mode: 'advise', rx: '.', text: 'cold cache',
+    given: { session: { idle_seconds_gt: 300 } } }], { repo: REPO, fetchedAt: 0 })
+  expect((await engine.prompt('back again', SESSION, root)).fires.map((f) => f.ruleId)).toEqual(['cold'])
+  expect(asked[asked.length - 1]).toMatchObject({ op: 'session', hook_event_name: 'UserPromptSubmit', tool_use_id: null })
 })
 
 test('a call in a checkout of another repo is not judged against this book', async () => {
@@ -426,4 +488,30 @@ test('the engine reads Edit/Write/Read paths and bodies from the tool arguments,
   // `notebook_path` and `new_source`), so the Python matches no content rule
   // on it; the port does the same rather than diverge.
   expect(fired(await pre('NotebookEdit', { notebook_path: `${root}/n.ipynb`, new_source: 'print(2)', cell_id: 'c' }, 5))).toEqual([])
+})
+
+// quarantined() runs on every Bash/edit pre call: it reads and parses the
+// session file only when its (mtime, size) changed, so a session that never
+// opened a violation pays a stat per call, not a read and a JSON.parse.
+test('the quarantine check re-reads the session file only when it changed', async () => {
+  const root = '/tmp/memhub-lane-vectors/quarantine-cache'
+  const c: Case = { name: 'quarantine-cache', rules: [], steps: [], files: { 'a.py': '' } }
+  const w = world(c, { root, rules: [], git_table: [], steps: [] })
+  const path = `${BASE}/state/${sessionFileName(SESSION)}`
+  w.put(path, JSON.stringify({ quarantine: {} }), 1)
+  let reads = 0
+  const engine = createEngine({ ...w.io, readText: async (p) => (p === path && reads++, w.io.readText(p)) })
+  engine.setBook([{ id: 'g', on: 'bash', mode: 'gate', rx: 'nothing-matches-this', text: 'x' }], { repo: REPO, fetchedAt: 0 })
+  const pre = (command: string) => engine.pre({ phase: 'pre', tool: 'Bash', input: { command }, sessionId: SESSION, cwd: root })
+  await pre('ls')
+  const first = reads
+  await pre('ls -la')
+  await pre('git status')
+  expect({ extraReads: reads - first }).toEqual({ extraReads: 0 })
+  // Python opens a violation (the file changes): the next call sees it and hands over.
+  w.put(path, JSON.stringify({ quarantine: { k: { rule_id: 'r', file: `${root}/a.py`, root, new: true } } }), 2)
+  await expect(pre('git commit -m x')).rejects.toBeInstanceOf(QuarantineHandoff)
+  // …and Python closes it: the next call reads it again and is the mod's.
+  w.put(path, JSON.stringify({ quarantine: {} }), 3)
+  await expect(pre('git commit -m x')).resolves.toBeDefined()
 })

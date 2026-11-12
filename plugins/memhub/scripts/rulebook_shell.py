@@ -1,7 +1,9 @@
 """Shell lexing for the rulebook hook: quoting, heredocs, separators, and
 what a Bash command touches — the directory each segment runs in
 (`call_dir`, `bash_dirs`) and the files it writes, with their text
-(`bash_write_targets`).
+(`bash_write_targets`) — plus what is done to that text before it leaves the
+machine (`redact_secrets`) and how an anchor rule finds itself in it
+(`anchor_rx`, `anchor_hits`).
 
 Pure functions of the command text and an environment mapping: no git, no
 I/O beyond `os.path` resolution. Split out of `rulebook_hook.py` (which
@@ -654,3 +656,99 @@ def read_cd(cwd, cmd, repo_info):
         if repo_info(parent)[0]:
             return parent
     return here
+
+
+# ── credentials out of command text ────────────────────────────────────────
+#
+# A command line is where credentials live — `curl -H "Authorization: Bearer
+# …"`, `psql postgres://user:pw@host`, `--token=…`. Wherever command text is
+# about to leave the machine (the judge's call excerpt, an override reason,
+# the harness window) those values are replaced first.
+#
+# This is a denylist and cannot be complete — the docstring and the README say
+# so. It is a floor, not a guarantee.
+_REDACTIONS = (
+    # `--token=x`, `--password x`, `API_KEY=x` — the value, not the flag, so the
+    # judge still sees that a credential was passed. A quoted value
+    # (`--token='x'`, `PGPASSWORD="two words"`) goes whole, quotes and all.
+    #
+    # `auth` is deliberately NOT in this list even though it names plenty of
+    # real secrets: it also names `gh auth login`, `--auth-mode`, `auth0_sub`,
+    # and eating the word after those costs the judge the verb of the command
+    # for nothing. The `Authorization:` header has its own rule below, which is
+    # where `auth` actually carries a credential.
+    # The key must END with the credential word. Allowing a trailing suffix
+    # matched `--token-budget 500` and ate the number, which is not a secret and
+    # is exactly the kind of over-redaction that degrades the judge on ordinary
+    # commands. `aws_secret_access_key`, `--with-token` and `API_KEY` all still
+    # match, because each ends with one.
+    (re.compile(r"(?i)\b([a-z0-9_-]*(?:secret|passwd|password|token|api[_-]?key|"
+                r"access[_-]?key|credential))(\s*[=:]\s*|\s+)('[^']*'|\"[^\"]*\"|[^\s\"']+)"),
+     r"\1\2<redacted>"),
+    # `curl -u user:password`, `-U user:password`, a quoted password
+    # (`-u user:'pass word'`), and a quoted pair (`-u 'user:pass word'`).
+    (re.compile(r"(?i)(\s-{1,2}(?:u|user)[=\s]+)([^\s:\"']+):('[^']*'|\"[^\"]*\"|[^\s\"']+)"),
+     r"\1\2:<redacted>"),
+    (re.compile(r"(?i)(\s-{1,2}(?:u|user)[=\s]+)(['\"])([^:'\"]+):([^'\"]*)\2"),
+     r"\1\2\3:<redacted>\2"),
+    # Authorization / Proxy-Authorization headers, with or without a scheme.
+    (re.compile(r"(?i)(authorization\s*:\s*)(?:bearer|basic|token)?\s*[^\s\"']+"),
+     r"\1<redacted>"),
+    # Credentials inline in a URL: scheme://user:pw@host
+    (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)([^\s:/@]+):([^\s@]+)@"), r"\1\2:<redacted>@"),
+    # Vendor-shaped keys, which are recognisable on their own.
+    (re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}"), "<redacted>"),
+    (re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr|github_pat)_[A-Za-z0-9_]{16,}"), "<redacted>"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "<redacted>"),
+    (re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}"), "<redacted>"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+"), "<redacted>"),
+    (re.compile(r"\bmhk_[A-Za-z0-9_-]{8,}"), "<redacted>"),
+)
+
+
+def redact_secrets(text):
+    """Strip credential-shaped values from a command before it is sent.
+
+    Order matters: the URL rule must run before the vendor-key rules, or a
+    password that happens to look like a key is rewritten first and the
+    surrounding `user:…@host` shape no longer matches.
+    """
+    if not text:
+        return text
+    for pattern, repl in _REDACTIONS:
+        text = pattern.sub(repl, text)
+    return text
+
+
+# Anchor rules (§4.7), matched here against the cached book. An anchor fires
+# when it appears in the call's command or path as a WHOLE identifier: not
+# preceded by an identifier character other than `/` (so `SKILL.md` matches
+# `skills/x/SKILL.md` and a relative path matches the tail of an absolute one),
+# and not followed by any (so `agent-plugins` does not match
+# `agent-plugins-internal`). An anchor ending in `/` names a directory and
+# also matches any path under it. Case-sensitive, literal. Whether the rule fits the
+# call is the judge's question (`judge_fires`), not this one's.
+_ANCHOR_RX = {}
+
+
+def anchor_rx(anchor):
+    """The compiled whole-identifier pattern for one anchor, once per run;
+    None for an anchor with nothing left to match (a bare `/`)."""
+    if anchor not in _ANCHOR_RX:
+        core = anchor.rstrip("/")
+        tail = r"(?:/|(?![A-Za-z0-9_./-]))" if anchor.endswith("/") else r"(?![A-Za-z0-9_./-])"
+        _ANCHOR_RX[anchor] = re.compile(
+            r"(?<![A-Za-z0-9_.-])" + re.escape(core) + tail) if core else None
+    return _ANCHOR_RX[anchor]
+
+
+def anchor_hits(rule, text):
+    """The anchors of `rule` that appear in `text` as whole identifiers."""
+    if not text:
+        return []
+    out = []
+    for a in rule.get("anchors") or []:
+        rx = anchor_rx(a) if isinstance(a, str) else None
+        if rx is not None and rx.search(text):
+            out.append(a)
+    return out

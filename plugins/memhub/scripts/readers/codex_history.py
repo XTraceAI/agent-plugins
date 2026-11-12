@@ -8,13 +8,16 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 from datetime import datetime
+import io
 import re
 
 from . import codex, codex_usage
+from .jsonl import read_bytes
 from .strict_json import loads
 
 _UUID = r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
-_NAME = re.compile(rf'rollout-.+-({_UUID})(?:_({_UUID}))?\.jsonl$')
+# ``.jsonl.zst`` once Codex compressed the rollout; the content is the same.
+_NAME = re.compile(rf'rollout-.+-({_UUID})(?:_({_UUID}))?\.jsonl(?:\.zst)?$')
 
 
 def plan(items, headers):
@@ -82,10 +85,26 @@ def context_boundary(rows):
     return boundary
 
 
+def is_fork(rows):
+    """Whether this rollout starts with a copy of its parent's history.
+
+    Only a fork child (``fork_turns``) carries one, and it says so twice: its
+    header names ``forked_from_id`` and the copy begins with the parent's own
+    ``session_meta``. A /review thread also sets
+    ``subagent_history_start_ordinal`` — to its own record count — while
+    copying nothing, so the ordinal alone would project its whole transcript
+    out as "inherited"."""
+    if not rows:
+        return False
+    if rows[0].get('payload', {}).get('forked_from_id'):
+        return True
+    return any(row.get('type') == 'session_meta' for row in rows[1:])
+
+
 def project_context(rows, records, sources, convert):
     """Retain legacy IDs while projecting inherited context out of child work."""
     boundary = context_boundary(rows)
-    if boundary is None or boundary <= rows[0]['ordinal'] + 1:
+    if boundary is None or boundary <= rows[0]['ordinal'] + 1 or not is_fork(rows):
         return rows, records, None, []
     projected = [rows[0], *[{'type': 'inherited_context'} if row['ordinal'] < boundary else row
                            for row in rows[1:]]]
@@ -107,7 +126,9 @@ def prefix_usage(path, cutoff, ordinal, inherited):
     offset = 0
     next_ordinal = None
     owned_from = 0
-    with path.open('rb') as source:
+    # The offsets index the rollout's content, so a compressed segment is read
+    # decompressed.
+    with io.BytesIO(read_bytes(path)) as source:
         while offset < cutoff:
             raw = source.readline()
             if not raw or offset + len(raw) > cutoff or not raw.endswith(b'\n'):
@@ -176,11 +197,19 @@ def read(group, snapshot, *, title_index=None):
             meta = own_meta or meta
             converted = codex_usage.apply(rows, converted, record_sources, usage_targets,
                 session_id=session_id, namespace=namespace, seen=seen_responses)
+            try:
+                # Optional detail beside the ledger counts; never fails the read.
+                codex_usage.attach_reasoning(rows, converted)
+            except Exception:  # noqa: BLE001
+                pass
             records.extend(context)
             records.extend(converted)
             native_title = codex._rollout_thread_name(rows, strict=True) or native_title
             if first_meta is None:
                 first_meta = meta
+                # Paginated history is never flushed with a limits snapshot;
+                # the first segment's would be stale, so carry none.
+                first_meta['account_limits'] = None
         # Resolve the fallback once, after seeing every native rename. An early
         # root fallback must not hide a continuation's title or require its index.
         first_meta['title'] = (native_title or codex._title(

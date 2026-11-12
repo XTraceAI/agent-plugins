@@ -1,7 +1,7 @@
 {
   "name": "memhub",
-  "description": "Team memory for Codex. Your sessions are saved to your memory automatically, your team keeps a shared brain of specs and docs, and your team's rules warn or block the agent at the moment they apply. MCP tools let the agent search and save team memory. Older Codex builds need a one-time hook install: ask the agent to set up MemHub's Codex hooks.",
-  "version": "0.133.0",
+  "description": "Team memory for Codex. Your sessions are saved to your memory automatically, your team keeps a shared brain of specs and docs, and your team's rules warn or block the agent at the moment they apply. MCP tools let the agent search and save team memory. Codex needs a one-time hook install, because it no longer loads a plugin's own hooks: ask the agent to set up MemHub's Codex hooks.",
+  "version": "0.151.0",
   "license": "Apache-2.0",
   "author": {
     "name": "XTrace",

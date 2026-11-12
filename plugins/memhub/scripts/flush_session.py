@@ -11,11 +11,23 @@ semantic work boundaries, so flushing there makes memory available mid-session
 narratives, and gives the gist's fold-forward an outcome-flavored cadence.
 
 **Then the session's agents.** Once every slice of the session landed, each
-subagent, fork and background agent it spawned (``<session>/subagents/``) is
-sent as its own conversation linked to the session — except the MemHub
-harness fork and anything under it (``agent_transcripts``). Only to a server
-whose ``import_conversation`` takes agent arguments; an older one would file
-each agent as a session of its own.
+subagent, fork and background agent it spawned (``<session>/subagents/``), and
+each agent its dynamic workflows dispatched
+(``<session>/subagents/workflows/<runId>/``), is sent as its own conversation
+linked to the session — except the MemHub harness fork, a plugin's own fork,
+and anything under either (``agent_transcripts``). Only to a server whose
+``import_conversation`` takes agent arguments; an older one would file each
+agent as a session of its own. A fork's copies of its owner's spawning
+response are stripped first, so that response counts once. A server that
+advertises ``workflow_run_id`` also gets each agent's parent agent, workflow
+run, status and returned text.
+
+**And the session's workflow runs.** The runs' name, status, phases and agent
+roster (``agent_transcripts.workflow_runs``, redacted) ride on the LAST slice
+of the session's own import, only to a server that advertises
+``workflow_runs``; each flush replaces each run by id. The server's tools are
+listed once per flush, before the session is sent, whenever there is a run or
+an agent to send.
 
 **Also the SessionEnd hook.** It must stay a script rather than an
 ``agent``-type hook: headless ``claude -p`` runs reject agent-type Stop
@@ -57,10 +69,12 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import agent_capture  # noqa: E402
 import agent_transcripts  # noqa: E402
 import atomic_write  # noqa: E402
 import mcp_http  # noqa: E402 — stdlib-only now, so no reason to defer it
 import pr_provenance  # noqa: E402
+import server_caps  # noqa: E402
 from _memhub_auth import NonInteractiveAuthRequired, resolve_bearer, skill_command  # noqa: E402
 from session_title import (  # noqa: E402
     custom_title,
@@ -138,7 +152,7 @@ _DEFAULT_DEADLINE_S = 240.0
 #
 # A slice that cannot plausibly finish should not be started. Below this, stop
 # with the honest summary instead of making a doomed call.
-_MIN_SLICE_BUDGET_S = 10.0
+_MIN_SLICE_BUDGET_S = agent_capture.MIN_SLICE_BUDGET_S
 
 
 def _stop_before_slice(index: int, now: float, deadline: float) -> bool:
@@ -241,11 +255,26 @@ def _prepare(records: list) -> tuple[list, dict | None]:
     return redact_records(records), provenance
 
 
-async def _flush(session_id: str, transcript_path: str) -> None:
+async def _flush(session_id: str, transcript_path: str,
+                 session_ended: bool = False) -> None:
     records = _read_records(transcript_path)
     if not records:
         _log("empty transcript; nothing to flush")
         return
+    # A local-rewind comparison branch (or a fenced checkout awaiting one) is
+    # captured only by flush_turn, which carries its authenticated lineage. A
+    # whole-session send here would upload it as an ordinary session.
+    from rewind import claude_capture
+    from rewind.state import branch_path, read as rewind_read
+    first_cwd = next((r["cwd"] for r in records if isinstance(r, dict)
+                      and isinstance(r.get("cwd"), str)), None)
+    if rewind_read(branch_path(session_id)) or claude_capture.fenced(first_cwd):
+        _log("rewind comparison branch: left to the per-turn flush")
+        return
+    try:
+        records = claude_capture.annotate(records, session_id, transcript_path)
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError):
+        pass  # identities are optional; never stall the backstop on them
     records, provenance = _prepare(records)
     if not records:
         _log("transcript holds only slash-command records; nothing to flush")
@@ -336,21 +365,41 @@ async def _flush(session_id: str, transcript_path: str) -> None:
     # merely slow stops here — where it can name what it did not send
     # — instead of being cancelled where it cannot.
     deadline = time.monotonic() + _deadline_s() * 0.9
+
+    # The agents and runs are read BEFORE the session is sent, because the
+    # runs ride on the session's own last slice. The server's tools are listed
+    # once, here, and the answer is reused for the agents.
+    plan = await asyncio.to_thread(_plan_agents, session_id, transcript_path,
+                                   session_ended)
+    tools = None
+    if plan.runs or plan.todo:
+        try:
+            tools = await asyncio.to_thread(mcp_http.list_tools, url, bearer)
+        except Exception as e:  # noqa: BLE001 — the session still goes
+            _log(f"agents and workflows not sent: could not read the server's "
+                 f"tools ({e})")
+    last_slice = None
+    if plan.runs and tools is not None \
+            and server_caps.server_accepts_workflow_runs(tools):
+        last_slice = {"workflow_runs": plan.runs}
     if not await _send_conversation(session, session_id, records, provenance,
                                     {"conversation_id": session_id},
-                                    title, namespace, deadline):
+                                    title, namespace, deadline,
+                                    last_slice=last_slice):
         return
     # Agents only after the whole session landed: an agent sent first would
     # sit unlinked, and a session that failed part-way stops this run anyway.
-    await _flush_agents(session, url, bearer, session_id, transcript_path,
-                        namespace, deadline)
+    if tools is not None:
+        await _flush_agents(session, tools, session_id, plan, namespace, deadline)
 
 
 async def _send_conversation(session, session_id: str, records: list,
                              provenance: dict | None, base: dict,
-                             title, namespace, deadline: float) -> bool:
+                             title, namespace, deadline: float,
+                             last_slice: dict | None = None) -> bool:
     """Send one conversation's records in ordered slices. True when every
-    slice landed; False when it stopped (already logged and breadcrumbed)."""
+    slice landed; False when it stopped (already logged and breadcrumbed).
+    ``last_slice`` is merged into the final slice's arguments only."""
     payloads = make_slices(records)
     for index, payload in enumerate(payloads, 1):
         if _stop_before_slice(index, time.monotonic(), deadline):
@@ -368,6 +417,8 @@ async def _send_conversation(session, session_id: str, records: list,
         }
         if provenance:
             arguments["provenance"] = provenance
+        if last_slice and index == len(payloads):
+            arguments.update(last_slice)
         # Bound this call by the time LEFT, not a fixed fraction of the
         # budget. `_stop_before_slice` only checks BEFORE a slice, so a
         # slice starting just under the deadline could otherwise run a full
@@ -390,56 +441,80 @@ def _agents_state_path(session_id: str) -> Path:
 
 
 def _sent_sizes(session_id: str) -> dict:
+    return agent_capture.load_sent(_agents_state_path(session_id))
+
+
+def _sent_key(agent: dict, details: bool) -> str:
+    """What the sent cache records for an agent that landed whole: its size,
+    its status and whether the server took the details
+    (``agent_capture.sent_key``, the revision being the size)."""
+    return agent_capture.sent_key(agent_transcripts.claude_agent(agent), details)
+
+
+class _AgentPlan:
+    """This flush's agents and runs, read once, before anything is sent."""
+
+    def __init__(self, kept, sent, todo, runs):
+        self.kept = kept
+        self.sent = sent
+        self.todo = todo
+        self.runs = runs
+
+
+def _plan_agents(session_id: str, transcript_path: str,
+                 session_ended: bool) -> _AgentPlan:
+    """The agents that may need sending and the session's workflow runs.
+    Never raises: a session must not fail to send over its agents."""
     try:
-        data = json.loads(_agents_state_path(session_id).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
+        kept, skipped = agent_transcripts.agents(
+            session_id, transcript_path, session_ended=session_ended)
+        for line in skipped:
+            _log(f"agent {line}; not sent")
+        runs, skipped_runs = agent_transcripts.workflow_runs(
+            session_id, transcript_path, kept, session_ended=session_ended)
+        for line in skipped_runs:
+            _log(f"workflow {line}; not sent")
+        for run in runs:
+            _log(f"workflow {run['run_id']}: {len(run['agents'])} agents, {run['status']}")
+    except Exception as e:  # noqa: BLE001
+        _log(f"agents not read ({type(e).__name__}: {e})")
+        return _AgentPlan([], {}, [], [])
+    planned = agent_capture.plan(_agents_state_path(session_id),
+                                 [agent_transcripts.claude_agent(a) for a in kept])
+    return _AgentPlan(kept, planned.sent, planned.todo, runs)
 
 
-async def _flush_agents(session, url: str, bearer: str, session_id: str,
-                        transcript_path: str, namespace, deadline: float) -> None:
+async def _flush_agents(session, tools: list, session_id: str, plan: _AgentPlan,
+                        namespace, deadline: float) -> agent_capture.SendReport:
     """Send each agent the session spawned as its own conversation, linked to
-    the session (MemHub-Backend agent-sessions spec §4.1). Never the MemHub
-    harness fork — see agent_transcripts.
+    the session (MemHub-Backend agent-sessions spec §4.1, §10.2). Never the
+    MemHub harness fork — see agent_transcripts.
 
-    An agent whose transcript has not grown since it last landed whole is not
-    re-sent. Its size is recorded only after every slice of it landed, so a
-    failed or cut-short agent is sent again by the next flush."""
-    kept, skipped = agent_transcripts.agents(session_id, transcript_path)
-    for line in skipped:
-        _log(f"agent {line}; not sent")
-    sent = _sent_sizes(session_id)
-    todo = [a for a in kept if sent.get(a["agent_id"]) != a["size"]]
-    if not todo:
-        return
-    try:
-        tools = await asyncio.to_thread(mcp_http.list_tools, url, bearer)
-    except Exception as e:  # noqa: BLE001 — the session already landed
-        _log(f"agents not sent: could not read the server's tools ({e})")
-        return
-    if not agent_transcripts.server_accepts_agents(tools):
-        _log(f"agents not sent: this server predates agent capture "
-             f"({len(todo)} waiting)")
-        return
-    for agent in todo:
-        if deadline - time.monotonic() < _MIN_SLICE_BUDGET_S:
-            _log(f"deadline reached; {len(todo) - todo.index(agent)} agent(s) "
-                 "not sent — the next flush sends them")
-            return
-        records = _read_records(agent["path"])
+    The Claude Code sender for ``agent_capture.send_agents``, which owns the
+    rules: an agent whose transcript, status and server support have not
+    changed since it last landed whole is not re-sent, and its key is recorded
+    only after every slice of it landed, so a failed or cut-short agent is
+    sent again by the next flush."""
+
+    async def send_one(agent: agent_capture.Agent, arguments: dict) -> bool:
+        source = agent.source
+        records = _read_records(source["path"])
         records, provenance = _prepare(records) if records else ([], None)
-        if records and not await _send_conversation(
-                session, session_id, records, provenance,
-                agent_transcripts.import_arguments(session_id, agent),
-                None, namespace, deadline):
-            return
-        _log(f"agent {agent['agent_id']} sent, linked to session {session_id[:8]}")
-        sent[agent["agent_id"]] = agent["size"]
-        try:
-            atomic_write.publish(_agents_state_path(session_id), json.dumps(sent))
-        except Exception:  # noqa: BLE001 — worst case the agent is re-sent
-            pass
+        # A fork's copies of its owner's spawning response go before anything
+        # else does, so that response is counted once (§10.2). Applied for
+        # every server that takes agents, details or not.
+        records = agent_transcripts.drop_fork_copies(
+            records, source.get("strip_keys") or frozenset(),
+            source.get("strip_tool_use_ids") or frozenset())
+        if not records:
+            return True
+        return await _send_conversation(session, session_id, records, provenance,
+                                        arguments, None, namespace, deadline)
+
+    return await agent_capture.send_agents(
+        server_caps.from_tools(tools), parent_conv_id=session_id,
+        agents=plan.todo, cache_path=_agents_state_path(session_id),
+        deadline=deadline, send_one=send_one, log=_log, sent=plan.sent)
 
 
 def _crumb_key(arguments: dict):
@@ -627,7 +702,9 @@ def main() -> int:
         # breadcrumb below is always written.
         started = time.monotonic()
         asyncio.run(asyncio.wait_for(
-            _flush(session_id, transcript_path), timeout=timeout_s))
+            _flush(session_id, transcript_path,
+                   agent_transcripts.session_ended(hook_input)),
+            timeout=timeout_s))
     # BaseException, not Exception: a CancelledError (a BaseException since
     # 3.8) or a KeyboardInterrupt would skip an Exception handler and kill the
     # hook with a traceback.

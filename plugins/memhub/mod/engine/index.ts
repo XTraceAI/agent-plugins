@@ -83,10 +83,15 @@ export type PathsInfo = { repo: string; root: string | null; base: string }
  * which takes their lock): an ordering feed that writes, an arming, a discharge.
  */
 export type StateOp =
-  | { op: 'feed'; root: string; rule: HookRule; hook_phase: string; tool: string; cmd: string; file_path: string; ok: boolean | null; armed: string | null }
+  | { op: 'feed'; root: string; rule: HookRule; hook_phase: string; tool: string; cmd: string; file_path: string; ok: boolean | null; armed: string | null; ran?: boolean | null }
   | { op: 'arm'; session: string; event: string; prompt: string; rules: HookRule[]; repo: string; gitdir: string }
   | { op: 'drop'; session: string; rule_ids: string[] }
+  | { op: 'quarantine'; session: string; open: { rule_id: string; file: string; root: string; new: boolean }[] }
   | { op: 'specs'; root: string; spec_dir: string; paths: string[] }
+  | {
+      op: 'session'; session: string; rule: { id: unknown; given: { session: unknown } }
+      hook_event_name: string; tool_use_id: string | null; agent_id: string | null; ev: [string, string] | null
+    }
 
 /** The engine's only way out of pure code. */
 export interface EngineIO {

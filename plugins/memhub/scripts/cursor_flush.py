@@ -25,10 +25,25 @@ forward (the same property Codex re-imports rely on). The local blob-id set
 only decides WHETHER to flush, so a lost state file costs a redundant send,
 never a lost or duplicated conversation.
 
-Cursor IDE 3.17 emits ``afterAgentResponse`` and ``stop`` with exact usage;
-Cursor Agent CLI 2026.08 emits only ``sessionStart`` / ``sessionEnd`` hooks and
-keeps usage solely in caller-owned stream output. ``sessionEnd`` therefore
-captures CLI content with nullable usage rather than estimating it.
+Cursor IDE 3.17 emits ``afterAgentResponse`` and ``stop`` with exact usage,
+whose input_tokens includes cache reads — it is stored net of them
+(``_hook_usage``) — and ``beforeSubmitPrompt`` as each prompt is sent; it has not been seen to
+fire ``sessionEnd`` when a chat closes, so ``stop`` is its last flush.
+Cursor Agent CLI (measured on 2026.10.16) fires no ``beforeSubmitPrompt``,
+``afterAgentResponse`` or ``stop`` at all: a CLI turn fires ``sessionStart``
+(first invocation only — never on ``--resume`` — with a null
+``transcript_path``), ``afterAgentThought``, the tool / shell / read hooks,
+and ``sessionEnd`` at the end of EVERY invocation. Its usage lives solely in
+caller-owned stream output, so ``sessionEnd`` captures CLI content with
+nullable usage rather than estimating it.
+
+The transcript's own clocks are coarse: a user turn's ``<timestamp>`` tag is
+minute precision, and nothing else in it is dated. So three hooks contribute
+their OWN wall clock (no Cursor payload carries a timestamp): ``sessionStart``
+saves ``session_start_at`` without reading the transcript or flushing, and it
+dates the session's banner and first prompt when the tag is all they have;
+``beforeSubmitPrompt`` queues an exact clock for the prompt it announces; and
+``sessionEnd`` dates the final assistant record of the invocation's turn.
 ``beforeShellExecution`` flushes only on milestone commands (git commit /
 gh pr …) so ordinary shell traffic stays quiet. ``afterShellExecution``
 captures the exact URL returned by a direct ``gh pr create`` because current
@@ -56,10 +71,13 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import agent_capture  # noqa: E402
 import atomic_write  # noqa: E402
+import cursor_agents  # noqa: E402
 import portable_lock  # noqa: E402
 import mcp_http  # noqa: E402
 import pr_provenance  # noqa: E402
+import server_caps  # noqa: E402
 from _memhub_auth import resolve_bearer, skill_command  # noqa: E402
 from readers import cursor as cursor_reader  # noqa: E402
 from readers.strict_json import loads as load_json  # noqa: E402
@@ -184,7 +202,18 @@ _FLUSH_MODE = {
     # episode batching is the lesser evil than losing records. Revert to
     # "auto" when the server folds dedup registration into the drain.
     "afterFileEdit": "now",
+    # IDE only: a sub-agent ended. Its parent's transcript flushes on the
+    # afterFileEdit debounce; the agent lane runs either way.
+    "subagentStop": "now",
 }
+
+# Events after which the agent lane looks for the session's sub-agents
+# (cursor_agents): the parent's turn or session ended, a sub-agent ended, or
+# a later prompt arrived (a background agent can finish between turns). The
+# lane runs after the parent's confirmed save, or on its own when the parent
+# had nothing new but was saved before. afterAgentResponse runs it only with
+# a parent send; its stop follows at once.
+_AGENT_EVENTS = ("stop", "sessionEnd", "subagentStop", "beforeSubmitPrompt")
 
 
 def _log(msg: str) -> None:
@@ -240,7 +269,8 @@ def _read_state(uuid: str, *, strict: bool = False, text: str | None = None) -> 
                 target_uuid = event.get("target_uuid") if isinstance(event, dict) else None
                 if (not isinstance(generation, str) or not _UUID_RE.fullmatch(generation)
                         or not isinstance(target_uuid, str) or not _UUID_RE.fullmatch(target_uuid)
-                        or cursor_reader.normalize_usage(event.get("usage")) is None):
+                        or cursor_reader.normalize_usage(event.get("usage")) is None
+                        or event.get("basis", _USAGE_BASIS_NET) != _USAGE_BASIS_NET):
                     raise ValueError("invalid saved Cursor usage")
         return state
     except FileNotFoundError:
@@ -251,8 +281,16 @@ def _read_state(uuid: str, *, strict: bool = False, text: str | None = None) -> 
         return {}
 
 
+def _update_state(uuid: str, update) -> None:
+    """Apply ``update(state)`` (mutating it) under the same per-uuid lock as
+    ``_save_state``: a field that is itself merged — the subagentStop roster,
+    written by parallel children ending together — must be read inside it."""
+    _save_state(uuid, _update=update)
+
+
 def _save_state(uuid: str, **fields) -> None:
     """Merge ``fields`` into this session's state under a per-uuid lock.
+    ``_update_state`` is the same with a callback for a read-modify-write.
 
     atomic_write makes each PUBLISH atomic, but the read-modify-write around
     it is not: the Cursor launcher runs every flush DETACHED, so an
@@ -262,6 +300,7 @@ def _save_state(uuid: str, **fields) -> None:
     lock is a separate .lock file, never the state file itself: locking a
     file that is about to be replaced releases the lock with the old inode.
     """
+    update = fields.pop("_update", None)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     lock_path = _state_path(uuid).with_suffix(".lock")
     try:
@@ -272,6 +311,8 @@ def _save_state(uuid: str, **fields) -> None:
         if fh is not None:
             portable_lock.lock_exclusive(portable_lock.fileno_of(fh))
         state = _read_state(uuid)
+        if update is not None:
+            update(state)
         state.update(fields)
         atomic_write.publish(_state_path(uuid), json.dumps(state))
     finally:
@@ -467,6 +508,24 @@ _HOOK_USAGE_KEYS = {
 }
 
 
+# What a persisted usage_events entry's counters mean. "net" is the
+# Anthropic/backend convention: input_tokens EXCLUDES cache reads. An entry
+# with no "basis" was saved by an older plugin straight from the IDE hook, so
+# it is gross and is converted when applied. A source that is already net
+# (cursor-agent's stream-json result, should it ever be forwarded) is stored
+# as "net" unchanged and is never subtracted.
+_USAGE_BASIS_NET = "net"
+
+
+def _net_of_cache(usage: dict[str, int]) -> dict[str, int]:
+    # Cursor IDE afterAgentResponse/stop report input_tokens GROSS: it
+    # includes cache_read_tokens (a 145,087-token turn read 143,616 from
+    # cache). Whether it also includes cache WRITES is unverified (every
+    # recorded IDE turn wrote 0), so cache_creation_input_tokens is left as is.
+    return dict(usage, input_tokens=max(
+        0, usage["input_tokens"] - usage["cache_read_input_tokens"]))
+
+
 def _hook_usage(event: str, payload: dict
                 ) -> tuple[str, dict[str, int]] | None:
     if event not in ("afterAgentResponse", "stop"):
@@ -478,7 +537,9 @@ def _hook_usage(event: str, payload: dict
     if (not isinstance(generation, str) or
             not _UUID_RE.fullmatch(generation) or usage is None):
         return None
-    return generation, usage
+    # The one place hook usage turns net; the shared normalize_usage and
+    # _apply_usage must not subtract again.
+    return generation, _net_of_cache(usage)
 
 
 def _assistant_text(record: dict) -> str:
@@ -546,7 +607,8 @@ def _usage_events_with(state: dict, generation: str, target_uuid: str,
     events = {key: value for key, value in events.items()
               if not (isinstance(value, dict) and
                       value.get("target_uuid") == target_uuid)}
-    events[generation] = {"target_uuid": target_uuid, "usage": usage}
+    events[generation] = {"target_uuid": target_uuid, "usage": usage,
+                          "basis": _USAGE_BASIS_NET}
     # Native files cannot reconstruct these exact samples. Keep one sample
     # per measured record for later local reads, even after cloud acknowledgement.
     # Like timestamp pins, this map scales with the observed session.
@@ -563,6 +625,13 @@ def _apply_usage(records: list[dict], usage_events) -> set[str]:
             continue
         record = by_uuid.get(event.get("target_uuid"))
         normalized = cursor_reader.normalize_usage(event.get("usage"))
+        if normalized is not None and "basis" not in event:
+            # Saved gross by a plugin before the basis marker. The entry on
+            # disk is never rewritten here, so each read converts it once; a
+            # re-sent generation replaces it with a marked net entry.
+            normalized = _net_of_cache(normalized)
+        elif event.get("basis") != _USAGE_BASIS_NET:
+            normalized = None  # a basis this build does not know: unmeasured
         message = record.get("message") if isinstance(record, dict) else None
         if (not isinstance(record, dict) or record.get("type") != "assistant" or
                 not isinstance(message, dict) or normalized is None):
@@ -595,9 +664,117 @@ def _now_iso() -> str:
             + f".{int(now * 1000) % 1000:03d}Z")
 
 
+def _parse_iso(value):
+    import datetime
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _is_prompt(record: dict) -> bool:
+    """A canonical prompt (or the banner): string content, unlike tool results."""
+    message = record.get("message")
+    return (record.get("type") == "user" and isinstance(message, dict)
+            and isinstance(message.get("content"), str))
+
+
+def _prompt_digest(text) -> str | None:
+    """Whitespace-insensitive identity of a prompt, so a hook clock can be
+    matched to its record without keeping the prompt's text in state."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    return hashlib.sha256(" ".join(text.split()).encode("utf-8")).hexdigest()[:32]
+
+
+# Hook clocks queued by beforeSubmitPrompt and not yet matched to a record.
+# A prompt normally lands at the very next observation; the cap only bounds
+# entries whose prompt Cursor never wrote (a blocked or aborted submit).
+_MAX_PROMPT_CLOCKS = 8
+# How far past the start of its tag's minute a session-start clock may fall
+# and still be the same moment: a minute tag covers 60 s, plus hook skew.
+_SESSION_START_SLACK_S = 65.0
+_BANNER_PREFIX = "[Imported from Cursor"
+
+
+def _exact_clocks(records: list[dict], state: dict, event: str,
+                  hook_at: str | None) -> tuple[dict, list]:
+    """Hook wall clocks that beat what the transcript carries, by record uuid.
+
+    Only records not yet dated are eligible (no pin, or an unmeasured one) —
+    a pin is never re-dated. Returns the clocks and the queued prompt clocks
+    they consumed:
+
+    * ``beforeSubmitPrompt`` clocks go to the newest undated prompt with the
+      same text, when its tag is minute-truncated (or absent) and not later
+      than the clock. A minute tag says 02:40:00 for a prompt sent 02:40:31.
+    * ``session_start_at`` dates the banner and the first prompt, only where
+      the tag is absent or the start falls inside the tag's minute — an IDE
+      chat opened long before its first prompt keeps the tag.
+    * ``sessionEnd`` dates the invocation turn's final assistant record, the
+      way exact usage marks its boundary record.
+    """
+    pins = state.get("record_ts")
+    pins = pins if isinstance(pins, dict) else {}
+
+    def undated(rid) -> bool:
+        return isinstance(rid, str) and bool(rid) and not pins.get(rid)
+
+    def tag_of(record):
+        tag = _parse_iso(record.get("timestamp"))
+        if tag is None:
+            return None, True
+        return tag, tag.second == 0 and tag.microsecond == 0
+
+    clocks: dict = {}
+    consumed: list = []
+    prompts = [record for record in records if _is_prompt(record)]
+    banner = prompts[0] if prompts and str(
+        prompts[0]["message"]["content"]).startswith(_BANNER_PREFIX) else None
+    asks = [record for record in prompts if record is not banner]
+
+    queued = state.get("prompt_clocks")
+    for entry in reversed(queued if isinstance(queued, list) else []):
+        at = _parse_iso(entry.get("at")) if isinstance(entry, dict) else None
+        if at is None:
+            continue
+        for record in reversed(asks):
+            rid = record.get("uuid")
+            if (not undated(rid) or rid in clocks or
+                    _prompt_digest(record["message"]["content"]) != entry.get("digest")):
+                continue
+            tag, coarse = tag_of(record)
+            if coarse and (tag is None or at >= tag):
+                clocks[rid] = entry["at"]
+                consumed.append(entry)
+            break
+
+    start_raw = state.get("session_start_at")
+    start = _parse_iso(start_raw)
+    if start is not None:
+        for record in (banner, asks[0] if asks else None):
+            rid = record.get("uuid") if record else None
+            if not undated(rid) or rid in clocks:
+                continue
+            tag, coarse = tag_of(record)
+            if tag is None or (coarse and 0 <= (start - tag).total_seconds()
+                               < _SESSION_START_SLACK_S):
+                clocks[rid] = start_raw
+
+    if event == "sessionEnd" and _parse_iso(hook_at) is not None:
+        target = _last_assistant_uuid(records)
+        if undated(target):
+            clocks[target] = hook_at
+    return clocks, consumed
+
+
 def _stamp_records(records: list[dict], prior, now_iso: str | None, *,
                    first_observation: bool,
-                   boundary_uuids: frozenset | set = frozenset()) -> dict:
+                   boundary_uuids: frozenset | set = frozenset(),
+                   clocks: dict | None = None) -> dict:
     """Date every record with a REAL clock, pinned across re-sends.
 
     The server persists ``timestamp`` as the row's ``event_date`` — "the
@@ -642,6 +819,13 @@ def _stamp_records(records: list[dict], prior, now_iso: str | None, *,
     different dates on the live path (pin) and the backstop re-read (reader
     clock) — exactly the flapping pinning exists to prevent.
 
+    ``clocks`` (from ``_exact_clocks``) are hook wall clocks for specific
+    records; each beats the record's own minute-precision tag and dates an
+    unmeasured pin, like a boundary record. A prompt newly dated here is
+    never dated before the record ahead of it: a minute tag that reads
+    earlier than the previous turn's pin is raised to that pin, the tightest
+    honest bound left, so turns never reorder.
+
     With ``now_iso=None`` this only APPLIES existing pins (read-only replay
     for out-of-band senders); no new stamps are minted. Mutates ``records``
     in place; returns the updated pin map for persisting.
@@ -656,7 +840,9 @@ def _stamp_records(records: list[dict], prior, now_iso: str | None, *,
     the map deliberately scales with the live artifact (see the constant).
     """
     stamps: dict = dict(prior) if isinstance(prior, dict) else {}
+    clocks = clocks if isinstance(clocks, dict) and now_iso else {}
     present: set = set()
+    latest = None
     for record in records:
         rid = record.get("uuid")
         if not isinstance(rid, str) or not rid:
@@ -664,22 +850,33 @@ def _stamp_records(records: list[dict], prior, now_iso: str | None, *,
         present.add(rid)
         reader_ts = record.get("timestamp")
         reader_ts = reader_ts if isinstance(reader_ts, str) and reader_ts else None
+        clock = clocks.get(rid)
+        minted = False
         if rid in stamps:
             pinned = stamps[rid]
             if not isinstance(pinned, str) or not pinned:
                 pinned = None
-            if pinned is None and reader_ts:
-                stamps[rid] = pinned = reader_ts
+            if pinned is None and (clock or reader_ts):
+                pinned, minted = clock or reader_ts, True
             elif pinned is None and now_iso and rid in boundary_uuids:
-                stamps[rid] = pinned = now_iso
+                pinned = now_iso
         else:
-            if reader_ts:
-                pinned = reader_ts
+            minted = True
+            if clock or reader_ts:
+                pinned = clock or reader_ts
             elif now_iso and (not first_observation or rid in boundary_uuids):
                 pinned = now_iso
             else:
                 pinned = None
+        if minted and now_iso and pinned and latest and _is_prompt(record):
+            moment = _parse_iso(pinned)
+            if moment is not None and moment < latest[0]:
+                pinned = latest[1]
+        if rid not in stamps or pinned != stamps[rid]:
             stamps[rid] = pinned
+        moment = _parse_iso(pinned)
+        if moment is not None and (latest is None or moment > latest[0]):
+            latest = (moment, pinned)
         if pinned:
             record["timestamp"] = pinned
         else:
@@ -719,9 +916,7 @@ def apply_session_state(records: list[dict], uuid: str, *, strict: bool = False,
 
 
 def _records_revision(records: list[dict]) -> str:
-    encoded = json.dumps(records, ensure_ascii=True, separators=(",", ":"),
-                         sort_keys=True).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return cursor_agents.records_revision(records)
 
 
 def current_blob_ids(store_db: Path) -> set[str]:
@@ -786,7 +981,7 @@ def should_flush(event: str, payload: dict, state: dict,
         return bool(_MILESTONE_RE.search(cmd[:_MILESTONE_SCAN_LIMIT]))
     if event == "afterShellExecution":
         return provenance_pending
-    if event == "afterFileEdit":
+    if event in ("afterFileEdit", "subagentStop"):
         return now - (state.get("last_flush_at") or 0) > DEBOUNCE_S
     if event in ("afterAgentResponse", "stop", "beforeSubmitPrompt",
                  "sessionEnd"):
@@ -809,7 +1004,9 @@ def _event_can_flush(event: str, payload: dict) -> bool:
     (records arriving between its sighting and the first flush would be
     mis-classed as unknowable backlog — review finding); the only reader
     that declines to flush is a debounced ``afterFileEdit``, and a debounce
-    implies a recent flush, hence an existing pin map.
+    implies a recent flush, hence an existing pin map. ``sessionStart`` is
+    refused here too: ``main`` saves its clock first, without reading the
+    transcript or touching ``record_ts`` (``_note_hook_clock``).
     """
     if event == "beforeShellExecution":
         cmd = payload.get("command")
@@ -819,7 +1016,7 @@ def _event_can_flush(event: str, payload: dict) -> bool:
     if event == "afterShellExecution":
         return bool(pr_provenance.scan_shell_event(event, payload)[0])
     return event in ("afterFileEdit", "afterAgentResponse", "stop",
-                     "beforeSubmitPrompt", "sessionEnd")
+                     "beforeSubmitPrompt", "sessionEnd", "subagentStop")
 
 
 # Reading a remote URL means reading the TARGET repo's own config — that is
@@ -911,7 +1108,12 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
                  flush_mode: str = "now", *, source_kind: str = "store",
                  source_revision: str | None = None,
                  records: list[dict], meta: dict,
-                 applied_usage: set[str] | None = None) -> None:
+                 applied_usage: set[str] | None = None,
+                 agent_event: str | None = None,
+                 deadline: float | None = None) -> bool | None:
+    """Send the session; True once the server confirmed it. With
+    ``agent_event`` one of the agent events, the session's sub-agents follow
+    the confirmed save (``_send_agents``)."""
     # ``records``/``meta`` are REQUIRED: reading, stamping, and persisting
     # pins is main()'s job, in that order, under the session lock. A
     # self-read fallback here shipped records that bypassed that flow —
@@ -1132,6 +1334,192 @@ async def _flush(uuid: str, source_path: Path, blob_ids: set[str],
         fields["sent_usage_generations"] = sorted(applied_usage)
     _save_state(uuid, **fields)
     _log(f"flushed {len(sendable)} records → cursor-{uuid} (personal)")
+    if agent_event not in _AGENT_EVENTS + ("afterAgentResponse",):
+        return True
+    deadline = deadline or time.monotonic() + FLUSH_TIMEOUT_S / 2
+    if deadline - time.monotonic() < agent_capture.MIN_SLICE_BUDGET_S:
+        # The parent used the budget: starting the agents now would race the
+        # caller's own timeout, whose cancel counts against the PARENT.
+        _log(f"{agent_event}: no time left for agents — the next agent event sends them")
+        return True
+    try:
+        # Bounded inside the caller's own timeout, and caught: the parent
+        # is confirmed, and nothing an agent does may count against it.
+        await asyncio.wait_for(
+            _send_agents(uuid, agent_event, session=session, url=url,
+                         bearer=bearer, namespace=namespace, deadline=deadline),
+            timeout=deadline - time.monotonic())
+    except Exception as e:  # noqa: BLE001
+        _log(f"{agent_event}: agent flush error: {e!r}")
+    return True
+
+
+# ── sub-agents ───────────────────────────────────────────────────────────────
+# Each agent a Cursor session spawned is sent as its own conversation,
+# ``cursor-<root>/agent-<child>``, linked to ``cursor-<root>``
+# (MemHub-Backend agent-sessions spec §4.1, §10.2). Finding them is
+# cursor_agents'; sending them is agent_capture's, which owns the sent cache,
+# the deadline and the rule that agents go only after the parent's confirmed
+# save. A child is never sent as a session of its own (``_child_of``).
+
+def _agents_path(uuid: str) -> Path:
+    return STATE_DIR / f"{_safe_uuid(uuid)}.agents"
+
+
+def _discover_agents(uuid: str, event: str, state: dict) -> list:
+    """Every sub-agent of ``uuid`` on either surface. A CLI root is a store
+    with meta.json and finds its children among its sibling stores; an IDE
+    root is a transcript whose directory holds ``subagents/``."""
+    root_ended = event == "sessionEnd"
+    agents: list = []
+    try:
+        agents += cursor_agents.cli_agents(
+            uuid, root_source=state.get("source_kind"), root_ended=root_ended, log=_log)
+    except Exception as e:  # noqa: BLE001 — agents never cost the parent
+        _log(f"agents: CLI discovery failed ({e!r})")
+    transcript, _err = _valid_transcript_path(state.get("transcript_path"), uuid)
+    if transcript is not None:
+        roster = state.get("subagents")
+        meta = state.get("cursor_meta") if isinstance(state.get("cursor_meta"), dict) else {}
+        try:
+            agents += cursor_agents.ide_agents(
+                uuid, transcript, roster if isinstance(roster, dict) else {},
+                cwd=meta.get("cwd"), root_ended=root_ended, log=_log)
+        except Exception as e:  # noqa: BLE001
+            _log(f"agents: IDE discovery failed ({e!r})")
+    seen: set = set()
+    return [a for a in agents if not (a.agent_id in seen or seen.add(a.agent_id))]
+
+
+async def _send_agents(uuid: str, event: str, *, session, url: str, bearer: str,
+                       namespace: str | None, deadline: float):
+    """Send the sub-agents of ``uuid`` not yet sent as they are now. Agent
+    failures are logged and retried by the next agent event; they never touch
+    the session's own ``fail_streak`` or dormancy."""
+    state = _read_state(uuid)
+    agents = await asyncio.to_thread(_discover_agents, uuid, event, state)
+    if not agents:
+        return None
+    cache = _agents_path(uuid)
+    planned = agent_capture.plan(cache, agents)
+    if not planned.todo:
+        return None
+    caps = await asyncio.to_thread(
+        server_caps.get, STATE_DIR, url, lambda: mcp_http.list_tools(url, bearer))
+    if caps is None:
+        _log(f"agents not sent: the server's tools could not be listed "
+             f"({len(planned.todo)} waiting)")
+        return None
+
+    async def send_one(agent, arguments: dict) -> bool:
+        sendable = redact_records(elide_oversized_tool_results(agent.load()))
+        if not sendable:
+            return True
+        call = {**arguments, "messages": sendable,
+                "source_platform": cursor_reader.HOST, "flush": "now"}
+        if namespace:
+            call["namespace"] = namespace
+        try:
+            res = await session.call_tool(
+                "import_conversation", arguments=call,
+                timeout=max(5.0, deadline - time.monotonic()))
+        except mcp_http.McpError as e:
+            _log(f"agent {agent.agent_id[:8]}: import failed: {e}")
+            return False
+        if _verdict(res, arguments["conversation_id"]) == "ok":
+            return True
+        if getattr(res, "isError", False) and server_caps.names_agent_argument(
+                " ".join(mcp_http.texts_of(res))):
+            server_caps.invalidate(STATE_DIR, url)
+        return False
+
+    report = await agent_capture.send_agents(
+        caps, parent_conv_id=f"cursor-{uuid}", agents=planned.todo,
+        cache_path=cache, deadline=deadline, send_one=send_one, log=_log,
+        sent=planned.sent)
+    if report.failed:
+        _log(f"agent {report.failed[0][:8]} not confirmed; {report.deferred} "
+             "agent(s) left for the next agent event")
+    return report
+
+
+async def _agents_only(uuid: str, event: str, state: dict, deadline: float) -> None:
+    """The agent lane without a parent send: the parent had nothing new, but
+    an earlier flush of it was confirmed, so its agents can link to it."""
+    try:
+        url, bearer = await asyncio.to_thread(resolve_bearer)
+    except Exception:  # noqa: BLE001 — local auth gap: nothing to send with
+        return
+    if not bearer:
+        return
+    session = mcp_http.Session(url, bearer, timeout=FLUSH_TIMEOUT_S / 2)
+    meta = state.get("cursor_meta") if isinstance(state.get("cursor_meta"), dict) else {}
+    cwd = meta.get("cwd")
+    if not cwd and state.get("source_kind") == "store":
+        located, _err = cursor_reader.locate(uuid)
+        cwd = cursor_reader.session_cwd(located) if located is not None else None
+    namespace = await asyncio.to_thread(_namespace_of, cwd) if _cwd_ok(cwd) else None
+    await _send_agents(uuid, event, session=session, url=url, bearer=bearer,
+                       namespace=namespace, deadline=deadline)
+
+
+def _run_agents_only(uuid: str, event: str) -> None:
+    """``_agents_only`` for a session whose parent was confirmed before and is
+    not dormant; the caller holds its flush lock."""
+    state = _read_state(uuid)
+    if not state.get("last_ok_at") or state.get("unsupported"):
+        return
+    _save_state(uuid, agents_lane_at=time.time())
+    deadline = time.monotonic() + FLUSH_TIMEOUT_S - 5
+    try:
+        asyncio.run(asyncio.wait_for(_agents_only(uuid, event, state, deadline),
+                                     timeout=FLUSH_TIMEOUT_S))
+    except Exception as e:  # noqa: BLE001 — never the parent's failure
+        _log(f"{event}: agent flush error: {e!r}")
+
+
+def _child_lane_due(root: str, event: str) -> bool:
+    """Whether a CHILD's hook should run its root's agent lane. A child's
+    own turn/stop events always do; its tool hooks (a cursor-agent child
+    fires afterFileEdit under its own id on every edit) at most once per
+    ``DEBOUNCE_S``, so an edit-heavy child is not re-read and re-sent whole
+    on every edit."""
+    if event in _AGENT_EVENTS:
+        return True
+    last = _read_state(root).get("agents_lane_at")
+    return not isinstance(last, (int, float)) or time.time() - last > DEBOUNCE_S
+
+
+def _child_of(uuid: str, payload: dict) -> tuple[bool, str | None]:
+    """(is ``uuid`` a sub-agent, its root or None). Decided BEFORE any source
+    is chosen, so a child is never flushed as ``cursor-<child>`` whichever of
+    its store or transcript happens to be readable: an IDE child's hooks carry
+    ``parent_tool_call_id``; a CLI child is a store with no meta.json."""
+    is_child, root = cursor_agents.ide_child_root(uuid, payload)
+    if is_child:
+        return True, root
+    return cursor_agents.cli_child_root(uuid)
+
+
+def _repo_enabled(payload: dict, uuid: str) -> bool:
+    """The repository allowlist (``repo_allow``, ``/memhub:repos``) for this
+    session's workspace — the same rule the Claude Code hooks apply. A
+    restricted machine captures a Cursor session only when its workspace is
+    a listed checkout; one with no workspace in view is not captured. Any
+    failure here captures, as the Claude Code hooks do."""
+    try:
+        import repo_allow  # noqa: PLC0415 — beside this file
+        if not repo_allow.restricted():
+            return True
+        roots = payload.get("workspace_roots")
+        cwd = next((r for r in roots if isinstance(r, str) and r), None) \
+            if isinstance(roots, list) else None
+        if not cwd:
+            meta = _read_state(uuid).get("cursor_meta")
+            cwd = meta.get("cwd") if isinstance(meta, dict) else None
+        return bool(cwd) and repo_allow.session_enabled(cwd)
+    except Exception:  # noqa: BLE001
+        return True
 
 
 _OBSERVATION_FIELDS = (
@@ -1140,7 +1528,8 @@ _OBSERVATION_FIELDS = (
 )
 
 
-def _observe_session(uuid, event, payload, event_pr_urls, *, observe_usage=True):
+def _observe_session(uuid, event, payload, event_pr_urls, *, observe_usage=True,
+                     hook_at: str | None = None):
     """Save native observations before waiting for an upload.
 
     Only observation readers/writers hold this lock. It is released before
@@ -1252,11 +1641,26 @@ def _observe_session(uuid, event, payload, event_pr_urls, *, observe_usage=True)
             _save_state(uuid, **fields)
             return None
 
+        clocks, consumed = _exact_clocks(records, state, event, hook_at)
+        # An invocation's records all exist once its sessionEnd fires, and
+        # sessionEnd observes before the upload lock, so they are dated by
+        # that clock too — not by a later clock that would put them after the
+        # final record it dates.
         fields["record_ts"] = _stamp_records(
-            records, state.get("record_ts"), _now_iso(),
+            records, state.get("record_ts"),
+            hook_at if event == "sessionEnd" and hook_at else _now_iso(),
             first_observation="record_ts" not in state,
-            boundary_uuids=boundary_uuids)
-        _save_state(uuid, **fields)
+            boundary_uuids=boundary_uuids, clocks=clocks)
+
+        def persist(saved: dict) -> None:
+            # A queued prompt clock is spent with the pin it became, in one
+            # write, so a concurrent beforeSubmitPrompt's entry is never lost.
+            saved.update(fields)
+            if consumed:
+                saved["prompt_clocks"] = [
+                    entry for entry in saved.get("prompt_clocks") or []
+                    if entry not in consumed]
+        _update_state(uuid, persist)
         observed = {**state, **fields}
         return {
             "source_kind": source_kind, "source_path": source_path,
@@ -1268,8 +1672,29 @@ def _observe_session(uuid, event, payload, event_pr_urls, *, observe_usage=True)
         os.close(fd)
 
 
+def _note_hook_clock(uuid: str, event: str, payload: dict, at: str) -> None:
+    """Save a hook's own clock for the records it announces, before anything
+    can wait or fail. Writes no ``record_ts``: whether the session was ever
+    observed stays derived from the pin map alone (see _event_can_flush)."""
+    if event == "sessionStart":
+        # Keep the first: only the session's real start dates its banner.
+        _update_state(uuid, lambda state: state.setdefault("session_start_at", at))
+    elif event == "beforeSubmitPrompt":
+        entry = {"at": at, "digest": _prompt_digest(payload.get("prompt"))}
+
+        def queue(state: dict) -> None:
+            queued = state.get("prompt_clocks")
+            queued = queued if isinstance(queued, list) else []
+            state["prompt_clocks"] = (queued + [entry])[-_MAX_PROMPT_CLOCKS:]
+        _update_state(uuid, queue)
+
+
 def main() -> int:
     event = sys.argv[1] if len(sys.argv) > 1 else "unknown"
+    # This hook's own clock, read before any lock wait: no Cursor payload
+    # carries a timestamp, and a boundary that waits on a busy upload must
+    # still date its records at the moment it fired.
+    hook_at = _now_iso()
     try:
         payload = json.loads(sys.stdin.read() or "{}")
     except json.JSONDecodeError:
@@ -1290,25 +1715,67 @@ def main() -> int:
         _log(f"{event}: session id {uuid!r} is not a uuid — refusing the "
              f"store lookup")
         return 0
+    if not _repo_enabled(payload, uuid):
+        _log(f"{event}: workspace is not on this machine's repository "
+             "allowlist (/memhub:repos) — not captured")
+        return 0
     event_pr_urls, missing_pr_urls = pr_provenance.scan_shell_event(
         event, payload)
     if missing_pr_urls:
         _log(f"{event}: direct gh pr create result had no canonical "
              "GitHub PR URL")
+    if event in ("sessionStart", "beforeSubmitPrompt"):
+        try:
+            _note_hook_clock(uuid, event, payload, hook_at)
+        except OSError as e:
+            _log(f"{event}: could not save the hook clock ({e!r})")
     if not _event_can_flush(event, payload):
         # A guaranteed non-send (plain shell traffic, unknown event) exits
         # before the lock and the transcript read — no I/O per `ls`, and no
         # quiet OBSERVATION that would skew first_observation (see
         # _event_can_flush).
         return 0
+    if event == "subagentStop":
+        # Fires under the PARENT; remember what it says of the child before
+        # anything can fail, so a later agent event still has it.
+        entry = cursor_agents.roster_entry(payload)
+        if entry is not None:
+            child, fields = entry
 
-    # Only exact hook-only usage needs observation before the upload lock.
-    # Ordinary edits/milestone shells keep the cheap busy-session skip: they
-    # neither parse the source nor queue behind the observation lock. Shell
-    # results still queue their PR provenance before reading the source.
+            def merge(state: dict) -> None:
+                # Under the state lock: two children ending together each
+                # add their own entry rather than the later one winning.
+                roster = state.get("subagents")
+                roster = dict(roster) if isinstance(roster, dict) else {}
+                roster[child] = {**(roster.get(child) or {}), **fields}
+                state["subagents"] = roster
+            _update_state(uuid, merge)
+    is_child, root = _child_of(uuid, payload)
+    if is_child:
+        # Never the child's own session, whichever of its sources is readable.
+        _log(f"{event}: {uuid[:8]} is a sub-agent"
+             f"{' of ' + root[:8] if root else ''} — captured with its root "
+             "session, never as its own")
+        if root and _UUID_RE.fullmatch(root) and _child_lane_due(root, event):
+            root_lock = _acquire(root, blocking=False)
+            if root_lock is not None:
+                try:
+                    _run_agents_only(root, event)
+                finally:
+                    os.close(root_lock)
+        return 0
+
+    # Only exact hook-only usage and sessionEnd need observation before the
+    # upload lock: sessionEnd's clock dates what exists when it fires, and an
+    # in-flight send can hold the upload lock while a following --resume
+    # invocation writes its turn. Ordinary edits/milestone shells keep the
+    # cheap busy-session skip: they neither parse the source nor queue behind
+    # the observation lock. Shell results still queue their PR provenance
+    # before reading the source.
     prepared = None
-    if _hook_usage(event, payload) is not None:
-        prepared = _observe_session(uuid, event, payload, event_pr_urls)
+    if event == "sessionEnd" or _hook_usage(event, payload) is not None:
+        prepared = _observe_session(uuid, event, payload, event_pr_urls,
+                                    hook_at=hook_at)
         if prepared is None:
             return 0
 
@@ -1323,84 +1790,103 @@ def main() -> int:
     lock_fd = _acquire(
         uuid, blocking=(event in ("afterAgentResponse", "stop",
                                   "beforeSubmitPrompt", "sessionEnd",
-                                  "afterShellExecution")))
+                                  "afterShellExecution", "subagentStop")))
     if lock_fd is None:
         _log(f"{event}: another flush is running for this session — skipping")
         return 0
     try:
-        state = _read_state(uuid)
-        accepted_pr_urls = pr_provenance.merge_urls(
-            state.get("accepted_pr_urls") or [])
-        accepted_pr_set = set(accepted_pr_urls)
-        prior_pending = pr_provenance.merge_urls(
-            state.get("pending_pr_urls") or [])
-        pending_pr_urls = [
-            url for url in pr_provenance.merge_urls(
-                prior_pending, event_pr_urls)
-            if url not in accepted_pr_set
-        ]
-        if pending_pr_urls != prior_pending:
-            # Cursor's transcript omits shell results. Persist the hook-only
-            # evidence before source reads and network work so any later event
-            # can retry it after a crash, missing source, or failed send.
-            _save_state(
-                uuid,
-                pending_pr_urls=pending_pr_urls,
-                accepted_pr_urls=accepted_pr_urls,
-            )
-            state = {
-                **state,
-                "pending_pr_urls": pending_pr_urls,
-                "accepted_pr_urls": accepted_pr_urls,
-            }
-        if prepared is None:
-            prepared = _observe_session(uuid, event, payload, event_pr_urls)
-            if prepared is None:
-                return 0
-            state = _read_state(uuid)
-        # Another hook may have observed/sent a newer source while this one
-        # waited for the upload lock. Refresh only then, without rebinding
-        # this already-observed generation to the newer last assistant.
-        if any(state.get(key) != value
-               for key, value in prepared["observation"].items()):
-            prepared = _observe_session(
-                uuid, event, payload, event_pr_urls, observe_usage=False)
-            if prepared is None:
-                return 0
-            state = _read_state(uuid)
-        source_kind = prepared["source_kind"]
-        source_path = prepared["source_path"]
-        blob_ids = prepared["blob_ids"]
-        source_revision = prepared["source_revision"]
-        records = prepared["records"]
-        meta = prepared["meta"]
-        applied_usage = prepared["applied_usage"]
-        pending_usage = applied_usage - set(state.get("sent_usage_generations") or [])
-        if not should_flush(
-                event, payload, state, blob_ids, time.time(),
-                source_kind=source_kind, source_revision=source_revision,
-                usage_pending=bool(pending_usage),
-                provenance_pending=bool(state.get("pending_pr_urls"))):
-            return 0
-        try:
-            mode = _FLUSH_MODE.get(event, "now")
-            asyncio.run(asyncio.wait_for(
-                _flush(
-                    uuid, source_path, blob_ids, mode,
-                    source_kind=source_kind, source_revision=source_revision,
-                    records=records, meta=meta, applied_usage=applied_usage),
-                timeout=FLUSH_TIMEOUT_S))
-        except Exception as e:
-            # A timeout or any raise past _flush's own handlers (the broad
-            # case, including asyncio.wait_for firing) counts toward dormancy
-            # too — otherwise a hard-down backend re-parses and re-uploads the
-            # whole store on every event forever, and Stop is cooldown-exempt
-            # so nothing else bounds it.
-            _log(f"{event}: flush error: {e}")
-            _note_failure(uuid, f"flush_error: {type(e).__name__}")
+        outcome = _flush_locked(uuid, event, payload, event_pr_urls, prepared,
+                                hook_at=hook_at)
+        if outcome == "skipped" and event in _AGENT_EVENTS:
+            # Nothing new in the session itself, but a sub-agent may have
+            # finished since: the agents of a session saved before still go.
+            _run_agents_only(uuid, event)
     finally:
         os.close(lock_fd)  # releases the flock
     return 0
+
+
+def _flush_locked(uuid: str, event: str, payload: dict, event_pr_urls,
+                  prepared, *, hook_at: str | None = None) -> str:
+    """The session's own flush, under its flush lock: "flushed" (confirmed),
+    "failed" (tried and not confirmed) or "skipped" (nothing to send)."""
+    state = _read_state(uuid)
+    accepted_pr_urls = pr_provenance.merge_urls(
+        state.get("accepted_pr_urls") or [])
+    accepted_pr_set = set(accepted_pr_urls)
+    prior_pending = pr_provenance.merge_urls(
+        state.get("pending_pr_urls") or [])
+    pending_pr_urls = [
+        url for url in pr_provenance.merge_urls(
+            prior_pending, event_pr_urls)
+        if url not in accepted_pr_set
+    ]
+    if pending_pr_urls != prior_pending:
+        # Cursor's transcript omits shell results. Persist the hook-only
+        # evidence before source reads and network work so any later event
+        # can retry it after a crash, missing source, or failed send.
+        _save_state(
+            uuid,
+            pending_pr_urls=pending_pr_urls,
+            accepted_pr_urls=accepted_pr_urls,
+        )
+        state = {
+            **state,
+            "pending_pr_urls": pending_pr_urls,
+            "accepted_pr_urls": accepted_pr_urls,
+        }
+    if prepared is None:
+        prepared = _observe_session(uuid, event, payload, event_pr_urls,
+                                    hook_at=hook_at)
+        if prepared is None:
+            return "skipped"
+        state = _read_state(uuid)
+    # Another hook may have observed/sent a newer source while this one
+    # waited for the upload lock. Refresh only then, without rebinding
+    # this already-observed generation to the newer last assistant. Nor
+    # its hook clock: records that appeared during the wait are dated
+    # now, not at a moment before they existed.
+    if any(state.get(key) != value
+           for key, value in prepared["observation"].items()):
+        prepared = _observe_session(
+            uuid, event, payload, event_pr_urls, observe_usage=False)
+        if prepared is None:
+            return "skipped"
+        state = _read_state(uuid)
+    source_kind = prepared["source_kind"]
+    source_path = prepared["source_path"]
+    blob_ids = prepared["blob_ids"]
+    source_revision = prepared["source_revision"]
+    records = prepared["records"]
+    meta = prepared["meta"]
+    applied_usage = prepared["applied_usage"]
+    pending_usage = applied_usage - set(state.get("sent_usage_generations") or [])
+    if not should_flush(
+            event, payload, state, blob_ids, time.time(),
+            source_kind=source_kind, source_revision=source_revision,
+            usage_pending=bool(pending_usage),
+            provenance_pending=bool(state.get("pending_pr_urls"))):
+        return "skipped"
+    try:
+        mode = _FLUSH_MODE.get(event, "now")
+        confirmed = asyncio.run(asyncio.wait_for(
+            _flush(
+                uuid, source_path, blob_ids, mode,
+                source_kind=source_kind, source_revision=source_revision,
+                records=records, meta=meta, applied_usage=applied_usage,
+                agent_event=event,
+                deadline=time.monotonic() + FLUSH_TIMEOUT_S - 5),
+            timeout=FLUSH_TIMEOUT_S))
+        return "flushed" if confirmed else "failed"
+    except Exception as e:
+        # A timeout or any raise past _flush's own handlers (the broad
+        # case, including asyncio.wait_for firing) counts toward dormancy
+        # too — otherwise a hard-down backend re-parses and re-uploads the
+        # whole store on every event forever, and Stop is cooldown-exempt
+        # so nothing else bounds it.
+        _log(f"{event}: flush error: {e}")
+        _note_failure(uuid, f"flush_error: {type(e).__name__}")
+        return "failed"
 
 
 if __name__ == "__main__":

@@ -163,18 +163,34 @@ def capture_context(payload: bytes) -> str | None:
 
 def main() -> int:
     event = sys.argv[1] if len(sys.argv) > 1 else "unknown"
-    # sessionStart and postToolUse take no permission; the rest are asked one.
-    output = {} if event in ("sessionStart", "postToolUse") else {"permission": "allow"}
+    # sessionStart, the post hooks and subagentStop take no permission; the
+    # rest are asked one.
+    output = ({} if event in ("sessionStart", "postToolUse", "postToolUseFailure",
+                              "subagentStop")
+              else {"permission": "allow"})
     try:
         raw = sys.stdin.buffer.read(_MAX_PAYLOAD_BYTES + 1)
         payload = _normalize_payload(raw)
         if payload is not None:
-            if event in cursor_rulebook.NOTE_EVENTS + ("beforeReadFile",):
-                # Rulebook-only events: capture never read them.
+            if event in cursor_rulebook.NOTE_EVENTS + ("beforeReadFile", "postToolUseFailure"):
+                # Rulebook events. Capture reads none of them, except that
+                # sessionStart's clock dates the session's first records.
                 try:
                     cursor_rulebook.note(event, json.loads(payload))
                 except Exception as exc:
                     _log(f"rulebook note failed ({exc!r})")
+                if event == "sessionStart":
+                    spawn_cursor_flush(payload, event)
+                    try:
+                        context = cursor_rulebook.session_context(json.loads(payload))
+                        if context:
+                            output["additional_context"] = context
+                    except Exception as exc:
+                        _log(f"session context failed ({exc!r})")
+            elif event == "subagentStart":
+                # Answered (allow) and nothing more: it names the spawning call
+                # but not the child, so capture acts on subagentStop.
+                pass
             else:
                 spawn_cursor_flush(payload, event)
             if event in cursor_rulebook.FLUSH_EVENTS:
@@ -186,6 +202,11 @@ def main() -> int:
                     ruled = cursor_rulebook.gate(event, json.loads(payload))
                 except Exception as exc:
                     _log(f"rulebook gate failed ({exc!r})")
+            if event in cursor_rulebook.POST_EVENTS:
+                try:
+                    ruled = cursor_rulebook.post(event, json.loads(payload))
+                except Exception as exc:
+                    _log(f"rulebook post lane failed ({exc!r})")
             if ruled and ruled.get("permission") == "deny":
                 print(json.dumps(ruled), flush=True)
                 return 0

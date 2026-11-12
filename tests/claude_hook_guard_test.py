@@ -80,7 +80,15 @@ def test_every_claude_handler_is_guarded_and_only_boundaries_capture():
         for group in groups:
             for handler in group["hooks"]:
                 commands.append((event, handler["command"]))
-    assert len(commands) == 22   # + PostToolUseFailure (rulebook_hook.py post —
+    assert len(commands) == 26   # + UserPromptSubmit (compare_session.py
+                                 # checkpoint — local rewind's before-prompt
+                                 # snapshot, ENG-1296),
+                                 # + Stop and UserPromptSubmit (rulebook_reply —
+                                 # the `reply` rules' gate at Stop, and the
+                                 # advisory it leaves for the next prompt),
+                                 # + Stop (rulebook_quarantine.py stop — a
+                                 # quarantined file blocks the stop once),
+                                 # + PostToolUseFailure (rulebook_hook.py post —
                                  # the failure lane, ENG-1236),
                                  # + UserPromptExpansion (rulebook_hook.py
                                  # expansion — a typed command noted, ENG-1235),

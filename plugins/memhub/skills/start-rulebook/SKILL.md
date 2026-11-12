@@ -601,8 +601,10 @@ The report, in order:
   fires were mostly in sessions that had already done X is moved to session
   start with its numbers. A session-armed ordering (`armed_by_events:
   ["session"]`, e.g. fetch before reading `origin/*`) is replayed AND armed by
-  the shipped engine: `armed_by_events` takes `session` and `prompt` (the
-  latter needs `armed_by_rx`) as well as the edit family. Propose it in that
+  the shipped engine: `armed_by_events` takes `session`, `prompt` (needs
+  `armed_by_rx`) and `command` (needs `armed_by_command_rx`: a successful
+  command that matches arms it, e.g. `git mv`, then the tests before a push)
+  as well as the edit family. Propose it in that
   shape rather than demoting it to a note, and let `/memhub:create-rule`
   step 3 set `min_hook_version`, so a teammate on an older hook gets it as
   advice naming the version it wanted instead of silence.

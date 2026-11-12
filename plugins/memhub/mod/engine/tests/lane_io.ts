@@ -26,8 +26,12 @@ export function sessionDoc(f: StateFiles, session: string): Dict {
   st.armed ??= {}
   st.armed_version ??= {}
   st.armed_once ??= []
+  if (!st.quarantine || typeof st.quarantine !== 'object' || Array.isArray(st.quarantine)) st.quarantine = {}
   return st
 }
+
+/** Python's `json.dumps([a, b])`, for a quarantine key (rulebook_quarantine.key). */
+const pyKey = (a: string, b: string) => `[${JSON.stringify(a)}, ${JSON.stringify(b)}]`
 
 /** scripts/rulebook_mod_state.py, as the Python functions it calls behave. */
 export function applyStateOp(f: StateFiles, op: StateOp): Dict {
@@ -40,7 +44,7 @@ export function applyStateOp(f: StateFiles, op: StateOp): Dict {
       read: () => f.readJson(path),
       write: (st) => f.put(path, JSON.stringify(st)),
     })
-    const outcome = eng.feed(rule, { hookPhase: op.hook_phase, tool: op.tool, cmd: op.cmd, filePath: op.file_path, ok: op.ok, armed: op.armed })
+    const outcome = eng.feed(rule, { hookPhase: op.hook_phase, tool: op.tool, cmd: op.cmd, filePath: op.file_path, ok: op.ok, armed: op.armed, ran: op.ran ?? null })
     return { outcome, gate_msg: rule._gate_msg ?? null, legacy_fires: rule._legacy_fires ?? null }
   }
   if (op.op === 'arm') {
@@ -70,6 +74,22 @@ export function applyStateOp(f: StateFiles, op: StateOp): Dict {
     }
     f.put(sessionPath(f, op.session), JSON.stringify(st))
     return {}
+  }
+  if (op.op === 'quarantine') {
+    const st = sessionDoc(f, op.session)
+    const opened: string[] = []
+    for (const v of op.open) {
+      const k = pyKey(v.rule_id, v.file)
+      const was = (st.quarantine as Dict)[k]
+      const stopped = was && typeof was === 'object' ? ((was as Dict).stopped ?? null) : null
+      const rec: Dict = { rule_id: v.rule_id, file: v.file, root: v.root || '', new: !!v.new, stopped }
+      const at = was && typeof was === 'object' ? (was as Dict).stopped_at : undefined
+      if (at !== undefined && at !== null) rec.stopped_at = at
+      ;(st.quarantine as Dict)[k] = rec
+      opened.push(k)
+    }
+    f.put(sessionPath(f, op.session), JSON.stringify(st))
+    return { opened }
   }
   return { error: 'specs: not in the lane vectors' }
 }
@@ -120,10 +140,11 @@ export function eventAsWritten(row: Dict, session: string): Dict {
 
 export const isEvent = (r: Dict) => typeof r.kind === 'string' && !('fire_id' in r)
 
-/** act.ts `modelText`: the context, then the echo instruction. */
+/** act.ts `modelText`: the context, then the echo instruction for the gate fires (the ones shown). */
 export function modelText(v: Verdict): string | undefined {
   const lines = [...v.context]
-  if (v.fires.length) lines.push(disclosureInstruction(v.fires.map((f) => f.line)))
+  const shown = v.fires.filter((f) => f.mode === 'gate').map((f) => f.line)
+  if (shown.length) lines.push(disclosureInstruction(shown))
   const t = lines.join('\n')
   return t.trim() ? t : undefined
 }

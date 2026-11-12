@@ -1,0 +1,611 @@
+{
+ "about": "Cursor IDE 3.25.6 (grok-4.7-high-fast), three turns recorded with harness/drivers/cursor_record.py on 2026-10-17. Only the usage-bearing afterAgentResponse/stop invocations are kept, each with the transcript as it stood when the hook fired; paths and the account email are scrubbed. input_tokens on these hooks is GROSS (it includes cache_read_tokens).",
+ "session_id": "369081f8-d23c-4081-8f17-6e109ba6346f",
+ "transcripts": {
+  "4d3909476bc2157a3ed506c3156fe1215bf72d61b2169e68e0f138e07136049b": [
+   {
+    "role": "user",
+    "message": {
+     "content": [
+      {
+       "type": "text",
+       "text": "<timestamp>Friday, Oct 16, 2026, 7:40 PM (UTC-7)</timestamp>\n<user_query>\nReply with the single word ONE.\n</user_query>"
+      }
+     ]
+    }
+   },
+   {
+    "role": "assistant",
+    "message": {
+     "content": [
+      {
+       "type": "text",
+       "text": "ONE"
+      }
+     ]
+    }
+   },
+   {
+    "type": "turn_ended",
+    "status": "success"
+   }
+  ],
+  "7349c3c5d444d212a52b8dd74b5ecd088b574a745127cb54e83fbb5d2a77be6f": [
+   {
+    "role": "user",
+    "message": {
+     "content": [
+      {
+       "type": "text",
+       "text": "<timestamp>Friday, Oct 16, 2026, 7:40 PM (UTC-7)</timestamp>\n<user_query>\nReply with the single word ONE.\n</user_query>"
+      }
+     ]
+    }
+   },
+   {
+    "role": "assistant",
+    "message": {
+     "content": [
+      {
+       "type": "text",
+       "text": "ONE"
+      }
+     ]
+    }
+   },
+   {
+    "type": "turn_ended",
+    "status": "success"
+   },
+   {
+    "role": "user",
+    "message": {
+     "content": [
+      {
+       "type": "text",
+       "text": "<timestamp>Friday, Oct 16, 2026, 7:41 PM (UTC-7)</timestamp>\n<user_query>\nRead every .py file under /src/agent-plugins-internal/plugins/memhub-staging/scripts/readers and summarize each in one line. This makes the context big enough that Cursor reuses cached input.\n</user_query>"
+      }
+     ]
+    }
+   },
+   {
+    "role": "assistant",
+    "message": {
+     "content": [
+      {
+       "type": "text",
+       "text": "I'll list every Python file in that readers directory and summarize each one in a single line."
+      },
+      {
+       "type": "tool_use",
+       "name": "Glob",
+       "input": {
+        "target_directory": "/src/agent-plugins-internal/plugins/memhub-staging/scripts/readers",
+        "glob_pattern": "**/*.py"
+       }
+      }
+     ]
+    }
+   },
+   {
+    "role": "assistant",
+    "message": {
+     "content": [
+      {
+       "type": "tool_use",
+       "name": "Read",
+       "input": {
+        "path": "/src/agent-plugins-internal/plugins/memhub-staging/scripts/readers/strict_json.py"
+       }
+      },
+      {
+       "type": "tool_use",
+       "name": "Read",
+       "input": {
+        "path": "/src/agent-plugins-internal/plugins/memhub-staging/scripts/readers/jsonl.py"
+       }
+      },
+      {
+       "type": "tool_use",
+       "name": "Read",
+       "input": {
+        "path": "/src/agent-plugins-internal/plugins/memhub-staging/scripts/readers/discovery.py"
+       }
+      },
+      {
+       "type": "tool_use",
+       "name": "Read",
+       "input": {
+        "path": "/src/agent-plugins-internal/plugins/memhub-staging/scripts/readers/cursor.py"
+       }
+      },
+      {
+       "type": "tool_use",
+       "name": "Read",
+       "input": {
+        "path": "/src/agent-plugins-internal/plugins/memhub-staging/scripts/readers/codex_usage.py"
+       }
+      },
+      {
+       "type": "tool_use",
+       "name": "Read",
+       "input": {
+        "path": "/src/agent-plugins-internal/plugins/memhub-staging/scripts/readers/codex_history.py"
+       }
+      },
+      {
+       "type": "tool_use",
+       "name": "Read",
+       "input": {
+        "path": "/src/agent-plugins-internal/plugins/memhub-staging/scripts/readers/codex.py"
+       }
+      },
+      {
+       "type": "tool_use",
+       "name": "Read",
+       "input": {
+        "path": "/src/agent-plugins-internal/plugins/memhub-staging/scripts/readers/claude.py"
+       }
+      },
+      {
+       "type": "tool_use",
+       "name": "Read",
+       "input": {
+        "path": "/src/agent-plugins-internal/plugins/memhub-staging/scripts/readers/__init__.py"
+       }
+      }
+     ]
+    }
+   },
+   {
+    "role": "assistant",
+    "message": {
+     "content": [
+      {
+       "type": "text",
+       "text": "Two files were too large to read in full. I’ll take their structure from the first section and public definitions so each still gets a one-line summary."
+      },
+      {
+       "type": "tool_use",
+       "name": "Read",
+       "input": {
+        "path": "/src/agent-plugins-internal/plugins/memhub-staging/scripts/readers/cursor.py",
+        "limit": 120
+       }
+      },
+      {
+       "type": "tool_use",
+       "name": "Read",
+       "input": {
+        "path": "/src/agent-plugins-internal/plugins/memhub-staging/scripts/readers/codex.py",
+        "limit": 120
+       }
+      },
+      {
+       "type": "tool_use",
+       "name": "Grep",
+       "input": {
+        "path": "/src/agent-plugins-internal/plugins/memhub-staging/scripts/readers/cursor.py",
+        "pattern": "^(def |class |HOST |\"\"\")"
+       }
+      },
+      {
+       "type": "tool_use",
+       "name": "Grep",
+       "input": {
+        "path": "/src/agent-plugins-internal/plugins/memhub-staging/scripts/readers/codex.py",
+        "pattern": "^(def |class |HOST |\"\"\")"
+       }
+      }
+     ]
+    }
+   },
+   {
+    "role": "assistant",
+    "message": {
+     "content": [
+      {
+       "type": "text",
+       "text": "⛔️ Rule fired: Delegate big file reads to a cheaper model\n⛔️ Rule fired: Delegate big file reads to a cheaper model\n\n- `__init__.py` — Registry of host readers (Claude, Codex, Cursor) plus host sniffing and the shared Claude-shaped record contract check.\n- `claude.py` — Reads `~/.claude/projects` JSONL transcripts as the canonical shape, listing, locating, and extracting session cwd without transforming records.\n- `codex.py` — Reads Codex rollout JSONL and reshapes Responses-API items (text, reasoning, tool calls, token usage) into Claude records.\n- `codex_history.py` — Stitches paginated Codex rollouts that share a history chain, projecting inherited context and carrying usage baselines across segments.\n- `codex_usage.py` — Overlays persisted per-response token ledgers onto Codex records, replacing parallel UI token-meter snapshots from the first ledger onward.\n- `cursor.py` — Reads Cursor `store.db` hash trees and hook transcripts into Claude records, stripping injected context and keeping only real timestamps.\n- `discovery.py` — Walks a selected filesystem layout for discovery, reporting inaccessible paths, symlinks, and non-regular files instead of following them.\n- `jsonl.py` — Opens JSONL with universal newlines and surrogate-escaped bytes, then enforces a per-record byte bound.\n- `strict_json.py` — Optional strict `json.loads` that rejects non-finite numbers and non-standard constants while leaving tolerant capture unchanged."
+      }
+     ]
+    }
+   },
+   {
+    "type": "turn_ended",
+    "status": "success"
+   }
+  ],
+  "acadfa60a9f2ed62d5bf0d34798d760835c1ec94fee4bfa6772552958b16117b": [
+   {
+    "role": "user",
+    "message": {
+     "content": [
+      {
+       "type": "text",
+       "text": "<timestamp>Friday, Oct 16, 2026, 7:40 PM (UTC-7)</timestamp>\n<user_query>\nReply with the single word ONE.\n</user_query>"
+      }
+     ]
+    }
+   },
+   {
+    "role": "assistant",
+    "message": {
+     "content": [
+      {
+       "type": "text",
+       "text": "ONE"
+      }
+     ]
+    }
+   },
+   {
+    "type": "turn_ended",
+    "status": "success"
+   },
+   {
+    "role": "user",
+    "message": {
+     "content": [
+      {
+       "type": "text",
+       "text": "<timestamp>Friday, Oct 16, 2026, 7:41 PM (UTC-7)</timestamp>\n<user_query>\nRead every .py file under /src/agent-plugins-internal/plugins/memhub-staging/scripts/readers and summarize each in one line. This makes the context big enough that Cursor reuses cached input.\n</user_query>"
+      }
+     ]
+    }
+   },
+   {
+    "role": "assistant",
+    "message": {
+     "content": [
+      {
+       "type": "text",
+       "text": "I'll list every Python file in that readers directory and summarize each one in a single line."
+      },
+      {
+       "type": "tool_use",
+       "name": "Glob",
+       "input": {
+        "target_directory": "/src/agent-plugins-internal/plugins/memhub-staging/scripts/readers",
+        "glob_pattern": "**/*.py"
+       }
+      }
+     ]
+    }
+   },
+   {
+    "role": "assistant",
+    "message": {
+     "content": [
+      {
+       "type": "tool_use",
+       "name": "Read",
+       "input": {
+        "path": "/src/agent-plugins-internal/plugins/memhub-staging/scripts/readers/strict_json.py"
+       }
+      },
+      {
+       "type": "tool_use",
+       "name": "Read",
+       "input": {
+        "path": "/src/agent-plugins-internal/plugins/memhub-staging/scripts/readers/jsonl.py"
+       }
+      },
+      {
+       "type": "tool_use",
+       "name": "Read",
+       "input": {
+        "path": "/src/agent-plugins-internal/plugins/memhub-staging/scripts/readers/discovery.py"
+       }
+      },
+      {
+       "type": "tool_use",
+       "name": "Read",
+       "input": {
+        "path": "/src/agent-plugins-internal/plugins/memhub-staging/scripts/readers/cursor.py"
+       }
+      },
+      {
+       "type": "tool_use",
+       "name": "Read",
+       "input": {
+        "path": "/src/agent-plugins-internal/plugins/memhub-staging/scripts/readers/codex_usage.py"
+       }
+      },
+      {
+       "type": "tool_use",
+       "name": "Read",
+       "input": {
+        "path": "/src/agent-plugins-internal/plugins/memhub-staging/scripts/readers/codex_history.py"
+       }
+      },
+      {
+       "type": "tool_use",
+       "name": "Read",
+       "input": {
+        "path": "/src/agent-plugins-internal/plugins/memhub-staging/scripts/readers/codex.py"
+       }
+      },
+      {
+       "type": "tool_use",
+       "name": "Read",
+       "input": {
+        "path": "/src/agent-plugins-internal/plugins/memhub-staging/scripts/readers/claude.py"
+       }
+      },
+      {
+       "type": "tool_use",
+       "name": "Read",
+       "input": {
+        "path": "/src/agent-plugins-internal/plugins/memhub-staging/scripts/readers/__init__.py"
+       }
+      }
+     ]
+    }
+   },
+   {
+    "role": "assistant",
+    "message": {
+     "content": [
+      {
+       "type": "text",
+       "text": "Two files were too large to read in full. I’ll take their structure from the first section and public definitions so each still gets a one-line summary."
+      },
+      {
+       "type": "tool_use",
+       "name": "Read",
+       "input": {
+        "path": "/src/agent-plugins-internal/plugins/memhub-staging/scripts/readers/cursor.py",
+        "limit": 120
+       }
+      },
+      {
+       "type": "tool_use",
+       "name": "Read",
+       "input": {
+        "path": "/src/agent-plugins-internal/plugins/memhub-staging/scripts/readers/codex.py",
+        "limit": 120
+       }
+      },
+      {
+       "type": "tool_use",
+       "name": "Grep",
+       "input": {
+        "path": "/src/agent-plugins-internal/plugins/memhub-staging/scripts/readers/cursor.py",
+        "pattern": "^(def |class |HOST |\"\"\")"
+       }
+      },
+      {
+       "type": "tool_use",
+       "name": "Grep",
+       "input": {
+        "path": "/src/agent-plugins-internal/plugins/memhub-staging/scripts/readers/codex.py",
+        "pattern": "^(def |class |HOST |\"\"\")"
+       }
+      }
+     ]
+    }
+   },
+   {
+    "role": "assistant",
+    "message": {
+     "content": [
+      {
+       "type": "text",
+       "text": "⛔️ Rule fired: Delegate big file reads to a cheaper model\n⛔️ Rule fired: Delegate big file reads to a cheaper model\n\n- `__init__.py` — Registry of host readers (Claude, Codex, Cursor) plus host sniffing and the shared Claude-shaped record contract check.\n- `claude.py` — Reads `~/.claude/projects` JSONL transcripts as the canonical shape, listing, locating, and extracting session cwd without transforming records.\n- `codex.py` — Reads Codex rollout JSONL and reshapes Responses-API items (text, reasoning, tool calls, token usage) into Claude records.\n- `codex_history.py` — Stitches paginated Codex rollouts that share a history chain, projecting inherited context and carrying usage baselines across segments.\n- `codex_usage.py` — Overlays persisted per-response token ledgers onto Codex records, replacing parallel UI token-meter snapshots from the first ledger onward.\n- `cursor.py` — Reads Cursor `store.db` hash trees and hook transcripts into Claude records, stripping injected context and keeping only real timestamps.\n- `discovery.py` — Walks a selected filesystem layout for discovery, reporting inaccessible paths, symlinks, and non-regular files instead of following them.\n- `jsonl.py` — Opens JSONL with universal newlines and surrogate-escaped bytes, then enforces a per-record byte bound.\n- `strict_json.py` — Optional strict `json.loads` that rejects non-finite numbers and non-standard constants while leaving tolerant capture unchanged."
+      }
+     ]
+    }
+   },
+   {
+    "type": "turn_ended",
+    "status": "success"
+   },
+   {
+    "role": "user",
+    "message": {
+     "content": [
+      {
+       "type": "text",
+       "text": "<timestamp>Friday, Oct 16, 2026, 7:42 PM (UTC-7)</timestamp>\n<user_query>\nAppend a line # reviewed to fixture.py, then reply DONE\n</user_query>"
+      }
+     ]
+    }
+   },
+   {
+    "role": "assistant",
+    "message": {
+     "content": [
+      {
+       "type": "text",
+       "text": "I'll add `# reviewed` to `fixture.py` and then reply DONE."
+      },
+      {
+       "type": "tool_use",
+       "name": "Glob",
+       "input": {
+        "glob_pattern": "**/fixture.py"
+       }
+      }
+     ]
+    }
+   },
+   {
+    "role": "assistant",
+    "message": {
+     "content": [
+      {
+       "type": "tool_use",
+       "name": "Read",
+       "input": {
+        "path": "/tmp/memhub-cursor-recording/fixture.py"
+       }
+      }
+     ]
+    }
+   },
+   {
+    "role": "assistant",
+    "message": {
+     "content": [
+      {
+       "type": "tool_use",
+       "name": "StrReplace",
+       "input": {
+        "path": "/tmp/memhub-cursor-recording/fixture.py",
+        "old_string": "CANARY = \"memhub-cursor-recording\"",
+        "new_string": "CANARY = \"memhub-cursor-recording\"\n# reviewed"
+       }
+      }
+     ]
+    }
+   },
+   {
+    "role": "assistant",
+    "message": {
+     "content": [
+      {
+       "type": "text",
+       "text": "DONE"
+      }
+     ]
+    }
+   },
+   {
+    "type": "turn_ended",
+    "status": "success"
+   }
+  ]
+ },
+ "invocations": [
+  {
+   "seq": 5,
+   "event": "afterAgentResponse",
+   "transcript": "4d3909476bc2157a3ed506c3156fe1215bf72d61b2169e68e0f138e07136049b",
+   "payload": {
+    "conversation_id": "369081f8-d23c-4081-8f17-6e109ba6346f",
+    "generation_id": "c3e427e5-7e9a-45db-8b49-56016bbc68d0",
+    "model": "grok-4.7-high-fast",
+    "input_tokens": 18356,
+    "output_tokens": 27,
+    "cache_read_tokens": 6272,
+    "cache_write_tokens": 0,
+    "session_id": "369081f8-d23c-4081-8f17-6e109ba6346f",
+    "hook_event_name": "afterAgentResponse",
+    "cursor_version": "3.25.6",
+    "workspace_roots": [
+     "/tmp/memhub-cursor-recording"
+    ],
+    "text": "ONE"
+   }
+  },
+  {
+   "seq": 6,
+   "event": "stop",
+   "transcript": "4d3909476bc2157a3ed506c3156fe1215bf72d61b2169e68e0f138e07136049b",
+   "payload": {
+    "conversation_id": "369081f8-d23c-4081-8f17-6e109ba6346f",
+    "generation_id": "c3e427e5-7e9a-45db-8b49-56016bbc68d0",
+    "model": "grok-4.7-high-fast",
+    "input_tokens": 18356,
+    "output_tokens": 27,
+    "cache_read_tokens": 6272,
+    "cache_write_tokens": 0,
+    "status": "completed",
+    "loop_count": 0,
+    "session_id": "369081f8-d23c-4081-8f17-6e109ba6346f",
+    "hook_event_name": "stop",
+    "cursor_version": "3.25.6",
+    "workspace_roots": [
+     "/tmp/memhub-cursor-recording"
+    ]
+   }
+  },
+  {
+   "seq": 55,
+   "event": "afterAgentResponse",
+   "transcript": "7349c3c5d444d212a52b8dd74b5ecd088b574a745127cb54e83fbb5d2a77be6f",
+   "payload": {
+    "conversation_id": "369081f8-d23c-4081-8f17-6e109ba6346f",
+    "generation_id": "e46407dd-f24c-4480-9690-901e3193d891",
+    "model": "grok-4.7-high-fast",
+    "input_tokens": 102136,
+    "output_tokens": 2304,
+    "cache_read_tokens": 72320,
+    "cache_write_tokens": 0,
+    "session_id": "369081f8-d23c-4081-8f17-6e109ba6346f",
+    "hook_event_name": "afterAgentResponse",
+    "cursor_version": "3.25.6",
+    "workspace_roots": [
+     "/tmp/memhub-cursor-recording"
+    ],
+    "text": "⛔️ Rule fired: Delegate big file reads to a cheaper model\n⛔️ Rule fired: Delegate big file reads to a cheaper model\n\n- `__init__.py` — Registry of host readers (Claude, Codex, Cursor) plus host sniffing and the shared Claude-shaped record contract check.\n- `claude.py` — Reads `~/.claude/projects` JSONL transcripts as the canonical shape, listing, locating, and extracting session cwd without transforming records.\n- `codex.py` — Reads Codex rollout JSONL and reshapes Responses-API items (text, reasoning, tool calls, token usage) into Claude records.\n- `codex_history.py` — Stitches paginated Codex rollouts that share a history chain, projecting inherited context and carrying usage baselines across segments.\n- `codex_usage.py` — Overlays persisted per-response token ledgers onto Codex records, replacing parallel UI token-meter snapshots from the first ledger onward.\n- `cursor.py` — Reads Cursor `store.db` hash trees and hook transcripts into Claude records, stripping injected context and keeping only real timestamps.\n- `discovery.py` — Walks a selected filesystem layout for discovery, reporting inaccessible paths, symlinks, and non-regular files instead of following them.\n- `jsonl.py` — Opens JSONL with universal newlines and surrogate-escaped bytes, then enforces a per-record byte bound.\n- `strict_json.py` — Optional strict `json.loads` that rejects non-finite numbers and non-standard constants while leaving tolerant capture unchanged."
+   }
+  },
+  {
+   "seq": 56,
+   "event": "stop",
+   "transcript": "7349c3c5d444d212a52b8dd74b5ecd088b574a745127cb54e83fbb5d2a77be6f",
+   "payload": {
+    "conversation_id": "369081f8-d23c-4081-8f17-6e109ba6346f",
+    "generation_id": "e46407dd-f24c-4480-9690-901e3193d891",
+    "model": "grok-4.7-high-fast",
+    "input_tokens": 102136,
+    "output_tokens": 2304,
+    "cache_read_tokens": 72320,
+    "cache_write_tokens": 0,
+    "status": "completed",
+    "loop_count": 0,
+    "session_id": "369081f8-d23c-4081-8f17-6e109ba6346f",
+    "hook_event_name": "stop",
+    "cursor_version": "3.25.6",
+    "workspace_roots": [
+     "/tmp/memhub-cursor-recording"
+    ]
+   }
+  },
+  {
+   "seq": 77,
+   "event": "afterAgentResponse",
+   "transcript": "acadfa60a9f2ed62d5bf0d34798d760835c1ec94fee4bfa6772552958b16117b",
+   "payload": {
+    "conversation_id": "369081f8-d23c-4081-8f17-6e109ba6346f",
+    "generation_id": "f0b04523-791b-45a4-9af8-7d9328b2af86",
+    "model": "grok-4.7-high-fast",
+    "input_tokens": 145087,
+    "output_tokens": 295,
+    "cache_read_tokens": 143616,
+    "cache_write_tokens": 0,
+    "session_id": "369081f8-d23c-4081-8f17-6e109ba6346f",
+    "hook_event_name": "afterAgentResponse",
+    "cursor_version": "3.25.6",
+    "workspace_roots": [
+     "/tmp/memhub-cursor-recording"
+    ],
+    "text": "DONE"
+   }
+  },
+  {
+   "seq": 78,
+   "event": "stop",
+   "transcript": "acadfa60a9f2ed62d5bf0d34798d760835c1ec94fee4bfa6772552958b16117b",
+   "payload": {
+    "conversation_id": "369081f8-d23c-4081-8f17-6e109ba6346f",
+    "generation_id": "f0b04523-791b-45a4-9af8-7d9328b2af86",
+    "model": "grok-4.7-high-fast",
+    "input_tokens": 145087,
+    "output_tokens": 295,
+    "cache_read_tokens": 143616,
+    "cache_write_tokens": 0,
+    "status": "completed",
+    "loop_count": 0,
+    "session_id": "369081f8-d23c-4081-8f17-6e109ba6346f",
+    "hook_event_name": "stop",
+    "cursor_version": "3.25.6",
+    "workspace_roots": [
+     "/tmp/memhub-cursor-recording"
+    ]
+   }
+  }
+ ]
+}

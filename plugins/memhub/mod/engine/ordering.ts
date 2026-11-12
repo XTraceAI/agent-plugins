@@ -21,9 +21,9 @@
 // stub's own functions.
 
 import type { HookRule } from './index'
-import { pySearch } from './pyre'
+import { pyCompile, pySearch } from './pyre'
 import * as shellMod from './shell'
-import { EDIT_TOOLS, get, isDict, pyIter, pyStr, truthy } from './rules'
+import { EDIT_TOOLS, cpSlice, get, isDict, pyIter, pySplitWs, pyStr, truthy } from './rules'
 
 type Dict = Record<string, unknown>
 
@@ -36,6 +36,10 @@ export interface OrderingShell {
   receiptSegments(shell: string, wholeChain: boolean): string[]
   /** self_discharging(shell, spec) */
   selfDischarging(shell: string, spec: Readonly<Record<string, unknown>>): boolean
+  /** unquoted(text) — command-armed rules only; shell.ts's when absent */
+  unquoted?(text: string): string
+  /** every segment, split outside quotes — command-armed rules only */
+  allSegments?(shell: string): [string, string][]
 }
 
 const fromShellModule = (name: string) => (...args: unknown[]): never => {
@@ -87,6 +91,8 @@ export type FeedEvent = {
   ok?: boolean | null
   /** "session" | "prompt" when the SESSION's own state armed this rule. */
   armed?: string | null
+  /** The call did not fail (lenient `bash_ok`): only then does a command arm. */
+  ran?: boolean | null
 }
 
 export type FeedOutcome = 'fired' | 'allowed' | 'discharged' | null
@@ -146,7 +152,9 @@ export class OrderingEngine {
     const isGate = e.hookPhase === 'pre' && e.tool === 'Bash' && !!seg &&
       this.sh.commandFires(req(spec, 'gated_command_rx'), seg, null, '')
     if (isGate && byCall && this.sh.selfDischarging(seg, spec)) return null
-    if (!(isEdit || isReceipt || isGate)) return null
+    const cmdLane = by.includes('command') && !!seg
+    const arm = cmdLane && e.ran === true && e.hookPhase === 'post' ? this.commandArms(seg, spec) : ''
+    if (!(isEdit || isReceipt || isGate || arm)) return null
 
     if (!this.store.lock()) return null
     try {
@@ -159,11 +167,16 @@ export class OrderingEngine {
       const rid = pyStr(r.id ?? null)
       if (!Object.prototype.hasOwnProperty.call(bucket, rid)) bucket[rid] = { count: 0, last_edit: null }
       const s = bucket[rid] as Dict
-      if (isEdit) {                                       // handler 1: mutation arms
+      if (isEdit || arm) {                                // handler 1: mutation arms
         const c = s.count
         if (typeof c !== 'number' && typeof c !== 'boolean') throw new PyTypeError('count')
         s.count = Number(c) + 1
-        s.last_edit = filePath
+        if (isEdit) {
+          s.last_edit = filePath
+          delete s.last_cmd
+        } else {
+          s.last_cmd = arm
+        }
         this.store.write(st as OrderingState)
         return null
       }
@@ -173,7 +186,7 @@ export class OrderingEngine {
           const legacy = [get(s, 'open_fire'), ...pyIter(truthy(get(s, 'open_fires')) ? s.open_fires : [])]
             .filter(truthy)
           r._legacy_fires = [...new Set(legacy)]
-          for (const k of ['open_fire', 'open_fires', 'resolved_fires']) delete s[k]
+          for (const k of ['open_fire', 'open_fires', 'resolved_fires', 'last_cmd']) delete s[k]
           this.store.write(st as OrderingState)
           return 'discharged'
         }
@@ -186,7 +199,20 @@ export class OrderingEngine {
       if (Number(s.count) >= minEdits) {
         r._gate_msg = `${pyStr(s.count)} edit(s) since the last passing '${pyStr(name)}' ` +
           `(last: ${pyStr(get(s, 'last_edit'))}). Run it first.`
+        if (truthy(get(s, 'last_cmd'))) {
+          r._gate_msg = `${pyStr(s.count)} change(s) since the last passing '${pyStr(name)}' ` +
+            `(last: ran \`${pyStr(s.last_cmd)}\`). Run it first.`
+        }
         return 'fired'
+      }
+      if (cmdLane) {
+        // rulebook_moments.command_gate_msg: this call arms, then runs the gated command
+        const now = this.armsBeforeGate(seg, spec)
+        if (now && Number(s.count) + 1 >= minEdits) {
+          r._gate_msg = `this call runs \`${now}\` before the gated command, with no passing ` +
+            `'${pyStr(name)}' after it. Run it first.`
+          return 'fired'
+        }
       }
       if (truthy(e.armed)) {
         const since = e.armed === 'session' ? 'this session started' : 'your prompt armed this rule'
@@ -198,6 +224,69 @@ export class OrderingEngine {
       this.store.unlock()
     }
   }
+
+  private unq(t: string): string {
+    return this.sh.unquoted ? this.sh.unquoted(t) : shellMod.unquoted(t)
+  }
+
+  private pieces(seg: string): [string, string][] {
+    return this.sh.allSegments ? this.sh.allSegments(seg) : shellMod.allSegments(seg)
+  }
+
+  /** rulebook_moments.command_arms: what a call that did not fail arms — any
+   *  segment, whatever joins it; a required one after it clears only when the
+   *  exit status vouches for it. */
+  private commandArms(seg: string, spec: Dict): string {
+    if (!commandArmed(spec)) return ''
+    const rx = req(spec, 'armed_by_command_rx')
+    const rq = req(spec, 'required_command_rx')
+    const parts = this.pieces(seg).map(([, p]) => shellMod.pyStrip(p))
+    let at = -1
+    parts.forEach((part, i) => {
+      if (this.sh.executes(part, rx)) at = i
+    })
+    if (at < 0) return ''
+    const vouched = new Set(this.sh.receiptSegments(seg, true).map((p) => shellMod.pyStrip(p)))
+    if (parts.slice(at + 1).some((p) => vouched.has(p) && this.sh.executes(p, rq))) return ''
+    return armText(parts[at]!, rx, (t) => this.unq(t))
+  }
+
+  /** rulebook_moments._runs_gated: the segment read from its own start and
+   *  with its separator before it, quoted spans blanked. */
+  private runsGated(sep: string, part: string, gated: string): boolean {
+    const text = this.unq(part)
+    return this.sh.commandFires(gated, shellMod.pyStrip(text, 'left'), null, '') ||
+      (sep !== '' && this.sh.commandFires(gated, sep + text, null, ''))
+  }
+
+  /** rulebook_moments.arms_before_gate: an arming segment, then the gated
+   *  one, with no required segment between, in this one call. */
+  private armsBeforeGate(seg: string, spec: Dict): string {
+    if (!commandArmed(spec)) return ''
+    const rx = req(spec, 'armed_by_command_rx')
+    const rq = req(spec, 'required_command_rx')
+    const gated = req(spec, 'gated_command_rx')
+    let pending = ''
+    for (const [sep, part] of this.pieces(seg)) {
+      if (pending && this.runsGated(sep, part, gated)) return pending
+      if (this.sh.executes(part, rx)) pending = armText(part, rx, (t) => this.unq(t))
+      else if (this.sh.executes(part, rq)) pending = ''
+    }
+    return ''
+  }
+}
+
+/** `command_armed(spec)`: arms on a command, with a pattern to arm on. */
+function commandArmed(spec: Dict): boolean {
+  return armedBy(spec).includes('command') && truthy(get(spec, 'armed_by_command_rx'))
+}
+
+/** `_arm_text(part, rx, unquoted)`: the matched text, whitespace folded, ≤60. */
+function armText(part: string, rx: string, unq: (t: string) => string): string {
+  const re = pyCompile(rx)
+  if (re === null) throw new Error(`unportable pattern: ${rx}`)
+  const m = re.exec(unq(part))
+  return cpSlice(pySplitWs(m ? m[0] : part).join(' '), 0, 60)
 }
 
 /** `spec[k]` as a pattern (KeyError / TypeError where Python raises). */

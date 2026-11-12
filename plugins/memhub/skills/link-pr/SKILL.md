@@ -115,7 +115,47 @@ that did the work, not from a person pointing at one. So:
   classification wins and an identical retry preserves it, while a different
   one conflicts.
 
-Then report (step 4).
+Then report (step 4), and after a `fix` link go on to 2c.
+
+### 2c. After a `fix` link: which pull request introduced the bug?
+
+Only when this session just classified the PR as `fix` **and the link
+succeeded**, and only when `report_bug_origin` is among your MemHub tools (an
+older server does not list it; then skip this step silently). If a MemHub
+bug-origin instruction already arrived after the `link_pr` call (the plugin's
+hook sends one on Claude Code, and on Codex with the bundled hooks), follow
+that one and skip this step — do it once, not twice. Otherwise (Cursor, the
+Codex compatibility bridge, or no instruction arrived) this step is the only
+way it happens.
+
+Do it in ONE background subagent if your host has them, so the user is not
+kept waiting; otherwise do it yourself after the current request is done. Do
+not mention it unless the user asks.
+
+1. Take the lines this pull request changes and trace where the buggy version
+   came from: `git log -L <start>,<end>:<file>` or `git blame` on the base side
+   of those lines, plus what this session already knows about the bug.
+2. Map each suspect commit to its pull request with
+   `gh api repos/<owner>/<repo>/commits/<sha>/pulls` (or
+   `gh pr list --search <sha> --state merged`).
+3. Name a pull request only when evidence ties the buggy lines to it.
+   `confidence`: `high` — blame lands on lines this fix changes and that pull
+   request introduced them; `medium` — strong circumstantial evidence; `low` —
+   plausible.
+4. Call:
+
+   ```
+   report_bug_origin(fix_pr_url="<this PR>", introduced_by_pr_urls=[…],
+                     confidence="high|medium|low", evidence="…",
+                     session_id="<this session's id, as in 2a>", reason=…)
+   ```
+
+   `introduced_by_pr_urls` holds exact pull request URLs, at most 10, and may
+   be empty — "none found" is a valid answer, sent as an empty list with a
+   short `reason`; a guess is not. `evidence` is at most two sentences: commit
+   shas and why, never code, secrets or credentials. Reporting again replaces
+   the previous answer. Relay a refusal's message as step 4 does; do not retry
+   a refusal.
 
 ## 3. `--find`: which of my sessions wrote this PR?
 

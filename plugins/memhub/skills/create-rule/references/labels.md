@@ -41,15 +41,15 @@ hypothesis can share the draft's title. Its `rule_evidence`
 `evidence` in step 5, verbatim; never pass `measured_at`, the server stamps it.
 
 A row with no `rule_evidence` was not measured, and the rule files without
-evidence — never write one by hand. That is an anchor rule, a prompt-armed
-ordering, a body whose count is only a ceiling (a `given` block,
+evidence — never write one by hand. That is an anchor rule, a prompt- or
+command-armed ordering, a body whose count is only a ceiling (a `given` block,
 `scope_paths` / `scope_exclude_paths`, an output rule's `command_rx` /
 `command_not_rx` / `content_not_rx`, an ordering's `path_rx` — filters the
 replay cannot apply), or a window outside 1–365 days (`--all`).
 
 The replay checks the pattern only: a `given` rule over-counts, an output
-rule replays `content_rx` alone, and a prompt or `anchor_recall` rule always
-shows 0 — report those to the person as **not measurable**, not "no lift".
+rule replays `content_rx` alone, and a prompt, `reply` or `anchor_recall`
+rule always shows 0 — report those to the person as **not measurable**, not "no lift".
 
 **The count belongs to the engine block it replayed:** when a later step
 changes the matcher or ordering (the precision check, step 3's shape, step

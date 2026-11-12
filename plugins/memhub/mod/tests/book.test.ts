@@ -19,6 +19,7 @@ import {
   REFRESH_MS,
   RELEASE_AFTER_FAILURES,
   shapeRules,
+  SLEEP_GAP_MS,
 } from '../book'
 import { Claims, StatusLine } from '../claims'
 import { BOOK, defaultRun, fakeCtx, fakeEngine, type FakeIo, fakeIo, ok, REPO, reply, ROOT, toHook } from './fakes'
@@ -292,6 +293,40 @@ describe('a refused $.http.fetch hands the rules to Python', () => {
     for (let i = 0; i < RELEASE_AFTER_FAILURES; i++) await book.refresh()
     expect(claims.list()).toEqual(['pre', 'post', 'prompt', 'session'])
     expect(io.statuses.at(-1)).toContain('team rules not refreshed')
+  })
+
+  test('one failure per wake across a night of sleep is not "in a row": the lanes stay claimed', async () => {
+    const { io, claims, book } = await loaded(() => {
+      throw BLIP
+    }, STALE)
+    let t = 1_700_000_000_000
+    io.now = async () => t
+    // a maintenance wake every ~16 minutes, one failed tick each, for twice the release count
+    for (let i = 0; i < 2 * RELEASE_AFTER_FAILURES; i++) {
+      t += 16 * 60_000
+      await book.refresh()
+    }
+    expect(claims.list()).toEqual(['pre', 'post', 'prompt', 'session'])
+    expect(io.statuses).not.toContain(REFRESH_GAVE_UP)
+    // awake again with the network still down: five failures a minute apart do release
+    for (let i = 0; i < RELEASE_AFTER_FAILURES; i++) {
+      t += 60_000
+      await book.refresh()
+    }
+    expect(claims.list()).toEqual([])
+    expect(io.statuses.at(-1)).toBe(REFRESH_GAVE_UP)
+  })
+
+  test('a fetch that hangs past the sleep gap still counts: the gap is measured to the attempt\'s start', async () => {
+    let t = 1_700_000_000_000
+    const { io, claims, book } = await loaded(() => {
+      t += SLEEP_GAP_MS + 60_000 // each attempt hangs longer than the gap, then fails
+      throw BLIP
+    }, STALE)
+    io.now = async () => t
+    for (let i = 0; i < RELEASE_AFTER_FAILURES; i++) await book.refresh()
+    expect(claims.list()).toEqual([])
+    expect(io.statuses.at(-1)).toBe(REFRESH_GAVE_UP)
   })
 
   test('a success in between resets the count', async () => {

@@ -58,13 +58,17 @@ reads from ``$.plugin`` (spec §3.2): ``memhub-staging`` is staging, ``memhub``
 is prod. An install whose manifest cannot be read has no environment and
 never steps aside: Python keeps serving, which is always safe.
 
-Only the four Rulebook lanes are claimable (``hook_entry.ROUTES`` marks them):
-``pre``/``post``/``prompt``/``session`` → ``rulebook_hook.py`` of the same
-name. The fire flush (``rulebook_hook.py flush``), capture, md_capture and the
-harness are never claimed — they stay the shipping path (spec §3.3, §4.7).
+Five lanes are claimable. The four Rulebook lanes (``hook_entry.ROUTES`` marks
+them): ``pre``/``post``/``prompt``/``session`` → ``rulebook_hook.py`` of the
+same name, whose hook steps aside. And ``drafter``, which no route skips:
+``harness_stop.py stop`` still judges the turn and asks ``claimed`` itself;
+claimed, it queues a flagged moment for the mod to spawn the fork instead of
+printing the hand-off line (harness_stop.py "mod drafter"). The fire flush
+(``rulebook_hook.py flush``), capture and md_capture are never claimed — they
+stay the shipping path (spec §3.3, §4.7).
 A list from a mod of 0.118.0-0.120.3, still loaded in a session started on
 one, also names ``harness``: that name is dropped like any unknown one, so its
-Rulebook lanes stay claimed and the harness's Stop runs in Python.
+Rulebook lanes stay claimed and the harness's Stop prints its line.
 
 Codex and Cursor never consult this: their hook configs call
 ``codex_hook_bridge.py`` / ``cursor_capture.cmd``, not ``hook_entry.py``, and
@@ -84,7 +88,7 @@ import os
 import time
 from typing import Mapping, Optional
 
-LANES = ("pre", "post", "prompt", "session")
+LANES = ("pre", "post", "prompt", "session", "drafter")
 ENV_VARS = {"staging": "MEMHUB_MOD_LANES_STAGING", "prod": "MEMHUB_MOD_LANES_PROD"}
 STAGING_NAME = "memhub-staging"
 PROD_NAME = "memhub"

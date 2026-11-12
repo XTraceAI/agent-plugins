@@ -129,6 +129,10 @@ _REASONS = {
     "unconfirmed_provenance": ("the session reached memory, but its captured "
                                "pull-request URL was not acknowledged"),
     "timeout": "the server stopped responding",
+    # A local rewind branch is held, not lost: its upload waits for the
+    # comparison's local registration (memhub-compare reconcile/open).
+    "rewind_lineage_pending": ("a rewind comparison's capture is waiting for its "
+                               "local run to be registered; run memhub-compare open"),
     # Ran out of its own clock, not a fault of the server or the credential.
     # Named separately because the alternative was reporting whatever error the
     # attempt BEFORE it produced, which pointed at a cause that had already been
@@ -144,6 +148,12 @@ _REASONS = {
     "payload_too_large": ("one turn was too large for the server to accept in "
                           "one piece"),
     "error": "the capture hook hit an unexpected error",
+    # A compressed Codex rollout (.jsonl.zst, which Codex writes for threads it
+    # is done with) and an interpreter that cannot read zstd: Python before
+    # 3.14 with no `zstd` tool on PATH — /usr/bin/python3 on macOS is 3.9.
+    "zstd_unavailable": ("this session's Codex rollout is zstd-compressed and "
+                         "this machine's python3 cannot read it (install the "
+                         "`zstd` tool, e.g. `brew install zstd`)"),
     # Not a credential problem, so the default "/memhub:login --status" advice
     # would send someone to inspect the one thing that is definitely fine. Gets
     # its own remedy in `_message`. Written by codex_hook_bridge when it cannot
@@ -680,6 +690,51 @@ def _already_warned(session_id: str, signature: str) -> bool:
     return False
 
 
+def agent_report(state_dir: Path | None = None) -> list[dict]:
+    """Per-root agent capture: found, sent, running, pending and failed, from
+    each root's state (the ``agents_*`` fields the Codex flusher writes) and
+    its sent cache (``<root>.agents``). Newest first; a root that never
+    spawned an agent is left out. Agent failures are kept out of
+    ``last_error`` on purpose, so they never raise the session banner — this
+    report is where they are seen."""
+    state_dir = STATE_DIR if state_dir is None else state_dir
+
+    def load(path: Path):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    try:
+        files = sorted([*state_dir.glob("*.agents"), *state_dir.glob("*.json")],
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return []
+    rows, seen = [], set()
+    for path in files:
+        root = path.name.rsplit(".", 1)[0]
+        if root in seen or root.endswith(".sessionflush"):
+            continue
+        state = load(state_dir / f"{root}.json")
+        sent = load(state_dir / f"{root}.agents")
+        if "agents_found" not in state and not sent:
+            continue
+        seen.add(root)
+        rows.append({
+            "session": root,
+            "found": state.get("agents_found", len(sent)),
+            "sent": state.get("agents_sent", len(sent)),
+            "running": len(state.get("agents_running") or []),
+            "pending": state.get("agents_pending") or 0,
+            "failed": list(state.get("agents_failed") or []),
+            "checked_at": state.get("agents_checked_at"),
+        })
+        if len(rows) >= _MAX_STATE_FILES:
+            break
+    return rows
+
+
 def _configure(argv: list[str]) -> None:
     """`--host claude|codex` picks the flush state to judge; `--plugin-root`
     names the package when the host exports no CLAUDE_PLUGIN_ROOT. Unknown
@@ -692,12 +747,33 @@ def _configure(argv: list[str]) -> None:
             _PLUGIN_ROOT_ARG = value
 
 
+def _codex_bridge_upkeep() -> str | None:
+    """Refresh the copied Codex hook runner and name any MemHub hook the
+    install lacks (setup_codex_hooks.upkeep). It runs here because this script
+    is what the OLD runner still starts at SessionStart, from the newest
+    plugin — the one place new code reaches a stale install."""
+    try:
+        import setup_codex_hooks as sch  # noqa: PLC0415 — stdlib, beside this file
+        return sch.upkeep(sch._codex_home(None))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def main() -> int:
     # Capture switched off on purpose is not a fault. Checked first so the
     # opt-out is genuinely free and genuinely silent.
     if os.environ.get("MEMHUB_TURN_FLUSH", "").strip().lower() in {"0", "off", "false"}:
+        # Capture is off, the rulebook is not: a stale Codex runner still runs
+        # its rules, so it is refreshed all the same — silently.
+        if "codex" in sys.argv:
+            _codex_bridge_upkeep()
         return 0
     _configure(sys.argv[1:])
+    if "--agents" in sys.argv[1:]:
+        # A report for a person or a skill, not the SessionStart hook: the
+        # agents each root spawned and how far their capture got.
+        print(json.dumps(agent_report(), indent=1))
+        return 0
 
     raw = sys.stdin.read()
     try:
@@ -723,7 +799,8 @@ def main() -> int:
     rulebook = _rulebook_problem()
     health = _message(host, token_problem, failure, rulebook)
     nudge = None if (health or token_problem) else _onboard_nudge(session_id)
-    message = "\n".join(part for part in (upgrade, health, nudge) if part)
+    bridge = _codex_bridge_upkeep() if "codex" in sys.argv else None
+    message = "\n".join(part for part in (upgrade, health, bridge, nudge) if part)
     if not message:
         return 0
 
@@ -733,7 +810,7 @@ def main() -> int:
     # should be shown once; only a genuinely DIFFERENT problem should interrupt
     # again.
     signature = (f"{upgrade or ''}|{host}|{token_problem or ''}|{failure[0] if failure else ''}"
-                 f"|{rulebook[0] if rulebook else ''}|{'nudge' if nudge else ''}")
+                 f"|{rulebook[0] if rulebook else ''}|{'nudge' if nudge else ''}|{bridge or ''}")
     if _already_warned(session_id, signature):
         return 0
 

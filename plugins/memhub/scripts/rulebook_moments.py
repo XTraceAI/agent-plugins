@@ -18,6 +18,8 @@ its atomic writer) is passed in; nothing here imports the hook.
 * PostToolUseFailure: the host's `error` as the post lane's result text and
   response, so output rules fire on a failed command and a failure is never
   an ordering receipt.
+* command-armed ordering rules (`armed_by_events: ["command"]`): what a
+  successful Bash call arms, and the gate's words when it is collected.
 
 Stdlib only; every function fails open.
 """
@@ -27,6 +29,7 @@ import hashlib
 import json
 import os
 import re
+import time
 
 PROBE_CACHE_TTL_S = 600      # a cached base answer is trusted this long at most
 PROMPT_BLOCK_AFTER_S = 600   # prompt lane: block on a fetch only past this; younger books refresh detached
@@ -47,6 +50,112 @@ def result_text(resp):
                  if isinstance((v := resp.get(k)), str) and v]
         return "\n".join(parts) if parts else json.dumps(resp, ensure_ascii=False)
     return str(resp)
+
+
+# ── Codex: what its hook payloads leave out ─────────────────────────────────
+# Codex's PostToolUse `tool_response` for a shell call is the command's bare
+# output: no exit code, no error flag (seen on codex-cli 0.163). `bash_ok` then
+# has only its text proxy, so a failed `git mv` reads as green and arms a
+# command rule, and a gate receipt (strict: wants an explicit 0) never
+# discharges — every gate ordering rule stays armed for the session. The
+# rollout the payload names records the same call, keyed by the payload's
+# `tool_use_id`, with its `exit_code` — and was found already written when the
+# hook ran (52 of 53 calls checked live). Not always: on CI (2026-10-19) a
+# failed `git mv` still armed a gate, the line evidently landing just after the
+# hook read. So a Codex whose rollout does write `CommandExecution` items gets
+# a short wait for this call's; one that writes none (0.146) is never waited on.
+_CODEX_TAIL_BYTES = 4 * 1024 * 1024
+_CODEX_CHUNK = 64 * 1024
+_CODEX_WAIT_S = 0.6
+_CODEX_POLL_S = 0.05
+
+
+def codex_resp(data, resp, *, sleep=time.sleep, clock=time.monotonic):
+    """`resp` with the exit code Codex left out, as `{"output", "exit_code"}`;
+    `resp` unchanged when it is not a bare string, the transcript is not a
+    Codex rollout, or the call's `CommandExecution` is not found. Only the
+    rollout is trusted: the output is the command's own text, and a line in it
+    saying "Exit code: 0" is no receipt. Never raises."""
+    if not isinstance(resp, str):
+        return resp
+    try:
+        tp, cid = data.get("transcript_path"), data.get("tool_use_id")
+        if not (isinstance(tp, str) and isinstance(cid, str) and cid
+                and os.path.basename(tp).startswith("rollout-")):
+            return resp
+        deadline, since = clock() + _CODEX_WAIT_S, 0
+        while True:
+            code, writes_them, since = _codex_scan(tp, cid, since)
+            if code is not None:
+                return {"output": resp, "exit_code": code}
+            if not writes_them or clock() >= deadline:
+                return resp
+            sleep(_CODEX_POLL_S)
+    except Exception:
+        return resp
+
+
+def _codex_scan(tp, cid, since=0):
+    """(this call's exit code or None, whether this Codex writes
+    `CommandExecution` items, where the next scan starts). A first scan reads
+    the tail newest first; a later one only the whole lines written since."""
+    key, seen = cid.encode(), since > 0
+    with open(tp, "rb") as f:
+        # Newest first, a chunk at a time: the call was just written, so
+        # a hit is near the end and a long rollout is not read whole.
+        end = f.seek(0, os.SEEK_END)
+        floor, carry = max(since, end - _CODEX_TAIL_BYTES), b""
+        f.seek(max(floor, end - _CODEX_CHUNK))
+        tail = f.read(end - max(floor, end - _CODEX_CHUNK))
+        cut = tail.rfind(b"\n")
+        # Only whole lines are read: a line still being written waits for the
+        # next scan rather than being passed over for good.
+        whole = end - len(tail) + cut + 1 if cut >= 0 else (floor if since else end)
+        end = whole
+        while end > floor:
+            start = max(floor, end - _CODEX_CHUNK)
+            f.seek(start)
+            block = f.read(end - start) + carry
+            lines = block.split(b"\n")
+            carry = lines[0] if start > floor else b""
+            for raw in reversed(lines[1:] if start > floor else lines):
+                if b'"CommandExecution"' in raw:
+                    seen = True
+                code = _codex_exit(raw, key, cid)
+                if code is not None:
+                    return code, True, whole
+            end = start
+    return None, seen, max(whole, since)
+
+
+def _codex_exit(raw, key, cid):
+    if key not in raw or b"CommandExecution" not in raw:
+        return None
+    try:
+        p = json.loads(raw).get("payload") or {}
+    except ValueError:
+        return None
+    item = p.get("item") if isinstance(p.get("item"), dict) else {}
+    code = item.get("exit_code")
+    if (item.get("type") == "CommandExecution" and item.get("id") == cid
+            and isinstance(code, int) and not isinstance(code, bool)):
+        return code
+    return None
+
+
+def codex_prompt(p):
+    """A rollout `response_item` payload's prompt text if it is a message the
+    person typed, else None: Codex also writes AGENTS.md and environment
+    context as `user` messages (readers.codex.clean_user_text strips them)."""
+    if not (isinstance(p, dict) and p.get("type") == "message" and p.get("role") == "user"):
+        return None
+    text = "\n".join(str(c.get("text") or "") for c in p.get("content") or []
+                     if isinstance(c, dict))
+    try:
+        from readers.codex import clean_user_text  # noqa: PLC0415 — beside this file
+    except Exception:
+        return None
+    return clean_user_text(text)
 
 
 def bash_ok(resp, *, strict=False):
@@ -389,7 +498,8 @@ def user_turns_of(tp, max_bytes, chars, keep):
     """What the person typed this session, oldest first. A transcript `user`
     record is also how tool results and injected context arrive, so this keeps
     only real prompts: no `toolUseResult`, no `tool_result` block, no `isMeta`
-    row, no compaction summary. A substring pre-filter keeps it to one
+    row, no compaction summary. A Codex rollout's prompts are its `user`
+    messages less injected context (`codex_prompt`). A substring pre-filter keeps it to one
     json.loads per candidate line. None when there is no transcript — and
     None never satisfies a `user` predicate."""
     try:
@@ -405,6 +515,11 @@ def user_turns_of(tp, max_bytes, chars, keep):
                 try:
                     rec = json.loads(raw)
                 except Exception:
+                    continue
+                if rec.get("type") == "response_item":     # a Codex rollout
+                    text = codex_prompt(rec.get("payload"))
+                    if text and text.strip():
+                        turns.append(text.strip()[:chars])
                     continue
                 if rec.get("type") != "user" or rec.get("isMeta") \
                         or rec.get("isCompactSummary") or "toolUseResult" in rec:
@@ -425,3 +540,129 @@ def user_turns_of(tp, max_bytes, chars, keep):
         return turns[-keep:]
     except Exception:
         return None
+
+
+# ── command-armed ordering rules ────────────────────────────────────────────
+#
+# `armed_by_events: ["command"]` + `armed_by_command_rx`: a Bash command that
+# matches arms the obligation the way an edit does (the per-checkout count in
+# `OrderingEngine`), `required_command_rx` clears it, `gated_command_rx` is
+# where it is collected. "You ran `git mv`; run the tests before you push."
+# The required command clears only on a passing run (exit 0): `rg`/`grep`
+# exit 1 on a CLEAN search, so "grep for the old name" cannot be the required
+# command — it would clear only when it finds leftovers. The hook passes its own shell helpers in (`executes`,
+# `receipt_segments`, `unquoted`, `command_fires`), so the arming reads a
+# command exactly as the receipt does: heredoc bodies dropped, quoted spans
+# blanked, leading `FOO=1` assignments ignored, a `!`-negated segment never.
+
+_SEP_RX = re.compile(r"&&|\|\||;|\n|\||(?<![>&])&(?![>&])")   # rulebook_shell._SEPARATOR_RX
+
+
+def command_armed(spec):
+    """Does this ordering block arm on a command?"""
+    return isinstance(spec, dict) and "command" in tuple(
+        spec.get("armed_by_events", ("edit", "write"))) and bool(spec.get("armed_by_command_rx"))
+
+
+def _arm_text(part, rx, unquoted):
+    m = re.search(rx, unquoted(part))
+    return " ".join((m.group(0) if m else part).split())[:60]
+
+
+def _pieces(seg):
+    """Every segment of `seg`, split outside quotes on any separator, as
+    (separator before it, segment) — "" before the first."""
+    blank = _blank(seg)
+    out, pos, sep = [], 0, ""
+    for m in _SEP_RX.finditer(blank):
+        out.append((sep, seg[pos:m.start()]))
+        pos, sep = m.end(), m.group(0)
+    out.append((sep, seg[pos:]))
+    return [(j, p) for j, p in out if p.strip()]
+
+
+def command_arms(seg, spec, *, executes, receipt_segments, unquoted, **_):
+    """What a Bash call that did not fail arms: the text of the last segment
+    that runs `armed_by_command_rx`, or "".
+
+    ANY segment arms, whatever joins it: `git rm -r old || true` and
+    `git mv a b; git status` succeed on the LAST segment's status, and the
+    move most likely ran — reading only the segments the exit status vouches
+    for skipped the obligation in exactly the case it exists for. A move that
+    failed behind `|| true` arms too: that over-arms (one extra required run),
+    the safe direction, and the same reading the pre lane gives `;`
+    (`arms_before_gate`). A call that FAILED arms nothing (the caller's `ran`).
+
+    A required command AFTER the arming segment leaves nothing owed only when
+    the exit status vouches for it (`receipt_segments(whole_chain=True)`:
+    `git mv a b && rg a`, or `git mv a b; rg a` with `rg` last)."""
+    if not command_armed(spec):
+        return ""
+    rx, req = spec["armed_by_command_rx"], spec["required_command_rx"]
+    parts = [p.strip() for _, p in _pieces(seg)]
+    at = None
+    for i, part in enumerate(parts):
+        if executes(part, rx):
+            at = i
+    if at is None:
+        return ""
+    vouched = {p.strip() for p in receipt_segments(seg, whole_chain=True)}
+    if any(p in vouched and executes(p, req) for p in parts[at + 1:]):
+        return ""
+    return _arm_text(parts[at], rx, unquoted)
+
+
+def _runs_gated(sep, part, gated, unquoted, command_fires):
+    """Does this one segment run the gated command? Read the way the whole-call
+    gate (`is_gate`) reads it: from the segment's own start, leading space
+    dropped, and with its separator before it — so either branch of a
+    command-position pattern like `(?:^|[;&|(]\\s*)git\\s+push` matches. Quoted spans are blanked
+    (`unquoted`): `echo "git push"` and `git commit -m 'git push later'`
+    mention the gated command, they do not run it."""
+    text = unquoted(part)
+    return command_fires(gated, text.lstrip(), flags=0) or \
+        bool(sep) and command_fires(gated, sep + text, flags=0)
+
+
+def arms_before_gate(seg, spec, *, executes, unquoted, command_fires, **_):
+    """In the PRE lane: does this one call run an arming command and then the
+    gated one, with no required command between (`git mv a b && git push`)?
+    The arming has not happened yet, so the count cannot see it; without this
+    the push in the same call would go through. Every joiner counts — after a
+    `;` the gated command runs whether or not the arming one passed, which
+    over-gates (the safe direction). Returns the arming text, or ""."""
+    if not command_armed(spec):
+        return ""
+    rx, req, gated = (spec["armed_by_command_rx"], spec["required_command_rx"],
+                      spec["gated_command_rx"])
+    pending = ""
+    for sep, part in _pieces(seg):
+        if pending and _runs_gated(sep, part, gated, unquoted, command_fires):
+            return pending
+        if executes(part, rx):
+            pending = _arm_text(part, rx, unquoted)
+        elif executes(part, req):
+            pending = ""
+    return ""
+
+
+def _blank(text):
+    from rulebook_shell import blank_quoted  # noqa: PLC0415 — beside this file
+    return blank_quoted(text)
+
+
+def command_gate_msg(slot, name, seg=None, spec=None, **kw):
+    """The gate's words for a command-armed obligation.
+
+    Without `seg`: the count already reached `min_edits` and the last arming
+    was a command (`slot["last_cmd"]`). With it: the count has not, and this
+    call would arm and then run the gated command (`arms_before_gate`) — ""
+    when it does not, or when one more arming still falls short."""
+    if seg is None:
+        return (f"{slot['count']} change(s) since the last passing '{name}' "
+                f"(last: ran `{slot['last_cmd']}`). Run it first.")
+    now = arms_before_gate(seg, spec, **kw)
+    if not now or slot["count"] + 1 < int(spec.get("min_edits", 1)):
+        return ""
+    return (f"this call runs `{now}` before the gated command, with no passing "
+            f"'{name}' after it. Run it first.")

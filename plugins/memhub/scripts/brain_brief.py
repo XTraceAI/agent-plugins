@@ -173,6 +173,25 @@ def _session_id(payload: dict) -> str:
     return str(payload.get("session_id") or "").strip()
 
 
+def _conversation_id(payload: dict, host: str | None = None) -> str:
+    """This session's id the way capture sends it, for ``save_artifact``'s
+    ``session_id``: bare on Claude Code, ``codex-<id>`` on Codex (the bridge
+    runs this same brief), ``cursor-<id>`` on Cursor (``cursor_capture.py``
+    runs it with ``--host cursor``: nothing in a Cursor payload names the
+    host). Lazy imports: only a repo with a room gets here."""
+    sid = _session_id(payload)
+    if not sid:
+        return ""
+    try:
+        import claude_hook_guard
+        import pr_link
+        if host is None:
+            host = "codex" if claude_hook_guard.is_codex(payload) else "claude"
+        return pr_link.conversation_id_for(host, sid) or ""
+    except Exception:  # noqa: BLE001 — a missing line, never a missing brief
+        return ""
+
+
 def _served(session_id: str) -> list[str]:
     return served_state.load_ids(served_state.STATE_DIR, session_id)
 
@@ -420,7 +439,7 @@ def _cached_pointer_section(cache: dict, session_id: str) -> list[str]:
 
 # ── brief: SessionStart, stdlib only, no network ───────────────────────────
 
-def cmd_brief(payload: dict) -> int:
+def cmd_brief(payload: dict, host: str | None = None) -> int:
     cwd = _cwd_from(payload)
     room = room_map.read_room(cwd)
     if not room:
@@ -449,6 +468,12 @@ def cmd_brief(payload: dict) -> int:
         "decision, so what you write is findable where the next session will "
         "look. Another brain is still reachable by naming it explicitly.",
     ]
+    conv_id = _conversation_id(payload, host)
+    if conv_id:
+        head.append(
+            f"When you call `save_artifact`, also pass `session_id: \"{conv_id}\"` "
+            "— this session — so the artifact shows on this session's Contents "
+            "tab in MemHub Studio (`save_artifact.py` does this itself).")
     cached = _read_json(_cache_path(env, brain_id))
     map_lines = _render_map(brain_id, str(cached.get("overview") or ""))
 
@@ -758,6 +783,17 @@ def cmd_refresh(payload: dict) -> int:
     return 0
 
 
+def _host_arg(args: list[str]) -> str | None:
+    """`--host claude|codex|cursor`, as the other hook scripts take it; None
+    lets the payload say (Claude Code passes nothing, Codex is recognised)."""
+    for i, arg in enumerate(args):
+        value = args[i + 1] if arg == "--host" and i + 1 < len(args) else (
+            arg.split("=", 1)[1] if arg.startswith("--host=") else None)
+        if value in ("claude", "codex", "cursor"):
+            return value
+    return None
+
+
 def main() -> int:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "brief"
     if cmd == "pointers":
@@ -776,7 +812,7 @@ def main() -> int:
         return cmd_refresh(payload)
     if cmd == "prompt":
         return cmd_prompt(payload)
-    return cmd_brief(payload)
+    return cmd_brief(payload, host=_host_arg(sys.argv[2:]))
 
 
 if __name__ == "__main__":

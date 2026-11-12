@@ -2,7 +2,7 @@
   "name": "memhub",
   "displayName": "XTrace MemHub",
   "description": "Team memory for Claude Code. Your sessions are saved automatically, so past work is searchable later. Your team's rules show up while you work, at the moment they apply. Skills let you search what the team knows, save a document, import a session, hand work to a teammate, link sessions to pull requests, write rules, work from specs, and watch a pull request through review.",
-  "version": "0.133.0",
+  "version": "0.151.0",
   "license": "Apache-2.0",
   "hooks": ["./hooks/claude-hooks.json"],
   "types": "./types/index.d.ts",
@@ -29,7 +29,7 @@
     "harnessDrafting": {
       "type": "boolean",
       "title": "Draft team rules from corrections",
-      "description": "When a turn looks like a correction worth keeping, the Stop hook asks Claude to start a background fork of the session, which drafts a team rule and files it as proposed (nothing is active until a reviewer activates it). The fork runs on your own model usage. Turn this off to draft nothing: the Stop hook then judges no turn.",
+      "description": "When a turn looks like a correction worth keeping, a background fork of the session drafts a team rule and files it as proposed (nothing is active until a reviewer activates it). In an interactive session the plugin starts the fork itself, unseen; otherwise the Stop hook asks Claude to start it. The fork runs on your own model usage. Turn this off to draft nothing: the Stop hook then judges no turn.",
       "default": true,
       "required": false
     },

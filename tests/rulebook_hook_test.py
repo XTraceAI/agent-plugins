@@ -1988,13 +1988,12 @@ def main() -> int:
 
         rc, out = run("pre", dict(base, tool_input={"command": "advisory-cmd"}), genv)
         j = outj(out)
-        check("advisory: the user's first line is the disclosure, the branded detail beneath it",
-              j.get("systemMessage", "").startswith("📏 Rule fired: ")
-              and "\n   XTrace ▸ [adv] " in j.get("systemMessage", "")
-              and "Advisory text" in j["systemMessage"], out)
-        check("advisory: agent context header stays branded and carries the echo instruction",
-              "XTrace Rulebook" in ctx(out) and "📏 Rule fired: " in ctx(out)
-              and "Begin your next reply" in ctx(out), ctx(out))
+        check("advisory: nothing is shown to the user",
+              "systemMessage" not in j, out)
+        check("advisory: agent context header stays branded, carries the rule and the credit note, no echo",
+              "XTrace Rulebook" in ctx(out) and "Advisory text" in ctx(out)
+              and "Rule fired: " not in ctx(out) and "Begin your next reply" not in ctx(out)
+              and "team rule from the MemHub Rulebook" in ctx(out), ctx(out))
         check("advisory: never blocks", "permissionDecision" not in j["hookSpecificOutput"])
 
         push = dict(base, tool_input={"command": "git push --force origin main"})
@@ -2387,6 +2386,7 @@ def main() -> int:
     diff_base_checks()
     spec_pending_probe_checks()
     armed_lane_checks()
+    command_armed_checks()
     min_hook_version_checks()
     prompt_lane_checks()
     edit_added_checks()
@@ -2404,6 +2404,146 @@ def main() -> int:
         print("all rulebook hook checks passed")
     return 1 if FAILURES else 0
 
+
+
+def command_armed_checks() -> None:
+    """`armed_by_events: ["command"]`: a Bash command matching
+    `armed_by_command_rx` arms the obligation — on PostToolUse, and only when
+    the call did not fail — `required_command_rx` clears it and
+    `gated_command_rx` is where it is collected. Driven through the real hook
+    process, the way Claude Code and Codex call it."""
+    with tempfile.TemporaryDirectory() as td:
+        repo = os.path.join(td, "cmdrepo")
+        os.makedirs(repo)
+        assert _git(repo, "-c", "init.defaultBranch=main", "init", "-q").returncode == 0
+        rule = {
+            "id": "tests-after-move", "on": "ordering", "repo_scope": "any",
+            "mode": "gate", "_label": "tests-after-move",
+            "ordering": {"armed_by_events": ["command"],
+                         "armed_by_command_rx": r"\bgit\s+(rm|mv)\b",
+                         "required_command_rx": r"\bpytest\b",
+                         "gated_command_rx": r"\bgit\s+push\b",
+                         "display_name": "the tests"},
+            "text": "After git mv/rm, run the tests before you push", "why": "w"}
+        # The same obligation with a command-position gated pattern, the style
+        # app/services/rulebook/spec_rule.py writes.
+        anchored = dict(rule, id="tests-after-move-anchored", _label="tests-after-move-anchored",
+                        ordering=dict(rule["ordering"],
+                                      gated_command_rx=r"(?:^|[;&|(]\s*)git\s+push\b"))
+        seed_book(td, "cmdrepo", [rule])
+        n = [0]
+
+        def env():
+            # a fresh state dir per scenario: the obligation is per checkout
+            n[0] += 1
+            d = os.path.join(td, f"base{n[0]}")
+            os.makedirs(d)
+            shutil.copytree(os.path.join(td, "book"), os.path.join(d, "book"))
+            return {"MEMHUB_RULEBOOK_BASE": d, "MEMHUB_RULEBOOK_FETCH": "0"}
+
+        def pre(e, command):
+            n[0] += 1
+            return run("pre", {"session_id": "c1", "cwd": repo, "tool_name": "Bash",
+                               "tool_use_id": f"c{n[0]}",
+                               "tool_input": {"command": command}}, e)[1]
+
+        def post(e, command, resp=None, failure=None):
+            n[0] += 1
+            payload = {"session_id": "c1", "cwd": repo, "tool_name": "Bash",
+                       "tool_use_id": f"c{n[0]}", "tool_input": {"command": command},
+                       "tool_response": resp if resp is not None else {"stdout": "", "exit_code": 0}}
+            if failure is not None:
+                payload.update(hook_event_name="PostToolUseFailure", error=failure)
+                payload.pop("tool_response")
+            run("post", payload, e)
+
+        e = env()
+        out = pre(e, "git push")
+        check("command-armed: nothing is armed before the arming command runs", out.strip() == "", out)
+        post(e, "git mv old.py new.py")
+        out = pre(e, "git push origin HEAD")
+        check("command-armed: a successful `git mv` arms the gate", "BLOCKED" in ctx(out), out)
+        check("command-armed: the reason names the arming command",
+              "ran `git mv`" in ctx(out), out)
+        check("command-armed: the fire is disclosed on systemMessage",
+              "Rule fired: tests-after-move" in (json.loads(out).get("systemMessage") or ""), out)
+        ledger = [os.path.join(dp, f) for dp, _, fs in os.walk(e["MEMHUB_RULEBOOK_BASE"])
+                  for f in fs if "ledger" in dp or "ledger" in f]
+        check("command-armed: the fire is written to the local ledger",
+              any("tests-after-move" in open(x, encoding="utf-8", errors="replace").read()
+                  for x in ledger), str(ledger))
+        post(e, "pytest -q", failure="Exit code 1\n1 failed, 3 passed")
+        out = pre(e, "git push")
+        check("command-armed: a FAILED required command (exit 1) does not clear it",
+              "BLOCKED" in ctx(out), out)
+        post(e, "pytest -q", resp={"stdout": "3 passed", "exit_code": 0})
+        out = pre(e, "git push")
+        check("command-armed: a passing required command clears it", out.strip() == "", out)
+
+        e = env()
+        post(e, "git rm gone.py", resp={"stdout": ""})      # Claude Code: no exit_code on success
+        out = pre(e, "git push")
+        check("command-armed: a success without an exit code (Claude Code's payload) arms",
+              "BLOCKED" in ctx(out), out)
+
+        e = env()
+        post(e, "git rm missing.py",
+             failure="Exit code 128\nfatal: pathspec 'missing.py' did not match any files")
+        out = pre(e, "git push")
+        check("command-armed: a FAILED arming command (PostToolUseFailure) arms nothing",
+              out.strip() == "", out)
+
+        e = env()
+        post(e, "git rm missing.py", resp={"stdout": "", "exit_code": 1})
+        out = pre(e, "git push")
+        check("command-armed: a non-zero exit code arms nothing", out.strip() == "", out)
+
+        e = env()
+        for mention in ("echo 'git mv a b'", "git commit -m 'git rm the old file'",
+                        "true # git mv a b", "cat <<'EOF' > notes.txt\ngit rm x\nEOF"):
+            post(e, mention)
+        out = pre(e, "git push")
+        check("command-armed: a quoted, commented or heredoc mention arms nothing",
+              out.strip() == "", out)
+
+        for cmd in ("git mv a.py b.py; ls", "git rm -r old || true", "git mv a.py b.py | cat"):
+            e = env()
+            post(e, cmd, resp={"stdout": ""})
+            out = pre(e, "git push")
+            check(f"command-armed: `{cmd}` that did not fail arms, though its exit status "
+                  "is not the move's", "BLOCKED" in ctx(out), out)
+
+        e = env()
+        post(e, "git mv a.py b.py; pytest -q; ls")
+        out = pre(e, "git push")
+        check("command-armed: a required command the exit status does not vouch for "
+              "clears nothing", "BLOCKED" in ctx(out), out)
+
+        e = env()
+        post(e, "git mv a.py b.py && pytest -q")
+        out = pre(e, "git push")
+        check("command-armed: arming then the required command in one chain leaves "
+              "nothing owed", out.strip() == "", out)
+
+        e = env()
+        out = pre(e, "git mv a.py b.py && git push")
+        check("command-armed: one call that arms and then pushes is gated",
+              "BLOCKED" in ctx(out) and "this call runs `git mv`" in ctx(out), out)
+        out = pre(e, "git mv a.py b.py && pytest -q && git push")
+        check("command-armed: ... unless the required command runs between them",
+              out.strip() == "", out)
+        for cmd in ("git mv a.py b.py && git commit -m 'git push later'",
+                    'git mv a.py b.py && echo "git push"'):
+            out = pre(e, cmd)
+            check(f"command-armed: `{cmd}` only MENTIONS the gated command", out.strip() == "", out)
+
+        # A command-position gated pattern sees the push after the separator.
+        e = env()
+        seed_book(e["MEMHUB_RULEBOOK_BASE"], "cmdrepo", [anchored])   # this scenario's book only
+        for cmd in ("git mv a.py b.py && git push", "git mv a.py b.py; git push"):
+            out = pre(e, cmd)
+            check(f"command-armed: `{cmd}` is gated under a command-position pattern",
+                  "BLOCKED" in ctx(out) and "this call runs `git mv`" in ctx(out), out)
 
 
 def armed_lane_checks() -> None:
@@ -3612,9 +3752,10 @@ def prompt_lane_checks() -> None:
         check("prompt: a wrapped wake-up fires the rule, on the UserPromptSubmit envelope",
               hso.get("hookEventName") == "UserPromptSubmit"
               and "[A loop tick says what it is for]" in hso.get("additionalContext", ""), out)
-        check("prompt: …and discloses it on both channels",
-              "📏 Rule fired: A loop tick says what it is for" in doc.get("systemMessage", "")
-              and "📏 Rule fired: A loop tick says what it is for" in hso.get("additionalContext", ""),
+        check("prompt: …shown to nobody, with the credit note for the agent",
+              "systemMessage" not in doc
+              and "Rule fired:" not in hso.get("additionalContext", "")
+              and "team rule from the MemHub Rulebook" in hso.get("additionalContext", ""),
               out)
         check("prompt: …and never denies anything", "permissionDecision" not in hso, out)
         rows = fires("loop-tick")
@@ -3633,7 +3774,8 @@ def prompt_lane_checks() -> None:
         out = prompt("p4", "please deploy now")
         doc = json.loads(out) if out.strip() else {}
         check("prompt: a gate-mode prompt rule advises and never blocks",
-              "Rule fired: prompt-gate" in doc.get("systemMessage", "")
+              "[prompt-gate]" in (doc.get("hookSpecificOutput") or {}).get("additionalContext", "")
+              and "systemMessage" not in doc
               and "permissionDecision" not in (doc.get("hookSpecificOutput") or {})
               and "BLOCKED" not in out
               and [x["mode"] for x in fires("prompt-gate")] == ["advise"], out)

@@ -3,7 +3,8 @@
 // registration order, so:
 //
 //   shell (session.start: claims → book → remote switch → session lane) → rulebook lanes
-//   (tool.call pre+post, prompt.submit) → turn.complete (ledger) → companion
+//   (tool.call pre+post, prompt.submit) → turn.complete (ledger, drafter) → agent
+//   message board → companion
 //
 // The companion registers LAST, so its tool.call hook is innermost and sees
 // the rulebook's answer.
@@ -20,13 +21,19 @@ import type { FireNote, LaneName } from '../types'
 // plugin's userConfig options (its `companion` switch): it reads fires from
 // `$.state` and polls proposals over `$.http.fetch` (`register(on, ctx, options)`).
 import { register as registerCompanion } from '../companion/register'
+// The agent message board (MemHub-Backend agent-message-board-spec §5): a
+// teammate's message above the prompt with Run / Dismiss. Registered just
+// before the companion, so its band row sits above the companion's.
+import { register as registerBoard } from '../board/register'
 import { Act } from './act'
 import { Book, RemoteSwitch } from './book'
 import { Claims, StatusLine } from './claims'
 import { ACTIVE, type Active, type Ctx, type Env, envOf, type Io, lastJson, makeCtx, MOD_CLI, rootOf } from './ctx'
 import type { Engine, EngineEnv, EngineIO, FileStat, HookRule, PathsInfo, TurnMessage } from './engine'
+import { Drafter } from './drafter'
 import { createEngine } from './engine/engine'
 import { Lanes, TOOL_RX } from './lanes'
+import { isOff, redactToolResult } from './redact'
 import { forwardTestCovers } from './redirect'
 
 /**
@@ -431,12 +438,15 @@ const NO_ENGINE: Engine = {
 export function register(on: On, options: PluginOptions = {}) {
   const ctx = lateCtx()
   let shell: Shell | undefined
+  // The harness's rule-drafting fork (mod/drafter.ts): lane `drafter`.
+  let drafter: Drafter | undefined
 
   // ── shell: claims → book → remote switch → session lane ───────────────────
   on('session.start', EVERY_SESSION, async ($: EngineInterface, e, next) => {
     // The shell failing to start must never cost the companion its start:
     // caught here, and the shell stays off (no claim, so Python serves).
     shell = undefined
+    drafter = undefined
     try {
       const io = ioOf($)
       const env = envOf(io.pluginName)
@@ -446,6 +456,15 @@ export function register(on: On, options: PluginOptions = {}) {
         // A fresh process has no `lanes` in $.state; a hot reload keeps it.
         const pastStartup = (await io.getState('lanes')).version > 0
         shell = await boot(io, real, createEngine, { cwd: e.cwd, pastStartup, extras: extrasOf($) })
+        // Claimed apart from the Rulebook's lanes: the drafter needs no book.
+        const d = new Drafter(io, real.root, shell.claims, async ({ prompt, description }) => {
+          const r = await $.agent.spawn({ subagentType: 'fork', prompt, description })
+          return r.deny !== undefined ? { deny: r.deny } : { agentId: r.agentId }
+        })
+        await d.start({ isInteractive: e.isInteractive === true }).then(
+          () => { drafter = d },
+          err => io.debug(`MemHub harness: drafter not claimed — ${err instanceof Error ? err.message : String(err)}`),
+        )
         // The companion's status strip reads the book and the allowlist off
         // ctx once the load has settled: draw the band again then.
         void shell.ready.then(() => {
@@ -460,6 +479,22 @@ export function register(on: On, options: PluginOptions = {}) {
       shell = undefined
     }
     return next(e)
+  }).catch(($, e, next) => next(e))
+
+  // ── credentials out of a command's output (redact.ts) ─────────────────────
+  // Registered BEFORE the rulebook lanes, so it is the outer hook: the lanes'
+  // result rules read the output as the command gave it, and what leaves this
+  // module for the screen, the model and the transcript is the redacted one.
+  // Needs no book, no claim and no sign-in. Any failure returns the tool's
+  // own result: this must never cost a call.
+  on('tool.call', { tool: /^Bash$/ }, async ($, e, next) => {
+    const r = await next(e)
+    try {
+      if (isOff(await $.env.get('MEMHUB_SESSION_REDACT'))) return r
+      return redactToolResult(r as never) as never
+    } catch {
+      return r
+    }
   }).catch(($, e, next) => next(e))
 
   // ── rulebook lanes ────────────────────────────────────────────────────────
@@ -516,11 +551,16 @@ export function register(on: On, options: PluginOptions = {}) {
     return r
   }).catch(($, e, next) => next(e))
 
-  // The turn's batched ledger events (spec §4.7).
+  // The turn's batched ledger events (spec §4.7), and the drafter's hand-off,
+  // which runs in the background: the turn is not held for a spawn.
   on('turn.complete', EVERY_TURN, async ($, e, next) => {
+    if (drafter) void drafter.turnEnded(e).catch(() => undefined)
     if (shell) await shell.act.flush(await shell.io.sessionId())
     return next(e)
   }).catch(($, e, next) => next(e))
+
+  // ── agent message board: outer to the companion's band ───────────────────
+  registerBoard(on, ctx)
 
   // ── companion: last, so innermost ─────────────────────────────────────────
   registerCompanion(on, ctx, options)

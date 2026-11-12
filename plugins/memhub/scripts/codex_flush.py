@@ -24,6 +24,18 @@ into the drain.
 Events wired (see hooks/codex-hooks.json, generated): ``Stop`` = turn
 boundary, always flush on growth; ``PostToolUse`` = milestone commands only
 (git commit / gh pr), so ordinary tool traffic stays quiet.
+
+Sub-agents (Codex CLI and desktop, multi-agent v2): after the root's own save
+is confirmed, ``codex_agents.discover`` finds the threads it spawned and
+``agent_capture.send_agents`` sends each as ``codex-<root>/agent-<child>``,
+linked to ``codex-<root>`` — gated on the server's ``import_conversation``
+schema (``server_caps``, cached in ``_server_caps``), remembered in
+``<root>.agents`` so an unchanged agent is not re-sent. A child is never filed
+as ``codex-<child>``: a hook naming a child's rollout is routed to its root,
+and a child flushed on its own is still skipped as a bot thread. Agent sends
+never move the root's ``fail_streak``. A Stop rescans the root's agents even
+when the root did not grow, and also re-checks a few other roots whose agents
+were last seen running (a child can finish after its root's last Stop).
 """
 from __future__ import annotations
 
@@ -36,12 +48,16 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import agent_capture  # noqa: E402
 import atomic_write  # noqa: E402
+import codex_agents  # noqa: E402
 import portable_lock  # noqa: E402
 import mcp_http  # noqa: E402
 import pr_provenance  # noqa: E402
+import server_caps  # noqa: E402
 from _memhub_auth import resolve_bearer, skill_command  # noqa: E402
 from readers import codex as codex_reader  # noqa: E402
+from readers.jsonl import ZstdUnavailable  # noqa: E402
 from redact import redact_records, redact_text  # noqa: E402
 from transcript_filter import elide_oversized_tool_results  # noqa: E402
 from room_map import git_env, git_readonly  # noqa: E402
@@ -94,6 +110,9 @@ LOCK_WAIT_S = 60.0
 # event forever. After this many consecutive unconfirmed replies the session
 # goes dormant like an unsupported one, on the same re-probe timer.
 MAX_UNCONFIRMED = 5
+# Other roots a Stop re-checks for agents last seen running, and how far back.
+AGENT_RESCAN_ROOTS = 3
+AGENT_RESCAN_WINDOW_S = 24 * 3600
 
 
 def _note_failure(sid: str, reason: str) -> None:
@@ -231,7 +250,12 @@ def _contained(p: Path) -> Path | None:
     try:
         rp = p.expanduser().resolve()
         root = codex_reader.sessions_root().resolve()
-        return rp if rp.is_file() and rp.is_relative_to(root) else None
+        if not rp.is_relative_to(root):
+            return None
+        # A payload (or the state DB) can still name rollout-X.jsonl after
+        # Codex compressed it to rollout-X.jsonl.zst beside it.
+        found = codex_reader.existing_rollout(rp)
+        return found.resolve() if found is not None and found.resolve().is_relative_to(root) else None
     except (OSError, ValueError):  # untrusted strings (NUL bytes raise)
         return None
 
@@ -294,10 +318,27 @@ def locate_rollout(payload: dict) -> tuple[Path | None, str | None]:
         # content forward under a session the id contradicted. (sid empty ⇒
         # transcript_path alone is trusted, once contained.)
         if sid and from_path != sid:
+            # A sub-agent's hook: Codex names the ROOT as session_id and the
+            # child's rollout as transcript_path (child PreToolUse,
+            # PostToolUse, SubagentStart). Not a conflict when the child's
+            # header chain reaches that very session — route to the root,
+            # whose flush sends the child as its agent. Anything else is
+            # still refused.
+            root = _root_rollout_of_child(tp_rollout, sid)
+            if root is not None:
+                _log(f"child thread {from_path!r} of codex-{sid[:8]} — "
+                     "routed to its root")
+                return root, _sid_of(root)
             _log(f"payload conflict: transcript_path names {from_path!r}, "
                  f"session_id names {sid!r} — refusing rather than risk "
                  f"flushing the wrong session")
             return None, None
+        if not sid:
+            # transcript_path alone, naming a child: route to its root rather
+            # than file the child (it would be skipped as a bot thread).
+            root = _root_rollout_of_child(tp_rollout, None)
+            if root is not None:
+                return root, _sid_of(root)
         return tp_rollout, _sid_of(tp_rollout)
     if sid and "/" not in sid and sid != "latest":
         # codex_reader.locate ALSO honors "latest" (newest by mtime) and any
@@ -310,6 +351,19 @@ def locate_rollout(payload: dict) -> tuple[Path | None, str | None]:
         if p is not None:
             return p, _sid_of(p)
     return None, None
+
+
+def _root_rollout_of_child(child: Path, sid: str | None) -> Path | None:
+    """The contained rollout of the root a child rollout belongs to — only
+    when its header chain reaches ``sid`` (when given). None otherwise."""
+    try:
+        root_id = codex_agents.child_root(child, sid)
+    except Exception:  # noqa: BLE001 — an unreadable chain is just "not a child"
+        return None
+    if not root_id or "/" in root_id:
+        return None
+    found, _err = codex_reader.locate(root_id)
+    return _contained(found) if found is not None else None
 
 
 def _command_text(payload: dict) -> str:
@@ -434,7 +488,176 @@ def _git_remote_basename(cwd: str) -> str | None:
     return None
 
 
-async def _flush(sid: str, rollout: Path, size: int) -> None:
+def _agents_cache(sid: str) -> Path:
+    """The root's agent sent cache: ``{agent_id: "<size>:<status>:<d|b>"}``.
+    No ``.json`` suffix — capture_health reads ``*.json`` as breadcrumbs."""
+    return STATE_DIR / f"{_safe_sid(sid)}.agents"
+
+
+async def _flush_agents(sid: str, rollout: Path, rows, session, url: str,
+                        bearer: str, namespace, deadline: float):
+    """Send the agents this root spawned, each linked to ``codex-<sid>``.
+
+    Called only after the root's own save was confirmed. Discovery reads the
+    child rollouts; the server's tools are listed (through the
+    ``_server_caps`` cache) only when some agent is actually due. Agent
+    failures land in the root's state as ``agents_*`` fields, never in its
+    ``fail_streak`` or ``last_error`` — a failed agent must not push a healthy
+    session toward dormancy or raise the capture banner."""
+    try:
+        found = codex_agents.discover(rollout, rows=rows, log=_log)
+    except Exception as exc:  # noqa: BLE001 — agents never cost the root its flush
+        _log(f"agents not read ({type(exc).__name__}: {exc})")
+        return None
+    for tid, why in found.skipped:
+        _log(f"agent {tid[:8]} of codex-{sid[:8]} skipped: {why}")
+    if not found.agents:
+        return None
+    cache = _agents_cache(sid)
+    planned = agent_capture.plan(cache, found.agents)
+    if not planned.todo:
+        _save_agent_state(sid, found.agents, planned.sent, None)
+        return None
+    caps = await asyncio.to_thread(server_caps.get, STATE_DIR, url,
+                                   lambda: mcp_http.list_tools(url, bearer))
+    if caps is None:
+        _log(f"agents not sent: could not list the server's tools "
+             f"({len(planned.todo)} waiting)")
+        return None
+    conv_id = f"codex-{sid}"
+
+    async def send_one(agent, arguments: dict) -> bool:
+        try:
+            records = agent.load()
+        except Exception as exc:  # noqa: BLE001 — one unreadable agent, not the root
+            _log(f"agent {agent.agent_id[:8]} not read ({type(exc).__name__}: {exc})")
+            return False
+        sendable = redact_records(elide_oversized_tool_results(records))
+        if not sendable:
+            return True
+        call = {"messages": sendable, **arguments,
+                "source_platform": codex_reader.HOST, "flush": "now"}
+        if namespace:
+            call["namespace"] = namespace
+        left = max(5.0, deadline - time.monotonic())
+        try:
+            res = await session.call_tool("import_conversation", arguments=call,
+                                          timeout=left)
+        except mcp_http.McpError as exc:
+            _log(f"agent {agent.agent_id[:8]} import failed: {str(exc)[:160]}")
+            if server_caps.names_agent_argument(str(exc)):
+                server_caps.invalidate(STATE_DIR, url)
+            return False
+        if _verdict(res, arguments["conversation_id"]) != "ok":
+            detail = " ".join(mcp_http.texts_of(res))
+            if getattr(res, "isError", False) and server_caps.names_agent_argument(detail):
+                server_caps.invalidate(STATE_DIR, url)
+            _log(f"agent {agent.agent_id[:8]} import not confirmed")
+            return False
+        return True
+
+    report = await agent_capture.send_agents(
+        caps, parent_conv_id=conv_id, agents=planned.todo, cache_path=cache,
+        deadline=deadline, send_one=send_one, log=_log, sent=planned.sent)
+    _save_agent_state(sid, found.agents, agent_capture.load_sent(cache), report)
+    return report
+
+
+def _save_agent_state(sid: str, agents, sent: dict, report) -> None:
+    """The root's agent summary, for capture_health's agent report: how many
+    were found, how many landed, which are still running or waiting, and the
+    last agent failure. Kept apart from last_error on purpose."""
+    landed = [a for a in agents if str(sent.get(a.agent_id, "")).startswith(f"{a.revision}:")]
+    running = [a.agent_id for a in agents if a.status == "running"]
+    fields = {"agents_found": len(agents), "agents_sent": len(landed),
+              "agents_running": running, "agents_checked_at": time.time()}
+    if report is not None:
+        fields["agents_pending"] = report.deferred
+        if report.failed:
+            fields["agents_failed"] = report.failed
+            fields["agents_failed_at"] = time.time()
+        elif report.sent:
+            fields["agents_failed"] = []
+        if report.gated:
+            fields["agents_gated"] = True
+    _save_state(sid, **fields)
+
+
+async def _agents_only(sid: str, rollout: Path) -> None:
+    """A rescan of a root that did not grow: its agents may have (a child
+    can finish after its root's last Stop). Needs the root already captured
+    — agents never go ahead of their parent."""
+    rows = codex_reader.load_rollout(rollout)
+    if not codex_agents.spawned(rows) and not _agents_cache(sid).exists():
+        return
+    url, bearer = await asyncio.to_thread(resolve_bearer)
+    if not bearer:
+        return
+    meta = rows[0].get("payload") if rows and isinstance(rows[0].get("payload"), dict) else {}
+    cwd = meta.get("cwd")
+    namespace = await asyncio.to_thread(_git_remote_basename, cwd) if _cwd_ok(cwd) else None
+    session = mcp_http.Session(url, bearer, timeout=FLUSH_TIMEOUT_S / 2)
+    await _flush_agents(sid, rollout, rows, session, url, bearer, namespace,
+                        time.monotonic() + FLUSH_TIMEOUT_S - 20)
+
+
+def _root_captured(state: dict, size: int) -> bool:
+    """Whether the root's current content is already confirmed saved."""
+    return bool(state.get("last_ok_at")) and state.get("rollout_size") == size \
+        and not state.get("unsupported") and not state.get("skipped_thread_source")
+
+
+def _roots_with_running_agents(exclude: str) -> list[str]:
+    """Other roots whose agents were last sent as running, newest first."""
+    now = time.time()
+    found = []
+    try:
+        caches = sorted(STATE_DIR.glob("*.agents"), key=lambda p: p.stat().st_mtime,
+                        reverse=True)
+    except OSError:
+        return []
+    for cache in caches:
+        sid = cache.name[: -len(".agents")]
+        try:
+            if sid == exclude or now - cache.stat().st_mtime > AGENT_RESCAN_WINDOW_S:
+                continue
+        except OSError:
+            continue
+        sent = agent_capture.load_sent(cache)
+        if any(isinstance(v, str) and ":running:" in v for v in sent.values()):
+            found.append(sid)
+        if len(found) >= AGENT_RESCAN_ROOTS:
+            break
+    return found
+
+
+def _rescan_other_roots(current: str) -> None:
+    """Re-check a few roots whose agents were last seen running: a child that
+    ended after its root's last Stop is only noticed by a later session."""
+    for sid in _roots_with_running_agents(current):
+        found, _err = codex_reader.locate(sid)
+        rollout = _contained(found) if found is not None else None
+        if rollout is None:
+            continue
+        lock_fd = _acquire(sid, blocking=False)
+        if lock_fd is None:
+            continue
+        try:
+            if not _root_captured(_read_state(sid), codex_reader.rollout_size(rollout)):
+                continue
+            asyncio.run(asyncio.wait_for(_agents_only(sid, rollout),
+                                         timeout=FLUSH_TIMEOUT_S))
+        except Exception as exc:  # noqa: BLE001 — a rescan never fails the hook
+            _log(f"agent rescan of codex-{sid[:8]} failed: {type(exc).__name__}")
+        finally:
+            os.close(lock_fd)
+
+
+async def _flush(sid: str, rollout: Path, size: int,
+                 landed: dict | None = None) -> None:
+    """``landed`` (when given) gets ``root=True`` the moment the root's own
+    save is confirmed, so the caller can tell a timeout in the agent phase
+    from a failed root flush."""
     # NB on shrink: the watermark is NOT reset here (before the send). Doing
     # so would drop the truncated rollout's content on a failed send —
     # `size <= watermark` would then hold and block re-flush. It is advanced
@@ -467,7 +690,14 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
         # "capture failed" over a session that captured fine is its own bug.
         _log(f"unfamiliar thread_source={source!r} — capturing it as the "
              f"person's work; classify it upstream if that is wrong")
-    records, meta = codex_reader.to_canonical(rollout)
+    started = time.monotonic()
+    from rewind.capture import prepare as prepare_rewind, chunks as rewind_chunks
+    from rewind.state import Unavailable as RewindUnavailable
+    try:
+        records, meta, comparison = prepare_rewind(rollout, sid)
+    except RewindUnavailable as exc:
+        _note_failure(sid, str(exc))
+        return
     state = _read_state(sid)
     pending_pr_urls, accepted_pr_urls, missing_pr_urls = (
         pr_provenance.queued_urls(state, records)
@@ -547,9 +777,31 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
         # matches nothing and ships in the clear. Verified both ways.
         arguments["title"] = redact_text(title.strip())[:200]
 
+    # The account's latest rate-limit snapshot (plan, window usage, credits),
+    # already reduced to an allowlist by the reader. It rides the call that is
+    # happening anyway — repo_allow, bot-thread and redaction gating above are
+    # unchanged — as a top-level argument a backend that predates it ignores.
+    limits = meta.get("account_limits")
+    if isinstance(limits, dict) and limits:
+        arguments["account_limits"] = limits
+
     try:
-        res = await session.call_tool("import_conversation",
-                                      arguments=arguments)
+        if comparison is None:
+            res = await session.call_tool("import_conversation", arguments=arguments)
+        else:
+            for lineage_chunk in rewind_chunks(comparison):
+                res = await session.call_tool("import_conversation",
+                    arguments={**arguments, "messages": sendable if lineage_chunk["prefix_map_complete"] else [],
+                               "comparison_lineage": lineage_chunk})
+                # No ordinary fallback. The final persisted ACK alone advances capture.
+                if getattr(res, "isError", False):
+                    raise RewindUnavailable("comparison_lineage_rejected")
+                if not lineage_chunk["prefix_map_complete"]:
+                    pending = mcp_http.ack_of(res, f"codex-{sid}")
+                    expected_offset = lineage_chunk["prefix_map_offset"] + len(lineage_chunk["prefix_mapping"])
+                    if (not pending or pending.get("ack_through") is not None or
+                            pending.get("comparison", {}).get("next_prefix_map_offset") != expected_offset):
+                        raise RewindUnavailable("comparison_prefix_ack_unconfirmed")
     except mcp_http.McpRateLimited as e:
         _log(f"rate limited: {e}")
         _note_failure(sid, "rate_limited")
@@ -578,6 +830,11 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
         return
 
     ack = mcp_http.ack_of(res, f"codex-{sid}")
+    if comparison is not None and sendable:
+        from rewind.state import branch_path, read as rewind_read, write as rewind_write
+        branch = rewind_read(branch_path(sid))
+        branch["last_capture_watermark"] = {"event_id": sendable[-1]["uuid"], "capture_version": 1}
+        rewind_write(branch_path(sid), branch)
     reconciled = pr_provenance.acknowledge_confirmed_import(
         pending_pr_urls,
         accepted_pr_urls,
@@ -600,6 +857,18 @@ async def _flush(sid: str, rollout: Path, size: int) -> None:
                 accepted_pr_urls=accepted_pr_urls,
                 fail_streak=0)
     _log(f"flushed {len(sendable)} records → codex-{sid} (personal)")
+    if landed is not None:
+        landed["root"] = True
+    # Agents go only now, after the root's own save was confirmed, inside
+    # what is left of this flush's budget.
+    try:
+        # 20 s short of the flush's own timeout: the last agent call is bounded
+        # by what is left, so it ends before wait_for would cancel the flush
+        # and count a timeout against the root.
+        await _flush_agents(sid, rollout, None, session, url, bearer, namespace,
+                            started + FLUSH_TIMEOUT_S - 20)
+    except Exception as exc:  # noqa: BLE001 — the root's save stands; never its streak
+        _log(f"agents not sent ({type(exc).__name__}: {exc})")
 
 
 def main() -> int:
@@ -615,8 +884,15 @@ def main() -> int:
         return 0
 
     try:
-        size = rollout.stat().st_size
-    except OSError as e:
+        size = codex_reader.rollout_size(rollout)
+    except ZstdUnavailable as e:
+        # A compressed rollout on an interpreter that cannot read zstd. Not a
+        # server failure (fail_streak untouched), but capture is blocked
+        # until a zstd tool or Python 3.14 is there, so the banner says so.
+        _log(f"{event}: {e} — skipping")
+        _save_state(sid, last_error="zstd_unavailable", last_error_at=time.time())
+        return 0
+    except (OSError, ValueError) as e:
         _log(f"{event}: rollout unreadable ({e}) — skipping")
         return 0
 
@@ -630,9 +906,12 @@ def main() -> int:
         _log(f"{event}: another flush is running for this session — skipping")
         return 0
     try:
-        return _flush_locked(event, payload, sid, rollout, size)
+        _flush_locked(event, payload, sid, rollout, size)
     finally:
         os.close(lock_fd)  # releases the flock
+    if event == "Stop":
+        _rescan_other_roots(sid)
+    return 0
 
 
 def _flush_locked(event: str, payload: dict, sid: str, rollout: Path,
@@ -640,6 +919,13 @@ def _flush_locked(event: str, payload: dict, sid: str, rollout: Path,
     """The gated flush, run while this session's flock is held."""
     state = _read_state(sid)
     if not should_flush(event, payload, state, size):
+        if event == "Stop" and _root_captured(state, size):
+            # Nothing new in the root, but its agents may have moved on.
+            try:
+                asyncio.run(asyncio.wait_for(_agents_only(sid, rollout),
+                                             timeout=FLUSH_TIMEOUT_S))
+            except Exception as e:  # noqa: BLE001 — never the root's failure
+                _log(f"{event}: agent rescan error: {type(e).__name__}: {e}")
         return 0
     # Cooldown after a failure — including a TIMEOUT, which lands in the
     # broad handler below. The watermark only advances on success, so an
@@ -658,10 +944,21 @@ def _flush_locked(event: str, payload: dict, sid: str, rollout: Path,
              f"cooling down ({ERROR_COOLDOWN_S:.0f}s)")
         return 0
 
+    landed: dict = {}
     try:
-        asyncio.run(asyncio.wait_for(_flush(sid, rollout, size),
+        asyncio.run(asyncio.wait_for(_flush(sid, rollout, size, landed),
                                      timeout=FLUSH_TIMEOUT_S))
     except Exception as e:
+        if landed.get("root"):
+            # The root's save was already confirmed; only its agent phase ran
+            # out (a cancel from wait_for is not an Exception inside _flush,
+            # so it unwinds to here). Never the root's failure: no streak, no
+            # last_error, no cooldown. The next Stop sends the agents.
+            _log(f"{event}: agent phase cut off after the root's save "
+                 f"({type(e).__name__}) — the next Stop sends them")
+            _save_state(sid, agents_failed_at=time.time(),
+                        agents_error=f"flush_error: {type(e).__name__}")
+            return 0
         # Timeouts included: record the stamp so the cooldown applies to a
         # slow upload too, not just to server-reported errors.
         _log(f"{event}: flush error: {e}")

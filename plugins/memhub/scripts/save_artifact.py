@@ -23,13 +23,19 @@ Run (stdlib python3, nothing to install):
     python3 scripts/save_artifact.py \
         --file spec.md --name "Retry Policy Spec" --type spec \
         [--agent-brain-id <id>] [--parent-id <id>] [--rationale "..."] \
-        [--tags a,b] [--topic billing]
+        [--tags a,b] [--topic billing] [--session-id <conversation id>]
 
     `--topic` is the brain chapter the document goes under — an existing topic
     of the brain when one fits even loosely, a new one only for a subject none
     covers, else "unsorted". A brain with topics on refuses a NEW artifact
     without one and lists its topics in the refusal; a new version keeps its
     topic when `--topic` is omitted. Outside a brain it is an ordinary tag.
+
+    `--session-id` links the artifact to the session that made it, so it shows
+    on that session's Contents tab in MemHub Studio. Omitted, it is the RUNNING
+    session (`capture.running_conversation_id`: the host's own session variable,
+    else the one live session in this directory); none found means an unlinked
+    save, never a failed one. `--session-id ""` saves unlinked on purpose.
 
     # a rendered DELIVERABLE (HTML page, chart PNG, PDF) — bytes, not text:
     python3 scripts/save_artifact.py \
@@ -136,6 +142,24 @@ def unwrap(result) -> dict:
     return {"_raw": str(result)}
 
 
+def running_session_id(explicit: str | None) -> str | None:
+    """The session to link the artifact to: the caller's, else the running one.
+
+    Without one the server saves the artifact linked to nothing, and it is
+    missing from the session's Contents tab in Studio. Detection never fails
+    the save — an unreadable session store is an unlinked save. A backend from
+    before `session_id` ignores the argument (unknown tool arguments are
+    dropped), so it rides along unconditionally.
+    """
+    if explicit is not None:
+        return explicit.strip() or None
+    try:
+        import capture
+        return capture.running_conversation_id()
+    except Exception:  # noqa: BLE001 — a label, never a reason to lose the save
+        return None
+
+
 async def main() -> int:
     ap = argparse.ArgumentParser(description="Store a file/stdin as a MemHub artifact.")
     src = ap.add_mutually_exclusive_group(required=False)
@@ -169,6 +193,11 @@ async def main() -> int:
     ap.add_argument("--topic", default=None,
                     help="the brain topic it goes under: an existing one, a new "
                          "one, or 'unsorted' (see the module docstring)")
+    ap.add_argument("--session-id", default=None,
+                    help="conversation id of the session that made this "
+                         "(bare for Claude Code, codex-<id>, cursor-<id>); "
+                         "default: the running session, when it is certain; "
+                         "'' to save unlinked")
     ap.add_argument("--url", default=None)
     args = ap.parse_args()
 
@@ -231,6 +260,10 @@ async def main() -> int:
     # always saw.
     if args.topic and args.topic.strip():
         call_args["topic"] = args.topic.strip()
+    session_id = running_session_id(args.session_id)
+    if session_id:
+        call_args["session_id"] = session_id
+        print(f"session  : {session_id}")
 
     url, headers, auth = resolve_url_and_auth(args.url)
 

@@ -19,6 +19,14 @@ hook's output rather than the person. The rule is never written from a session:
 there the same classifier refuses an agent adding its own allow rule, so
 onboard leaves it to the installer, which the person runs in their own shell.
 A rule the person put under `deny` or `ask` is their choice and is left alone.
+
+The same flag appends NOTE to `autoMode.allow`, auto mode's prose exceptions
+to its soft blocks: the fork then files or supersedes a rule through
+`create_rule`, which the classifier otherwise reads as modifying a shared
+resource. The note covers a rule that lands `proposed` and nothing put in
+force. A list set without `"$defaults"` replaces the built-in entries
+(code.claude.com/docs/en/auto-mode-config), so an existing list is appended to
+as it stands and a new one starts with `"$defaults"`.
 """
 from __future__ import annotations
 
@@ -37,6 +45,13 @@ from setup_codex_hooks import SetupError, _load_json, _write_atomic  # noqa: E40
 
 KEY = "CLAUDE_CODE_FORK_SUBAGENT"
 RULE = "Agent(fork)"
+DEFAULTS = "$defaults"
+NOTE = ("MemHub rule drafts: a background fork that the MemHub plugin's Stop hook "
+        "asks for (its prompt starts \"MemHub harness fork, moment\") may read this "
+        "session's transcript and file a team rule, or a supersede of an existing "
+        "one, through MemHub's create_rule tool (mcp__plugin_memhub_memhub__create_rule "
+        "or mcp__plugin_memhub-staging_memhub__create_rule) when the rule lands "
+        "`proposed`. Not covered: activate=true, or deleting a rule.")
 _ON = ("1", "true", "yes", "on")
 
 
@@ -78,6 +93,35 @@ def _rule_state(doc: dict, path: Path) -> str:
     if RULE in _rules(doc, path, "deny") or RULE in _rules(doc, path, "ask"):
         return "held"
     return "unset"
+
+
+def _auto_allow(doc: dict, path: Path) -> list | None:
+    """`autoMode.allow`, or None when the person never set one."""
+    auto = doc.get("autoMode", {})
+    if not isinstance(auto, dict):
+        raise SetupError(f"{path} field 'autoMode' must be an object")
+    allow = auto.get("allow")
+    if allow is not None and not isinstance(allow, list):
+        raise SetupError(f"{path} field 'autoMode.allow' must be a list")
+    return allow
+
+
+def _with_note(doc: dict, path: Path, present: bool) -> dict:
+    """`doc` with NOTE added to or dropped from autoMode.allow. A new list
+    keeps the built-in entries (`$defaults`); a list left holding only that
+    token, or nothing, goes, as does an emptied autoMode."""
+    allow = [e for e in (_auto_allow(doc, path) or []) if e != NOTE]
+    if present:
+        allow = (allow or [DEFAULTS]) + [NOTE]
+    auto = dict(doc.get("autoMode", {}))
+    if allow and allow != [DEFAULTS]:
+        auto["allow"] = allow
+    else:
+        auto.pop("allow", None)
+    out = {k: v for k, v in doc.items() if k != "autoMode"}
+    if auto:
+        out["autoMode"] = auto
+    return out
 
 
 def _with_rule(doc: dict, path: Path, present: bool) -> dict:
@@ -135,12 +179,17 @@ def install(home: Path, allow_rule: bool = False) -> tuple[str, Path | None]:
     if KEY in env and not _is_on(env[KEY]):
         return "left off", None
     need_key = KEY not in env
-    need_rule = allow_rule and _rule_state(doc, path) == "unset"
-    if not (need_key or need_rule):
+    rule = _rule_state(doc, path) if allow_rule else "held"
+    need_rule = rule == "unset"
+    # A launch the person holds under deny/ask is not eased afterwards either.
+    need_note = rule != "held" and NOTE not in (_auto_allow(doc, path) or [])
+    if not (need_key or need_rule or need_note):
         return "already set", None
     new = {**doc, "env": {**env, KEY: "1"}} if need_key else doc
     if need_rule:
         new = _with_rule(new, path, True)
+    if need_note:
+        new = _with_note(new, path, True)
     old_mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else None
     backup = _backup(path)
     _write_atomic(path, new, old_mode)
@@ -153,7 +202,8 @@ def uninstall(home: Path) -> tuple[bool, Path | None]:
     doc = _load_json(path)
     env = _env_of(doc, path)
     has_rule = RULE in _rules(doc, path, "allow")
-    if KEY not in env and not has_rule:
+    has_note = NOTE in (_auto_allow(doc, path) or [])
+    if KEY not in env and not has_rule and not has_note:
         return False, None
     cleaned = {k: v for k, v in doc.items() if k != "env"}
     rest = {k: v for k, v in env.items() if k != KEY}
@@ -161,6 +211,8 @@ def uninstall(home: Path) -> tuple[bool, Path | None]:
         cleaned["env"] = rest
     if has_rule:
         cleaned = _with_rule(cleaned, path, False)
+    if has_note:
+        cleaned = _with_note(cleaned, path, False)
     mode = stat.S_IMODE(path.stat().st_mode)
     backup = _backup(path)
     _write_atomic(path, cleaned, mode)
@@ -180,7 +232,8 @@ def main() -> int:
     parser.add_argument("action", choices=("install", "status", "remove"), nargs="?", default="install")
     parser.add_argument("--claude-home")
     parser.add_argument("--allow-rule", action="store_true",
-                        help=f"also add {RULE} to permissions.allow (install.sh only)")
+                        help=f"also add {RULE} to permissions.allow and the rule-draft "
+                             "note to autoMode.allow (install.sh only)")
     args = parser.parse_args()
     home = _claude_home(args.claude_home)
     path = _settings(home)
@@ -201,6 +254,9 @@ def main() -> int:
                 print(f"MemHub fork agent: {RULE} " + (
                     "left under deny/ask as you set it" if held
                     else "allowed, so rule drafts launch without an auto-mode review"))
+                if not held:
+                    print("MemHub fork agent: autoMode.allow names MemHub rule drafts, so a "
+                          "draft can file a proposed rule; putting one in force is still reviewed")
             print(f"settings: {path}")
             if backup:
                 print(f"backup: {backup}")

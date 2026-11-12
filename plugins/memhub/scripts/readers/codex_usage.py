@@ -52,15 +52,24 @@ def apply(rows, records, sources, usage_targets, *, session_id, namespace, seen)
                 raise ValueError('conflicting usage for one response')
             continue
         seen[key] = total
-        for row in rows[context_position:position]:
+        response_start = previous
+        for offset, row in enumerate(rows[context_position:position], context_position):
+            value = row.get('payload', {})
             if row.get('type') == 'turn_context':
-                model = row.get('payload', {}).get('model')
+                model = value.get('model')
+                response_start = offset
+            elif (row.get('type') == 'response_item' and value.get('role') == 'user'
+                  or row.get('type') == 'event_msg' and value.get('type') in ('task_started', 'task_complete')
+                  or row.get('type') == 'event_msg' and value.get('type') == 'token_count'
+                  and isinstance(value.get('info'), dict)
+                  and codex._usage_total(value['info'].get('total_token_usage')) is not None):
+                response_start = offset
         context_position = position
         at = bisect_left(assistant_positions, position) - 1
         target = None
         if at >= 0:
             source_position, candidate = assistants[at]
-            if source_position > previous and id(candidate) not in protected:
+            if source_position > response_start and id(candidate) not in protected:
                 target = candidate
         next_position = ledgers[n + 1][0] if n + 1 < len(ledgers) else len(rows)
         if target is None:
@@ -78,6 +87,15 @@ def apply(rows, records, sources, usage_targets, *, session_id, namespace, seen)
             sources[id(target)] = position
             records.append(target)
         target['api_message_id'] = response
+        target['requestId'] = response
+        # Text, reasoning, and tool items emitted by one request share its
+        # response identity. Keep the measurement on one target only, so
+        # downstream completeness can fold fragments without double counting.
+        for _, fragment in assistants[bisect_right(assistant_positions, response_start):
+                                      bisect_left(assistant_positions, position)]:
+            if id(fragment) not in protected:
+                fragment['api_message_id'] = response
+                fragment['requestId'] = response
         if model is None:
             target['message'].pop('model', None)
         else:
@@ -91,3 +109,36 @@ def apply(rows, records, sources, usage_targets, *, session_id, namespace, seen)
         previous = position
     return sorted((record for record in records if id(record) in retained),
                   key=lambda record: sources[id(record)])
+
+
+def attach_reasoning(rows, records) -> None:
+    """Copy each ledger response's reasoning count onto its record's usage.
+
+    Runs after ``apply`` (which rewrites ledger-backed usage to the four
+    counts) and never inside it: ``apply`` raises on anomalies by design,
+    while a missing or malformed reasoning count must cost only itself. The
+    caller still wraps this in its own ``try``. The count lands where Claude
+    puts its own (``output_tokens_details.thinking_tokens``), which an older
+    backend ignores.
+    """
+    reasoning = {}
+    for row in rows:
+        if not isinstance(row, dict) or row.get('type') != 'token_usage_record':
+            continue
+        payload = row.get('payload')
+        if not isinstance(payload, dict):
+            continue
+        response, usage = payload.get('response_id'), payload.get('usage')
+        count = usage.get('reasoning_output_tokens') if isinstance(usage, dict) else None
+        if isinstance(response, str) and type(count) is int and count >= 0:
+            reasoning[response] = count
+    if not reasoning:
+        return
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        count = reasoning.get(record.get('api_message_id'))
+        message = record.get('message')
+        if not count or not isinstance(message, dict) or not isinstance(message.get('usage'), dict):
+            continue
+        message['usage']['output_tokens_details'] = {'thinking_tokens': count}

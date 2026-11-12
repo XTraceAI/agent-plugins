@@ -21,7 +21,7 @@ describe('the disclosure', () => {
   test('is rulebook_hook.disclosure_instruction, byte for byte', () => {
     // python3 -c 'import rulebook_hook as r; print(repr(r.disclosure_instruction(["📏 Rule fired: a", "⛔️ Rule fired: b"])))'
     const python =
-      '\n_Disclose these to the user. Begin your next reply with the following line(s), verbatim and each on its own line, before anything else — including before any tool call narration:_\n📏 Rule fired: a\n⛔️ Rule fired: b\n_This is how the team sees its rules working. Do not paraphrase, do not merge them into a sentence, and do not omit one because it did not change what you were going to do — a rule that fired and changed nothing is exactly the rule the team needs to hear about._'
+      '\n_Disclose these to the user. Begin your next reply with the following line(s), verbatim and each on its own line, before anything else — including before any tool call narration:_\n📏 Rule fired: a\n⛔️ Rule fired: b\n_This is how the team sees what its rules stopped. Do not paraphrase and do not merge them into a sentence._'
     expect(disclosureInstruction(['📏 Rule fired: a', '⛔️ Rule fired: b'])).toBe(python)
   })
 
@@ -35,18 +35,30 @@ describe('the disclosure', () => {
     expect(a.modelText(advice)).toBe(advice.context[0])
   })
 
-  test('off (the echo path): no system row, the person still sees the line', async () => {
+  test('off (the echo path): no system row, the person still sees a gate\'s line', async () => {
     const { io, act: a } = act()
-    await a.record({ context: [], fires: [fire('r1')], ledger: [] }, SESSION)
+    await a.record({ context: [], fires: [fire('g', true)], ledger: [] }, SESSION)
     expect(io.appends).toEqual([])
-    expect(io.logs).toEqual([fire('r1').line]) // the person's copy
+    expect(io.logs).toEqual([fire('g', true).line]) // the person's copy
   })
 
-  test('off: the model is told to echo, in context and in a deny', async () => {
+  test('an advisory fire is shown to nobody and echoed by nobody, on either path', async () => {
+    for (const systemRow of [false, true]) {
+      const io = fakeIo()
+      const a = new Act(io, fakeCtx(io), new StatusLine(io), systemRow)
+      const advice = { context: ['## XTrace Rulebook\n- **[r1]** keep it small'], fires: [fire('r1')], ledger: [] }
+      await a.record(advice, SESSION)
+      expect(io.logs).toEqual([]) // nothing on the person's screen
+      expect(a.modelText(advice)).toBe(advice.context[0]) // and no echo instruction
+      expect(firesOf(io).map(n => n.ruleId)).toEqual(['r1']) // the companion's feed still has it
+    }
+  })
+
+  test('off: the model is told to echo a gate\'s line, in a deny', async () => {
     const { io, act: a } = act()
     const advice = { context: ['## XTrace Rulebook\n- **[r1]** keep it small'], fires: [fire('r1')], ledger: [] }
     await a.record(advice, SESSION)
-    expect(a.modelText(advice)).toBe(`${advice.context[0]}\n${disclosureInstruction([fire('r1').line])}`)
+    expect(a.modelText(advice)).toBe(advice.context[0]) // an advisory fire is never echoed
     const gate = { deny: 'Blocked by the XTrace team rulebook', context: [], fires: [fire('g', true)], ledger: [] }
     await a.record(gate, SESSION)
     expect(a.denyText(gate)).toBe(`${gate.deny}\n${disclosureInstruction([fire('g', true).line])}`)
@@ -73,7 +85,7 @@ describe('the transcript system row (D5, gate G2)', () => {
     const fires = lines.map((line, i) => ({ ...fire(`r${i}`, i === 1), line }))
     await a.record({ context: [], fires, ledger: [] }, SESSION)
     expect(io.appends.filter(r => r.type === 'system')).toEqual(lines.map(text => ({ type: 'system', text })))
-    expect(io.logs).toEqual(lines) // the person's copy is still $.ui.log
+    expect(io.logs).toEqual([lines[1]]) // the person's copy is $.ui.log, for the gate's fire alone
   })
 
   test('no echo instruction in the context or the deny', async () => {
@@ -132,12 +144,12 @@ describe('the transcript system row (D5, gate G2)', () => {
     const { io, act: a } = rowAct()
     const append = io.append
     io.append = async (type, text) => {
-      if (type === 'system' && text === fire('r2').line) throw new Error('refused')
+      if (type === 'system' && text === fire('r2', true).line) throw new Error('refused')
       return append(type, text)
     }
-    const v = { context: ['ctx'], fires: [fire('r1'), fire('r2')], ledger: [] }
+    const v = { context: ['ctx'], fires: [fire('r1', true), fire('r2', true)], ledger: [] }
     await a.record(v, SESSION)
-    expect(a.modelText(v)).toBe(`ctx\n${disclosureInstruction([fire('r2').line])}`)
+    expect(a.modelText(v)).toBe(`ctx\n${disclosureInstruction([fire('r2', true).line])}`)
   })
 
   test('a row that cannot be written keeps the echo, and says so', async () => {
@@ -145,9 +157,9 @@ describe('the transcript system row (D5, gate G2)', () => {
     io.append = async type => {
       if (type === 'system') throw new Error('session.append refused: policy')
     }
-    const v = { context: ['ctx'], fires: [fire('r1')], ledger: [] }
+    const v = { context: ['ctx'], fires: [fire('r1', true)], ledger: [] }
     await a.record(v, SESSION)
-    expect(a.modelText(v)).toBe(`ctx\n${disclosureInstruction([fire('r1').line])}`)
+    expect(a.modelText(v)).toBe(`ctx\n${disclosureInstruction([fire('r1', true).line])}`)
     expect(io.statuses.at(-1)).toContain('MemHub: disclosure')
   })
 
@@ -156,9 +168,9 @@ describe('the transcript system row (D5, gate G2)', () => {
     io.append = async type => {
       if (type === 'user') throw new Error('refused')
     }
-    const v = { context: [], fires: [fire('r1')], ledger: [] }
+    const v = { context: [], fires: [fire('r1', true)], ledger: [] }
     await a.record(v, SESSION)
-    expect(a.modelText(v)).toBe(disclosureInstruction([fire('r1').line]))
+    expect(a.modelText(v)).toBe(disclosureInstruction([fire('r1', true).line]))
   })
 })
 
